@@ -1,5 +1,4 @@
-1.0e
-QuestRecorder-1.0e.zip
-- Fixed: 1.0c/1.0d left fights out of new profiles - rebuild those profiles.
-- Mission items like the spy scanner used once per count.
-- Smarter guesses, no walk steps for hidden helper quests.
+1.0f
+QuestRecorder-1.0f.zip
+- Mission pickups are back to the 1.0b check: dailies and heroics only if not in your log and not done, weeklies only if not in your log.
+- Rebuild profiles made with 1.0c-1.0e.

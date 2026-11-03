@@ -1,6 +1,5 @@
 3.9.99
-QuestRecorder-1.0e.zip
-This installs Quest Recorder 1.0e (the first full release - versions start again from 1.0).
-- Fixed: 1.0c/1.0d left fights out of new profiles - rebuild those profiles.
-- Mission items like the spy scanner used once per count.
-- Smarter guesses, no walk steps for hidden helper quests.
+QuestRecorder-1.0f.zip
+This installs Quest Recorder 1.0f (the first full release - versions start again from 1.0).
+- Mission pickups are back to the 1.0b check: dailies and heroics only if not in your log and not done, weeklies only if not in your log.
+- Rebuild profiles made with 1.0c-1.0e.
