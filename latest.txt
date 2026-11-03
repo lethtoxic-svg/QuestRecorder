@@ -1,0 +1,6 @@
+3.9.3
+QuestRecorder-3.9.3.zip
+- Heroic Transport shuttles are used again from where you used them (fixes quick travel + running).
+- No more -draft.xml in Recordings (it was notes, not the profile). Load the profile from Profiles\Recorded\<planet>.
+- Short, clean profile header with LethToxic credit.
+- Plainer step names.

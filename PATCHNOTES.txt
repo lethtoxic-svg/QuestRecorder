@@ -1,0 +1,53 @@
+Quest Recorder 3.9.3 BETA - patch notes
+Made by Quest Recorder - LethToxic
+
+FIXED
+- Heroic Transport: now also picked up from recordings where the game logged it as a plain cast (Vny's Dromund Kaas run:
+  all 5 shuttle trips are used, instead of quick travelling and running). Quick Travel and other normal travel are left to BuddyCron.
+- The Recordings folder no longer gets a -draft.xml. That file was only notes, not a working profile, and testers were loading it by mistake.
+  The profile to load is always in Profiles\Recorded\<planet>\<planet> - Recorded <date>.xml.
+  (Want the notes file back? Settings > 'Keep notes draft'.)
+- Profiles now have a short header: 'Made by Quest Recorder 3.9.3 - LethToxic', plus 'Recorded by <name>' if you set it.
+- Plainer step names (no long explanations in the profile).
+
+Quest Recorder 3.9.2 BETA - patch notes
+Made by Quest Recorder - LethToxic
+
+NEW
+- Profile Fixer: "Fix a profile" in the Quest Recorder window. See a profile as a plain list of steps;
+  remove, move up/down, or add a step from what you target in the game (click/use it, talk to it,
+  fight that mob, walk here, take this elevator, use a mission item, wait, show a message).
+  Pick the quest step it is for from your current quests, or "just once". Every change is backed up;
+  "Undo last fix" puts it back.
+- Updates: the plugin checks for a new version when BuddyCron starts. Click "Updates" to see what's new
+  and install it (your current version is backed up first). "Undo update" goes back.
+- "Recorded by <your name>": optional setting "Your name for credits" - your name goes on every profile
+  you record, under "Made by Quest Recorder - LethToxic".
+- Each planet / area gets its own folder: Profiles\Recorded\<planet>\.
+- "Make profile from a recording" also works on a recording that is still running.
+
+RECORDING / PROFILES
+- Heroic Transport (mission items that move you): used again from the same spot, instead of quick
+  travelling and running there.
+- Terminals that spawn a boss: clicked once, then the fight (waits if the terminal has to respawn).
+- Ordered puzzles (e.g. Sith code tablets): every object you clicked, in your order.
+- Clicking an NPC that ticks a quest (e.g. identifying spies): clicks that NPC. Companions are ignored.
+- Looting a body for a quest item: fights that kind of mob there.
+- Quests finished by the last kill: adds that last fight so the quest gets done.
+- Counts that tick a moment before the kill is reported, and double counts for one action: no longer
+  show as "nothing caught".
+- Quests picked up and gone again without progress are left out (no endless "go round again").
+- Raised objects: walks to where you stood when you used it, then uses it from there.
+- A use interrupted by a fight is tried again after 5 seconds instead of 30.
+- Elevators: taken to the floor you picked, only while you are on the side you got on.
+- Rewards: waits for the reward window after each quest and accepts it, plus a last check at the end
+  (weekly included).
+- A quick "Loot" cast with no object: uses the object right where you stood.
+
+WINDOW
+- Live Task tracker, "!!" lines and an in-game warning (needs BuddyCron's overlay) when something was
+  not caught.
+- Undo hotkey Ctrl+Shift+Z for a misclick.
+
+OTHER
+- Author shows as LethToxic; credits on every plugin file and every profile.
