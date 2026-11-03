@@ -1,4 +1,4 @@
-1.0f
-QuestRecorder-1.0f.zip
-- Mission pickups are back to the 1.0b check: dailies and heroics only if not in your log and not done, weeklies only if not in your log.
-- Rebuild profiles made with 1.0c-1.0e.
+1.0g
+QuestRecorder-1.0g.zip
+- Heroic shuttles: short hops are taken too (Saving Face used to get walked).
+- Since 1.0f: mission pickups back to the 1.0b check (weeklies: only if not in your log).
