@@ -1,3 +1,11 @@
+Quest Recorder 3.9.6 BETA - patch notes
+Made by Quest Recorder - LethToxic
+
+FIXED
+- Heroic Transport: each heroic has its own shuttle item ('Heroic Transport: <mission>'). The profile now uses the right one,
+  from wherever the bot is (even another planet), until it has landed at the mission. No shuttle item? BuddyCron travels instead.
+- Recordings made before 3.9.5 (which only saw 'Heroic Transport') get the right shuttle from the heroic you did next.
+
 Quest Recorder 3.9.5 BETA - patch notes
 Made by Quest Recorder - LethToxic
 
