@@ -1,5 +1,9 @@
 Quest Recorder patch notes - LethToxic
 
+1.0a
+- Checks for updates as soon as BuddyCron starts, even if Quest Recorder isn't ticked.
+- The update pop-up now shows on top of the game instead of hiding behind it.
+
 1.0
 First proper release. Play it once, get the profile.
 - Records everything you do by hand and turns it into a profile that does it the same way.

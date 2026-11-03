@@ -1,7 +1,6 @@
 3.9.99
-QuestRecorder-1.0.zip
-This installs Quest Recorder 1.0 (the first full release - versions start again from 1.0).
-First proper release. Play it once, get the profile.
-- Control panel: fix or build a profile without touching the XML.
-- Heroic Transport shuttles, mission items, rewards and more get recorded properly.
-- Update pop-up from now on.
+QuestRecorder-1.0a.zip
+This installs Quest Recorder 1.0a (the first full release - versions start again from 1.0).
+- Checks for updates as soon as BuddyCron starts, even if Quest Recorder isn't ticked.
+- The update pop-up shows on top of the game.
+- Tidier wording in profiles and the log.
