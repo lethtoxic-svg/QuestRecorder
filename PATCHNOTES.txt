@@ -1,3 +1,10 @@
+Quest Recorder 3.9.7 BETA - patch notes
+Made by Quest Recorder - LethToxic
+
+FIXED
+- Heroic Transport the Korriban way: if the shuttle item answers to plain 'Heroic Transport' (as on Korriban), that is used too.
+  Each shuttle step tries 'Heroic Transport: <mission>' first, then 'Heroic Transport', then lets BuddyCron travel.
+
 Quest Recorder 3.9.6 BETA - patch notes
 Made by Quest Recorder - LethToxic
 
