@@ -1,5 +1,6 @@
-1.0
+3.9.99
 QuestRecorder-1.0.zip
+This installs Quest Recorder 1.0 (the first full release - versions start again from 1.0).
 First proper release. Play it once, get the profile.
 - Control panel: fix or build a profile without touching the XML.
 - Heroic Transport shuttles, mission items, rewards and more get recorded properly.

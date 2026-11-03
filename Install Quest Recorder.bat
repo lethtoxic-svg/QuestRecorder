@@ -16,7 +16,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop';" ^
   "$src='https://raw.githubusercontent.com/lethtoxic-svg/QuestRecorder/main/';" ^
   "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;" ^
-  "$lines=(Invoke-WebRequest -UseBasicParsing ($src+'latest.txt')).Content -split \"`n\";" ^
+  "$lines=(Invoke-WebRequest -UseBasicParsing ($src+'patch.txt')).Content -split \"`n\";" ^
   "$ver=$lines[0].Trim(); $zip=$lines[1].Trim();" ^
   "if($zip -notmatch '^[\w.\-]+\.zip$'){ throw 'The update file name looks wrong.' }" ^
   "Write-Host ('Downloading Quest Recorder '+$ver+' ...');" ^
