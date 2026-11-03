@@ -1,5 +1,12 @@
 Quest Recorder patch notes - LethToxic
 
+1.0e
+- Fixed: 1.0c and 1.0d left the fights out of new profiles. Please rebuild any profile you made with them
+  ("Make profile from a recording").
+- Mission items used several times for one task (like the Radiation Sensor for the spies) are used once per count.
+- A guessed object has to be near where the quest moved on (no more walking off to a same-named thing elsewhere).
+- The game's hidden helper quests don't add walk steps any more.
+
 1.0d
 - Fixed the bot standing still at the wrong object: when the recorder couldn't see what you did for a quest
   (like identifying spies in the Black Hole), it sometimes picked an object you only used later. Now it only

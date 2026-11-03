@@ -1,4 +1,5 @@
-1.0d
-QuestRecorder-1.0d.zip
-- Fixed the bot standing still at the wrong object (like a cache for the Black Hole spies quest).
-- Plus everything from 1.0c: no more load crash, weeklies/dailies picked up, shorter shuttle wait.
+1.0e
+QuestRecorder-1.0e.zip
+- Fixed: 1.0c/1.0d left fights out of new profiles - rebuild those profiles.
+- Mission items like the spy scanner used once per count.
+- Smarter guesses, no walk steps for hidden helper quests.

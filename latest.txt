@@ -1,5 +1,6 @@
 3.9.99
-QuestRecorder-1.0d.zip
-This installs Quest Recorder 1.0d (the first full release - versions start again from 1.0).
-- Fixed the bot standing still at the wrong object (like a cache for the Black Hole spies quest).
-- Plus everything from 1.0c: no more load crash, weeklies/dailies picked up, shorter shuttle wait.
+QuestRecorder-1.0e.zip
+This installs Quest Recorder 1.0e (the first full release - versions start again from 1.0).
+- Fixed: 1.0c/1.0d left fights out of new profiles - rebuild those profiles.
+- Mission items like the spy scanner used once per count.
+- Smarter guesses, no walk steps for hidden helper quests.
