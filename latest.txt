@@ -1,6 +1,5 @@
 3.9.99
-QuestRecorder-1.0a.zip
-This installs Quest Recorder 1.0a (the first full release - versions start again from 1.0).
-- Checks for updates as soon as BuddyCron starts, even if Quest Recorder isn't ticked.
-- The update pop-up shows on top of the game.
-- Tidier wording in profiles and the log.
+QuestRecorder-1.0b.zip
+This installs Quest Recorder 1.0b (the first full release - versions start again from 1.0).
+- Runs smoother: no more walk points every few metres, BuddyCron's navigator does the walking.
+- Heroic shuttle steps no longer pause when there's no shuttle to use.

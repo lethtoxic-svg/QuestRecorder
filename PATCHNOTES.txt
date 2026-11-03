@@ -1,5 +1,10 @@
 Quest Recorder patch notes - LethToxic
 
+1.0b
+- Runs smoother: profiles no longer have a walk point every few metres - BuddyCron's navigator does the walking.
+  They only keep what matters: clicks, talks, fights, doors, lifts, shuttles, rewards.
+- Heroic shuttle steps no longer pause for 10 seconds when there's no shuttle to use.
+
 1.0a
 - Checks for updates as soon as BuddyCron starts, even if Quest Recorder isn't ticked.
 - The update pop-up now shows on top of the game instead of hiding behind it.
