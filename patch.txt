@@ -1,5 +1,4 @@
-1.0c
-QuestRecorder-1.0c.zip
-- Fixed BuddyCron crashing when loading some recorded profiles.
-- Weeklies, dailies and heroics get picked up whenever the game offers them.
-- Shorter wait after a Heroic Transport.
+1.0d
+QuestRecorder-1.0d.zip
+- Fixed the bot standing still at the wrong object (like a cache for the Black Hole spies quest).
+- Plus everything from 1.0c: no more load crash, weeklies/dailies picked up, shorter shuttle wait.
