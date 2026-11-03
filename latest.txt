@@ -1,5 +1,6 @@
 3.9.99
-QuestRecorder-1.0b.zip
-This installs Quest Recorder 1.0b (the first full release - versions start again from 1.0).
-- Runs smoother: no more walk points every few metres, BuddyCron's navigator does the walking.
-- Heroic shuttle steps no longer pause when there's no shuttle to use.
+QuestRecorder-1.0c.zip
+This installs Quest Recorder 1.0c (the first full release - versions start again from 1.0).
+- Fixed BuddyCron crashing when loading some recorded profiles.
+- Weeklies, dailies and heroics get picked up whenever the game offers them.
+- Shorter wait after a Heroic Transport.

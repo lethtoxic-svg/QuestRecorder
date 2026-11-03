@@ -1,4 +1,5 @@
-1.0b
-QuestRecorder-1.0b.zip
-- Runs smoother: no more walk points every few metres, BuddyCron's navigator does the walking.
-- Heroic shuttle steps no longer pause when there's no shuttle to use.
+1.0c
+QuestRecorder-1.0c.zip
+- Fixed BuddyCron crashing when loading some recorded profiles.
+- Weeklies, dailies and heroics get picked up whenever the game offers them.
+- Shorter wait after a Heroic Transport.

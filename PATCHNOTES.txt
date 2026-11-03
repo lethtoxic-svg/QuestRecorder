@@ -1,5 +1,12 @@
 Quest Recorder patch notes - LethToxic
 
+1.0c
+- Fixed BuddyCron crashing when loading some recorded profiles (a recording that ended on an elevator, or
+  a quest you got without a giver, left an empty step in the profile).
+- Weeklies, dailies and heroics get picked up again whenever the game offers them (weeklies up to 3 times
+  a week), and the profile doesn't loop forever on a weekly.
+- Shorter wait after a Heroic Transport (5 seconds instead of 10).
+
 1.0b
 - Runs smoother: profiles no longer have a walk point every few metres - BuddyCron's navigator does the walking.
   They only keep what matters: clicks, talks, fights, doors, lifts, shuttles, rewards.
