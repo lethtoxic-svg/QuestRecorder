@@ -1,3 +1,19 @@
+Quest Recorder 3.9.5 BETA - patch notes
+Made by Quest Recorder - LethToxic
+
+FIXED
+- Mission items were never detected (a timer bug meant your mission items list was never read). Using a mission item -
+  like the Heroic Transport shuttles - is now recorded as 'used mission item', so the profile uses it again from the same spot.
+- Mission items are also matched by name, in case the game uses a different id for the cast than the item shows.
+
+Quest Recorder 3.9.4 BETA - patch notes
+Made by Quest Recorder - LethToxic
+
+FIXED
+- The plugin did not load in 3.9.3 (build error in the Fix a profile window). Fixed; Fix a profile can now also read objects and elevators you target.
+- Heroic Transport steps can no longer get stuck: they only run while you have the transport and are still where you used it. Otherwise BuddyCron travels there itself.
+- The recording notes no longer list a draft file.
+
 Quest Recorder 3.9.3 BETA - patch notes
 Made by Quest Recorder - LethToxic
 
