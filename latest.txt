@@ -1,5 +1,5 @@
-3.9.7
-QuestRecorder-3.9.7.zip
-- Heroic Transport shuttles work the Korriban way: the profile uses the right shuttle for each heroic, from anywhere.
+3.9.8
+QuestRecorder-3.9.8.zip
+- Update pop-up: from now on a window asks 'Update now?' when a new version is out. Press Yes and it is done.
+- Heroic Transport shuttles: the profile uses the right shuttle for each heroic, the Korriban way.
 - Mission items are now recorded properly.
-- No more -draft.xml in Recordings. Load the profile from Profiles\Recorded\<planet>.

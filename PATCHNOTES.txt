@@ -1,3 +1,10 @@
+Quest Recorder 3.9.8 BETA - patch notes
+Made by Quest Recorder - LethToxic
+
+NEW
+- Update pop-up: when BuddyCron starts and a new version is out, a window asks 'Update now?'. Press Yes and it is done
+  (your current version is saved in PluginBackups first). Restart BuddyCron to use it. No more sending zips around.
+
 Quest Recorder 3.9.7 BETA - patch notes
 Made by Quest Recorder - LethToxic
 
