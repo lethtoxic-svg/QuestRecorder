@@ -1,5 +1,4 @@
-1.1
-QuestRecorder-1.1.zip
-- See what you did live (OK or !! with the reason), review your profile step by step after Stop (untick, reorder, do by hand) - no XML.
-- Records everything exactly: replies, mission items, interact key, every click - no guessing. Hotkeys: Ctrl+Shift+P pause here, Ctrl+Shift+W wait here, Ctrl+Shift+Z ignore last action.
-- Better profiles: right quest givers, fights roam every spot, runes in order, Kregg's Locker, pick-ups give up instead of clicking forever.
+1.1a
+QuestRecorder-1.1a.zip
+- Updates now come straight from the plugin's source on GitHub (no zip). The plugin sits at the top of the repository.
+- NPC quest windows (the Recon Droid) are accepted: the pick-up runs BuddyCron's own PickUpQuest (update BuddyCron to its latest build).

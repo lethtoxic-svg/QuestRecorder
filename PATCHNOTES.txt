@@ -1,5 +1,11 @@
 Quest Recorder patch notes - LethToxic
 
+1.1a
+- Updates now come straight from the plugin's source on GitHub (no more zip files): the plugin sits at the top of
+  the repository, the way BuddyCron plugins usually do. You can also clone or download it into BuddyCron\Plugins\QuestRecorder.
+- NPC quest windows (the Recon Droid's Asset Liquidation) are accepted by the bot, using BuddyCron's new quest window
+  support (update BuddyCron to its latest build).
+
 1.1
 Recording - everything you do, nothing guessed:
 - "What you did (live)": every click, item, reply, window, board and lift shows up as you play, with what it did
