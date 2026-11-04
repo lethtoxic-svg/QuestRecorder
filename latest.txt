@@ -1,5 +1,6 @@
 3.9.99
-QuestRecorder-1.0g.zip
-This installs Quest Recorder 1.0g (the first full release - versions start again from 1.0).
-- Heroic shuttles: short hops are taken too (Saving Face used to get walked).
-- Since 1.0f: mission pickups back to the 1.0b check (weeklies: only if not in your log).
+QuestRecorder-1.1.zip
+This installs Quest Recorder 1.1 (the first full release - versions start again from 1.0).
+- See what you did live (OK or !! with the reason), review your profile step by step after Stop (untick, reorder, do by hand) - no XML.
+- Records everything exactly: replies, mission items, interact key, every click - no guessing. Hotkeys: Ctrl+Shift+P pause here, Ctrl+Shift+W wait here, Ctrl+Shift+Z ignore last action.
+- Better profiles: right quest givers, fights roam every spot, runes in order, Kregg's Locker, pick-ups give up instead of clicking forever.

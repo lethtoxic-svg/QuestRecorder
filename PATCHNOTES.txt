@@ -1,5 +1,57 @@
 Quest Recorder patch notes - LethToxic
 
+1.1
+Recording - everything you do, nothing guessed:
+- "What you did (live)": every click, item, reply, window, board and lift shows up as you play, with what it did
+  in your quest log. OK = the bot does it by itself. !! = it can't, the line says why, and it pops up in game.
+- Each recording also saves "(what you did).txt": every action, exactly where, and what changed in your quest log.
+- The quest giver is whatever you clicked right before it landed in your log (General Konya for End of Torvix, the
+  Recon Droid for Asset Liquidation, the terminal for the dailies).
+- Steps are the clicks you made, in your order, at the exact spots - no more guessing objects from their names.
+- The interact key counts as a use, and every key or mouse action over an object is recorded.
+- Conversations: the reply you pick is recorded. Light or dark picks use TempConvoSkip; other picks use the new
+  TalkAndReply step, which picks the same wheel numbers you did.
+- Mission items: caught by cast, cooldown, a stack being used up, quest items in your bags, and "Using X..." casts.
+  Several used one after another (the Sith runes) are each used once, in your order.
+- Scanner: when you click a quest object, every other one with the same name close by is noted too.
+- Hotkeys while recording: Ctrl+Shift+P = pause here (you do it by hand), Ctrl+Shift+W = wait here 10 s,
+  Ctrl+Shift+Z = ignore your last action.
+
+After you stop - you're in charge:
+- Review list: your profile step by step in plain words. Untick a step to leave it out, move it up or down, or
+  mark it "do by hand", then Save. No XML. Steps with no proof (nothing you did was seen) are yellow.
+
+Better profiles:
+- Fights roam every spot you killed at; one kill counting for two quests keeps both fights going; a task you
+  stopped short of still runs to the full count.
+- "Click any of these" is one step with every spot, so the bot uses whichever one is there.
+- Puzzles (6+ clicks on the same object in one step, like the End of Torvix pipeline controls) become a
+  "do it by hand" pause on that exact object.
+- The thing you clicked right before a boss fight (Kregg's Locker) is clicked again first.
+- Pick-ups give up after 3 tries if the giver isn't offering the quest (no more clicking a terminal forever), and
+  handle mission boards and conversations by themselves. An NPC's own quest window (the Recon Droid) still needs
+  you to press Accept - the profile asks you.
+- Heroic shuttles: taken from the Fleet too, and when you started recording mid-cast.
+
+Also in 1.1:
+- Bot stuck? If the bot sits on one step for 5 minutes and nothing in your quest log moves, a pop-up
+  offers to open the fix panel right at that step.
+- Record from here: in the control panel, pick a step, press Record from here and play just the bit
+  the bot got wrong. It goes into the profile by itself - no re-recording the whole planet.
+- Carry on: logged off halfway through a planet? Your next recording there (within a day) carries on
+  in the same profile instead of starting a new one.
+- Send report: one button packs your recording, the profile and your BuddyCron log into a zip (your
+  character name is taken out). Drop it in Discord and say what went wrong.
+- Double-click a line in the task tracker and the control panel opens right at that step.
+- Control panel is much simpler: big buttons for the usual fixes (Click this, Talk to this, Fight these,
+  Use my mission item, Walk here, Wait, Remove, Undo). It works out the quest step by itself. The full
+  list is still there under More options.
+- More options: Replace step (swap a step for a new one), Check my profile (spots steps that
+  will probably go wrong) and Share (packs the profile so you can post it).
+- The main window is simpler: settings moved to their own Settings button, the task tracker gets the space.
+- First time you open it, a short how-it-works.
+- When you stop recording it tells you where your profile is.
+
 1.0g
 - Heroic shuttles: short hops are taken too. A shuttle counts as needed when you're further than half the hop
   you made (between 15 and 100 m) - Saving Face (a 50 m hop) used to get walked.
