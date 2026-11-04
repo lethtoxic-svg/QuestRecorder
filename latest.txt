@@ -1,5 +1,4 @@
 3.9.99
-QuestRecorder-1.1a.zip
-This installs Quest Recorder 1.1a.
-- Updates now come straight from the plugin's source on GitHub (no zip). The plugin sits at the top of the repository.
-- NPC quest windows (the Recon Droid) are accepted: the pick-up runs BuddyCron's own PickUpQuest (update BuddyCron to its latest build).
+QuestRecorder-1.1b.zip
+This installs Quest Recorder 1.1b.
+- 1.1a's pick-up was broken: the bot walked to the giver and didn't pick anything up. Fixed, the Recon Droid in Black Hole included.

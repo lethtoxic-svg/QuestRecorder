@@ -77,7 +77,18 @@ namespace QuestBehaviors
                 // the give-up: at the giver, no conversation going on, and still no quest after the tries -> move on
                 new Decorator(ret => ShouldGiveUp(), new ActionRunCoroutine(GiveUp)),
                 // everything else is BuddyCron's PickUpQuest, as it is
-                PickUp().Behavior);
+                PickUpBehavior());
+        }
+
+        /// <summary>
+        /// BuddyCron's PickUpQuest behaviour tree, built by its own CreateBehavior (its Behavior property is only filled
+        /// in when BuddyCron starts that tag itself, so asking for it here gave nothing and the bot stood still).
+        /// </summary>
+        private Composite PickUpBehavior()
+        {
+            var make = typeof(PickupQuestTag).GetMethod("CreateBehavior", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+            var tree = make != null ? make.Invoke(PickUp(), null) as Composite : null;
+            return tree ?? PickUp().Behavior;
         }
 
         private bool ShouldGiveUp()

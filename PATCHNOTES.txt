@@ -1,5 +1,9 @@
 Quest Recorder patch notes - LethToxic
 
+1.1b
+- 1.1a's pick-up was broken: the bot walked to the giver and didn't pick anything up. Fixed, the Recon Droid in
+  Black Hole included.
+
 1.1a
 - Updates now come straight from the plugin's source on GitHub (no more zip files): the plugin sits at the top of
   the repository, the way BuddyCron plugins usually do. You can also clone or download it into BuddyCron\Plugins\QuestRecorder.
