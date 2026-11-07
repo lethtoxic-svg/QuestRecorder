@@ -54,6 +54,7 @@ namespace QuestBehaviors
             _gaveUp = false;
             _atGiver = null;
             _pickUp = null;
+            _sinceClick = null;
         }
 
         /// <summary>BuddyCron's own PickUpQuest, set up with this step's giver and quest.</summary>
@@ -67,6 +68,7 @@ namespace QuestBehaviors
                     ProfileUseRange = ProfileUseRange,
                     ProfileSearchRadius = ProfileSearchRadius,
                     QuestId = QuestId,
+                    IgnoreLOS = true, // BuddyCron's default for PickUpQuest in a profile
                 };
             return _pickUp;
         }
@@ -74,10 +76,53 @@ namespace QuestBehaviors
         protected override Composite CreateBehavior()
         {
             return new PrioritySelector(
+                // BuddyCron's PickUpQuest looks the giver up once and keeps it. Looked up from the other side of a lift
+                // (Black Hole: the terminal floor), that copy goes stale and the bot stands next to the real Recon Droid
+                // doing nothing. Forget a stale or far-away copy so it looks again from here.
+                new Action(ret => { ForgetStaleGiver(); return RunStatus.Failure; }),
                 // the give-up: at the giver, no conversation going on, and still no quest after the tries -> move on
                 new Decorator(ret => ShouldGiveUp(), new ActionRunCoroutine(GiveUp)),
+                // at the giver: one click, then up to 3 s for the board to open. BuddyCron's PickUpQuest clicks again
+                // every 0.3 s, and a mission board takes almost a second to open, so each click cancelled the one before
+                // and the board never opened (Black Hole terminal, BuddyCron 1.0.76: 27 clicks in 10 s).
+                new Decorator(ret => WaitForBoard(), new Action(ret => RunStatus.Success)),
                 // everything else is BuddyCron's PickUpQuest, as it is
                 PickUpBehavior());
+        }
+
+        private Stopwatch _sinceClick;
+
+        /// <summary>True while a click at the giver is still waiting for its board / quest window (don't click again yet).</summary>
+        private bool WaitForBoard()
+        {
+            if (Core.Me == null || Core.Player == null)
+                return false;
+            if (Core.Player.MissionBoardOpen || Core.Player.LightweightQuestOffer != null)
+                return false; // open: let PickUpQuest take the mission
+            HeroCnvOracle cnv = ExtraNodeManager.ConvoOracle;
+            if (cnv != null && cnv.IsInConversation)
+                return false; // a conversation: PickUpQuest handles it
+            // only once a click can really happen: the giver found and within the game's interact range (the same test
+            // BuddyCron's walk-and-interact uses) - before that, never hold up the walk
+            bool inReach = false;
+            try
+            {
+                var giver = PickUp().Object;
+                inReach = giver != null && giver.IsValid && giver.IsWithinInteractRange;
+            }
+            catch
+            {
+                inReach = false;
+            }
+            if (!inReach)
+            {
+                _sinceClick = null; // still walking there
+                return false;
+            }
+            if (_sinceClick != null && _sinceClick.ElapsedMilliseconds < 3000)
+                return true; // clicked just now: give the board time to open
+            _sinceClick = Stopwatch.StartNew(); // this pass is the click
+            return false;
         }
 
         /// <summary>
@@ -89,6 +134,33 @@ namespace QuestBehaviors
             var make = typeof(PickupQuestTag).GetMethod("CreateBehavior", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
             var tree = make != null ? make.Invoke(PickUp(), null) as Composite : null;
             return tree ?? PickUp().Behavior;
+        }
+
+        private static System.Reflection.FieldInfo _giverField;
+
+        private void ForgetStaleGiver()
+        {
+            try
+            {
+                if (_pickUp == null)
+                    return;
+                if (_giverField == null)
+                    foreach (System.Reflection.FieldInfo f in typeof(PickupQuestTag).GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic))
+                        if (f.Name.IndexOf("<Object>", System.StringComparison.Ordinal) >= 0 && typeof(BuddyCron.Objects.HeroObject).IsAssignableFrom(f.FieldType))
+                            _giverField = f;
+                if (_giverField == null)
+                    return;
+                var kept = _giverField.GetValue(_pickUp) as BuddyCron.Objects.HeroObject;
+                if (kept == null)
+                    return;
+                // stale (gone, or not where the giver stands) -> look again
+                if (!kept.IsValid || kept.Location.DistanceSqr(Position) > 4f) // more than 20 m from the giver's spot
+                    _giverField.SetValue(_pickUp, null);
+            }
+            catch
+            {
+                // leave BuddyCron's lookup as it is
+            }
         }
 
         private bool ShouldGiveUp()
@@ -106,7 +178,9 @@ namespace QuestBehaviors
             }
             if (_atGiver == null)
                 _atGiver = Stopwatch.StartNew();
-            return _atGiver.ElapsedMilliseconds > 10000L * Tries;
+            // at least 45 s: BuddyCron's PickUpQuest waits up to 30 s at the spot for the giver to show up before it
+            // looks again - giving up sooner (as before) cut it off just before it found the Recon Droid
+            return _atGiver.ElapsedMilliseconds > System.Math.Max(10000L * Tries, 45000L);
         }
 
         private Task<bool> GiveUp(object arg)

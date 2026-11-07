@@ -1,3 +1,6 @@
-1.1b
+1.2
 QuestRecorder-1.1b.zip
-- 1.1a's pick-up was broken: the bot walked to the giver and didn't pick anything up. Fixed, the Recon Droid in Black Hole included.
+- Profiles copy what you did, in your order: mission items where you stood, on who, from how close, every use.
+- Scanner: eggs, bones and the mobs your missions need, also the ones you walk past. Collect steps take any of them nearby.
+- Rewards get taken, quick travel no longer makes walk points, special-bar abilities, disguises and defend steps are recorded.
+- Reads the game combat log for item uses with no cast bar (turn on Enable Combat Logging in the game).

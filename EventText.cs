@@ -98,14 +98,22 @@ namespace QuestRecorder
                 case EvKind.NpcClick:
                     return "Clicked NPC " + Name(e.Target);
                 case EvKind.QuestItem:
-                    return "Used quest item \"" + e.Option + "\"" + (e.Target != null ? " on " + Short(e.Target) : string.Empty);
+                    if (e.Note == "equipped")
+                        return "Put on \"" + e.Option + "\"";
+                    return (e.Note == "ability" ? "Used quest ability \"" : "Used quest item \"") + e.Option + "\"" + (e.Target != null ? " on " + Short(e.Target) : string.Empty);
                 case EvKind.Cast:
                     return "Cast \"" + (e.Option.Length > 0 ? e.Option : "?") + "\" for " + Fmt.Duration(e.DurationMs / 1000.0) + " (started out of combat)" +
                            (e.Target != null ? " near " + Short(e.Target) : string.Empty);
                 case EvKind.Spot:
-                    return "Scanner: another " + (e.Target != null ? Short(e.Target) : "object") + " nearby";
+                    return "Scanner: " + (e.Target != null && e.Target.Kind == ObjKind.Npc ? "a mob your mission counts, " + Short(e.Target) : "another " + (e.Target != null ? Short(e.Target) : "object")) + " nearby";
                 case EvKind.Command:
                     return "Command \"" + e.Option + "\" with the mouse over " + (e.Target != null ? Short(e.Target) : "something") + Paren(e.Note);
+                case EvKind.Target:
+                    return "Targeted " + (e.Target != null ? Short(e.Target) : "something");
+                case EvKind.Loot:
+                    return "Looted " + (e.Target != null ? Short(e.Target) : "a body");
+                case EvKind.CastStart:
+                    return "Started \"" + (e.Option.Length > 0 ? e.Option : "?") + "\" on " + (e.Target != null ? Short(e.Target) : "something");
                 case EvKind.BoardOpen:
                 {
                     int n = e.Details != null ? e.Details.Count : 0;
@@ -323,7 +331,8 @@ namespace QuestRecorder
             "seq,time,elapsed_s,kind,x,y,z,heading_deg,area_id,area_name,quest_id,quest_name,quest_fqn,quest_hidden,branch,step," +
             "old_branch,old_step,task_index,task_id,count,max,objective,target_kind,target_name,target_id,target_x,target_y," +
             "target_z,target_marker,target_how,before_x,before_y,before_z,before_area_id,before_area_name,stand_x,stand_y," +
-            "stand_z,option,note,live_check,live_check_failed,duration_ms,summary";
+            "stand_z,option,note,live_check,live_check_failed,duration_ms,summary," +
+            "target_dead,target_anchor,target_level,target_toughness,target_use_range,target_quest_usable,target_spec,task_targets,target_health";
 
         public static string CsvRow(RecEvent e)
         {
@@ -375,6 +384,20 @@ namespace QuestRecorder
             f.Add(e.Check.Length > 0 ? (e.CheckFailed ? "yes" : "no") : string.Empty);
             f.Add(e.DurationMs > 0 ? e.DurationMs.ToString() : string.Empty);
             f.Add(e.Summary);
+            // what the recorder knew about the object (new columns go at the end so older readers still work)
+            f.Add(t != null && t.Dead ? "yes" : string.Empty);
+            f.Add(t != null && t.Anchor != 0 ? Fmt.Hex(t.Anchor) : string.Empty);
+            f.Add(t != null && t.Level != 0 ? Fmt.UInt(t.Level) : string.Empty);
+            f.Add(t != null ? t.Toughness : string.Empty);
+            f.Add(t != null && t.UseRange > 0 ? Fmt.F3(t.UseRange) : string.Empty);
+            f.Add(t != null && t.UsableForQuest ? "yes" : string.Empty);
+            f.Add(t != null && t.Spec != 0 ? Fmt.Hex(t.Spec) : string.Empty);
+            var tt = new List<string>();
+            if (e.TaskTargets != null)
+                foreach (ulong id in e.TaskTargets)
+                    tt.Add(Fmt.Hex(id));
+            f.Add(string.Join(" ", tt.ToArray()));
+            f.Add(t != null && t.Health >= 0f ? Fmt.F3(t.Health) : string.Empty);
 
             var sb = new StringBuilder(256);
             for (int i = 0; i < f.Count; i++)

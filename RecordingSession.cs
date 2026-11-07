@@ -681,15 +681,31 @@ namespace QuestRecorder
                 if (profile == null || !File.Exists(profile))
                     return;
                 string fixes = Path.Combine(Path.GetDirectoryName(profile), "_fixer backups");
-                if (Directory.Exists(fixes) && Directory.GetFiles(fixes, Path.GetFileNameWithoutExtension(profile) + " (before fix*").Length > 0)
+                if (Directory.Exists(fixes) && (Directory.GetFiles(fixes, Path.GetFileNameWithoutExtension(profile) + " (before fix*").Length > 0 ||
+                                                Directory.GetFiles(fixes, Path.GetFileNameWithoutExtension(profile) + " (before review*").Length > 0))
                 {
-                    RrLog.Info("Your last {0} profile was changed in the control panel, so this recording starts a new one.", Place);
+                    // you saved it from the review list or changed it: it's yours, a new recording never touches it
+                    RrLog.Info("Your last {0} profile was saved from the review list or changed, so this recording starts a new one.", Place);
                     return;
                 }
                 var events = new List<RecEvent>();
                 LoadChain(prev, events, 0);
                 if (events.Count == 0)
                     return;
+                // every quest you picked up there was finished: that run is complete, start a new profile
+                var open = new HashSet<ulong>();
+                foreach (RecEvent e in events)
+                {
+                    if (e.Kind == EvKind.QuestAdded && !e.QuestHidden)
+                        open.Add(e.QuestId);
+                    else if (e.Kind == EvKind.QuestCompleted)
+                        open.Remove(e.QuestId);
+                }
+                if (open.Count == 0 && events.Exists(x => x.Kind == EvKind.QuestCompleted))
+                {
+                    RrLog.Info("Your last {0} recording was finished, so this recording starts a new profile.", Place);
+                    return;
+                }
                 foreach (RecEvent e in events)
                     e.Elapsed = e.Time != default(DateTime) ? (e.Time - Started).TotalSeconds : e.Elapsed - 1000000; // before this recording: negative, still in order
                 _joinEvents = events;

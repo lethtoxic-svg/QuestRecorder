@@ -147,6 +147,18 @@ namespace QuestRecorder
             set { SetField(ref _autoRecord, value, nameof(AutoRecord)); }
         }
 
+        private bool _recordBot;
+
+        [Category("1. Recording")]
+        [DisplayName("Keep recording while the bot plays")]
+        [Description("Off (normal): the recorder pauses while the bot runs, so it only records you. On: it records the bot too - for building a profile by letting the bot (or a helper driving it) play the content. Off by default.")]
+        [DefaultValue(false)]
+        public bool RecordBot
+        {
+            get { return _recordBot; }
+            set { SetField(ref _recordBot, value, nameof(RecordBot)); }
+        }
+
         private string _creditName = string.Empty;
 
         [Category("1. Recording")]

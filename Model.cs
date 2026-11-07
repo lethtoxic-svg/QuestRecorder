@@ -73,6 +73,14 @@ namespace QuestRecorder
         public int Floor;
         public ulong Level;
         public string Toughness = string.Empty;
+        /// <summary>It was dead when you used it (a loot, not a talk).</summary>
+        public bool Dead;
+        /// <summary>Its health (percent) at that moment; -1 = not known.</summary>
+        public float Health = -1f;
+        /// <summary>The game's id for where it spawns: the same for every respawn of it (0 = not known).</summary>
+        public ulong Anchor;
+        /// <summary>The game's id for its type (spnSpawnedSpec: every Czerka Combat Specialist shares one). 0 = not known.</summary>
+        public ulong Spec;
 
         public ObjRef Clone(string how)
         {
@@ -135,6 +143,8 @@ namespace QuestRecorder
         public ulong TaskId;
         public ulong Max;
         public string Text = string.Empty;
+        /// <summary>The mob / object type ids the game counts for this task (empty = not known).</summary>
+        public List<ulong> Targets = new List<ulong>();
     }
 
     /// <summary>Cached task list of one quest step.</summary>
@@ -283,8 +293,12 @@ namespace QuestRecorder
 
         // Extras read only on the sample where something started or changed.
         public ObjRef Click;
+        /// <summary>The target you picked on this look (null when it didn't change).</summary>
+        public ObjRef NewTarget;
         /// <summary>Other objects with the same name near the one you clicked (the scanner).</summary>
         public List<ObjRef> SameKind;
+        /// <summary>Objects one of your tasks counts, newly seen near you this look (the task scanner).</summary>
+        public List<ObjRef> TaskSpots;
         public string ClickCommand = string.Empty;
         /// <summary>A command other than "use" (right-click) started with the mouse over an object: not a click.</summary>
         public string OtherCommand;
@@ -314,7 +328,21 @@ namespace QuestRecorder
         public string QuestItemName;
         /// <summary>A mission item used without a cast bar (seen by its cooldown starting), or null.</summary>
         public string InstantItemName;
+        /// <summary>That item is a usable bag item, not a mission item (a stim): kept only when the quest moves right after.</summary>
+        public bool InstantItemBag;
+        /// <summary>That item left the mission items (your last one, or the game took it away when its step was done).</summary>
+        public bool InstantItemGone;
         public ObjRef CastTarget;
+        /// <summary>A quest ability you used from a special / temporary bar (Macrobinoculars, Seeker Droid), or null.</summary>
+        public string AbilityName;
+        /// <summary>What you used that ability on (your target NPC), or null for yourself / where you stand.</summary>
+        public ObjRef AbilityTarget;
+        /// <summary>An item you just put on (a quest disguise), or null.</summary>
+        public string EquippedName;
+        /// <summary>A mission item use only the game's combat log reported (no cast bar, no cooldown), or null.</summary>
+        public string LogItemName;
+        /// <summary>Who the combat log says you used it on, or null for yourself.</summary>
+        public ObjRef LogItemTarget;
     }
 
     internal enum EvKind
@@ -366,6 +394,12 @@ namespace QuestRecorder
         Command,
         /// <summary>Another object like the one you clicked, nearby (the scanner): more spots for "click any of these".</summary>
         Spot,
+        /// <summary>You picked a target (a mob to attack, an NPC, an object).</summary>
+        Target,
+        /// <summary>You looted a dead mob (clicked its body).</summary>
+        Loot,
+        /// <summary>A cast started (on the object it's used on): written when it starts, so it comes before what it caused.</summary>
+        CastStart,
     }
 
     internal sealed class QuestLine
@@ -387,6 +421,14 @@ namespace QuestRecorder
         public DateTime Time;
         public double Elapsed;
         public EvKind Kind;
+
+        /// <summary>A copy as another kind (the profile builder reads a loot as a loot without changing the recording).</summary>
+        public RecEvent As(EvKind kind)
+        {
+            var c = (RecEvent)MemberwiseClone();
+            c.Kind = kind;
+            return c;
+        }
 
         // where you were
         public Vec3 Pos;
@@ -411,6 +453,8 @@ namespace QuestRecorder
         public ulong Max;
         public int TaskTotal = -1;
         public string Text = string.Empty;
+        /// <summary>For a count: the mob / object type ids the game counts for that task (empty = not known).</summary>
+        public List<ulong> TaskTargets = new List<ulong>();
 
         // what you interacted with
         public ObjRef Target;

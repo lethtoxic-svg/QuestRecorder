@@ -131,6 +131,7 @@ namespace QuestRecorder
             }
 
             TryQuestLog();
+            TargetPicked(cur);
             Clicks(cur);
             OtherCommand(cur);
             Casts(prev, cur);
@@ -237,8 +238,28 @@ namespace QuestRecorder
 
         // ------------------------------------------------------------------ clicks and casts
 
+        /// <summary>You picked a new target: which mob, NPC or object, and where.</summary>
+        private void TargetPicked(Snap cur)
+        {
+            if (cur.NewTarget == null)
+                return;
+            RecEvent e = New(EvKind.Target, cur);
+            e.Target = cur.NewTarget;
+            Emit(e);
+        }
+
         private void Clicks(Snap cur)
         {
+            // the task scanner: objects one of your tasks counts, seen near you (also ones you never clicked)
+            if (cur.TaskSpots != null)
+                foreach (ObjRef spot in cur.TaskSpots)
+                {
+                    if (!_spotted.Add(spot.NodeId))
+                        continue; // already noted
+                    RecEvent ts = New(EvKind.Spot, cur);
+                    ts.Target = spot;
+                    Emit(ts);
+                }
             ObjRef c = cur.Click;
             if (c == null)
                 return;
@@ -259,6 +280,14 @@ namespace QuestRecorder
                         sp.Target = same;
                         Emit(sp);
                     }
+            }
+            else if (c.Kind == ObjKind.Npc && c.Dead)
+            {
+                // a dead mob: you looted it (in a fight or not), not a talk
+                RecEvent e = New(EvKind.Loot, cur);
+                e.Target = c;
+                e.Option = cur.ClickCommand;
+                Emit(e);
             }
             else if (c.Kind == ObjKind.Npc && !cur.InCombat)
             {
@@ -287,10 +316,39 @@ namespace QuestRecorder
 
         private void Casts(Snap prev, Snap cur)
         {
+            // a quest ability from a special / temporary bar: recorded like a mission item use, marked "ability"
+            if (cur.AbilityName != null)
+            {
+                RecEvent ae = New(EvKind.QuestItem, cur);
+                ae.Option = cur.AbilityName;
+                ae.Note = "ability";
+                ae.Target = cur.AbilityTarget;
+                Emit(ae);
+            }
+            // a mission item use the game's combat log reported (no cast bar, no cooldown, nothing left your bags)
+            if (cur.LogItemName != null)
+            {
+                RecEvent le = New(EvKind.QuestItem, cur);
+                le.Option = cur.LogItemName;
+                le.Target = cur.LogItemTarget;
+                Emit(le);
+            }
+            // an item you put on (a quest disguise)
+            if (cur.EquippedName != null)
+            {
+                RecEvent ee = New(EvKind.QuestItem, cur);
+                ee.Option = cur.EquippedName;
+                ee.Note = "equipped";
+                Emit(ee);
+            }
             if (cur.InstantItemName != null)
             {
                 RecEvent ie = New(EvKind.QuestItem, cur);
                 ie.Option = cur.InstantItemName;
+                if (cur.InstantItemBag)
+                    ie.Note = "bag item";
+                else if (cur.InstantItemGone)
+                    ie.Note = "item gone";
                 ie.Target = cur.CastTarget;
                 Emit(ie);
             }
@@ -307,6 +365,14 @@ namespace QuestRecorder
                 _castInCombat = prev.InCombat || cur.InCombat;
                 _castIsQuestItem = cur.QuestItemName != null;
                 _castTarget = cur.QuestItemName == null ? cur.CastTarget : null;
+                if (!_castIsQuestItem && _castTarget != null && _castTarget.Kind == ObjKind.Placeable)
+                {
+                    // the use starts now: written before the quest counts it
+                    RecEvent cs = New(EvKind.CastStart, cur);
+                    cs.Option = _castName;
+                    cs.Target = _castTarget;
+                    Emit(cs);
+                }
                 if (cur.QuestItemName != null)
                 {
                     RecEvent e = New(EvKind.QuestItem, cur);
@@ -328,7 +394,7 @@ namespace QuestRecorder
             _lastCastEndTick = cur.Tick;
             // Out-of-combat casts, plus casts on an object when a fight broke out during them.
             bool onObject = _castTarget != null && _castTarget.Kind == ObjKind.Placeable;
-            if (!_castIsQuestItem && ms >= 300 && ((!_castInCombat && !cur.InCombat) || (!_castInCombat && onObject)))
+            if (!_castIsQuestItem && ms >= 300 && (onObject || (!_castInCombat && !cur.InCombat)))
             {
                 RecEvent e = New(EvKind.Cast, cur);
                 e.Pos = _castPos;
@@ -388,7 +454,7 @@ namespace QuestRecorder
                 Emit(e);
                 moved = true;
             }
-            if (!moved && !cur.IsInTaxi && !prev.IsInTaxi && dist >= Cfg.JumpMeters && dist / dt > 25.0)
+            if (!moved && !cur.IsInTaxi && !prev.IsInTaxi && dist * MetresPerUnit >= Cfg.JumpMeters && dist / dt > 25.0)
             {
                 RecEvent e = New(EvKind.Jump, cur);
                 SetFrom(e, prev);
@@ -710,6 +776,7 @@ namespace QuestRecorder
                         e.TaskId = ti.TaskId;
                         e.Max = ti.Max;
                         e.Text = ti.Text;
+                        e.TaskTargets = ti.Targets; // what the game counts for this task
                     }
                     bool gt;
                     if (cur.TaskChecks != null && cur.TaskChecks.TryGetValue(q.QuestId.ToString("X16") + ":" + i.ToString(), out gt))
@@ -878,7 +945,11 @@ namespace QuestRecorder
             }
             if (boardRecently)
                 return Board(out how, out board);
-            if (_lastClick != null && cur.Tick - _lastClickTick <= ClickWindowMs)
+            // A pick-up: whatever you clicked last gave it. A hand-in only if what you clicked takes hand-ins
+            // (a quest-end marker or a dropbox): quests that finish by themselves (CZ-198 dailies) aren't
+            // handed in to the container you happened to click.
+            if (_lastClick != null && cur.Tick - _lastClickTick <= ClickWindowMs &&
+                (forPickup || _lastClick.TakesTurnIn || _lastClick.Name.IndexOf("Dropbox", StringComparison.OrdinalIgnoreCase) >= 0))
             {
                 how = How.Clicked;
                 return _lastClick;
@@ -951,9 +1022,13 @@ namespace QuestRecorder
             }
         }
 
+        /// <summary>Game positions are in units of 10 m (BuddyCron: 2.6 apart = "26 meters").</summary>
+        internal const float MetresPerUnit = 10f;
+
         private void Breadcrumb(Snap cur)
         {
-            int every = Cfg.BreadcrumbMeters;
+            // your footsteps every 5 m or closer (old settings said 25 m), so the profile can walk where you walked
+            int every = Cfg.BreadcrumbMeters <= 0 ? 5 : Math.Min(Cfg.BreadcrumbMeters, 5);
             if (!_haveCrumb)
             {
                 _haveCrumb = true;
@@ -965,7 +1040,7 @@ namespace QuestRecorder
                 _lastCrumb = cur.Pos;
                 return;
             }
-            if (every <= 0 || cur.Pos.DistanceTo(_lastCrumb) < every)
+            if (cur.Pos.DistanceTo(_lastCrumb) * MetresPerUnit < every)
                 return;
             _lastCrumb = cur.Pos;
             Emit(New(EvKind.Breadcrumb, cur));

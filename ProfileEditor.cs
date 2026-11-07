@@ -158,6 +158,15 @@ namespace QuestRecorder
                 case "LoadProfile":
                     parts.Add("load " + Attr(e, "Path"));
                     return;
+                case "ClickObject":
+                    parts.Add("click " + Attr(e, "Name") + " (that exact one)");
+                    return;
+                case "UseQuestAbility":
+                    parts.Add("use ability " + Attr(e, "AbilityName"));
+                    return;
+                case "EquipItem":
+                    parts.Add("put on " + Attr(e, "ItemName"));
+                    return;
                 case "UseMissionItemOnce":
                     parts.Add("use " + Attr(e, "ItemName") + " once");
                     return;
@@ -292,7 +301,7 @@ namespace QuestRecorder
         public void Add(string xml, string comment, StepView before)
         {
             // parse inside the profile's own namespace, so the new step looks like the rest of the file
-            var tmp = new XmlDocument();
+            var tmp = new XmlDocument { PreserveWhitespace = true }; // keep the step laid out like the rest of the file
             tmp.LoadXml("<x" + (_ns.Length > 0 ? " xmlns=\"" + _ns + "\"" : string.Empty) + ">" + xml + "</x>");
             XmlNode node = null;
             foreach (XmlNode n in tmp.DocumentElement.ChildNodes)

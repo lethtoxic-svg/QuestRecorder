@@ -23,7 +23,7 @@ namespace QuestRecorder
         // Engine-call work stops once a look has spent this long reading (the rest waits for the next looks).
         private const double ReadBudgetMs = 8.0;
         // Nearby-object searches are skipped once a look has spent this long reading.
-        private const double NearbyStopMs = 15.0;
+        private const double NearbyStopMs = 30.0; // a normal look already takes ~14 ms: at 15 most searches were skipped
         // A quest that left the log waits at most this many looks for its "was it completed?" check.
         private const int MaxRemovedWaits = 15;
         private const int MaxTaxiChoices = 40;
@@ -154,7 +154,38 @@ namespace QuestRecorder
             _questItemByName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             _unmatchedLogged.Clear();
             _questItemsTick = NeverRead; // not long.MinValue: now - MinValue overflows and the list was never read
+            // another character: its items aren't "used" or "gone" compared with the last one's
+            _itemStack.Clear();
+            _itemCooldown.Clear();
+            _questNames = new HashSet<string>(StringComparer.Ordinal);
+            _bagNames = new HashSet<string>(StringComparer.Ordinal);
+            _bagPlot = new HashSet<string>(StringComparer.Ordinal);
+            _bagPlotBefore = new HashSet<string>(StringComparer.Ordinal);
+            _bagGone = null;
+            _goneQueue.Clear();
+            _wasQuestItem.Clear();
+            _castItemName = null;
+            _baseAbilities = null;
+            _abilityName.Clear();
+            _abilityFails = 0;
+            _abilityOff = false;
+            _abilityCd.Clear();
+            _abilityUsedAt.Clear();
+            _equipped = null;
+            _logItemName = null;
+            _instName = null;
+            _questEmptyReads = 0;
+            _bagEmptyReads = 0;
         }
+
+        // item uses: the item whose cast was recorded (its end isn't a second use), items that left the bags waiting to be
+        // reported (one per look), and every name seen among the mission items
+        private string _castItemName;
+        private long _castItemSeen;
+        private readonly List<string> _goneQueue = new List<string>();
+        private readonly HashSet<string> _wasQuestItem = new HashSet<string>(StringComparer.Ordinal);
+        private int _questEmptyReads;
+        private int _bagEmptyReads;
 
         // ------------------------------------------------------------------ per-look budget
 
@@ -241,10 +272,27 @@ namespace QuestRecorder
             Part("combat", () => ReadCombat(me, prev, s));
             Part("casts", () => ReadCast(me, prev, s));
             Part("items", () => ReadInstantItems(me, s));
+            Part("task scan", () => ScanTaskObjects(s));
+            Part("combat log", () => ReadCombatLog(s));
+            Part("quest abilities", () => ReadQuestAbilities(s));
+            Part("equipped", () => ReadEquipped(me, s));
             Part("taxi map", () => ReadTaxiMap(s));
             Part("movement", () => ReadMovement(me, prev, afterLoading, s));
             Part("mission board", () => ReadBoard(me, prev, s));
+            Part("target", () => ReadTarget(prev, s));
             return s;
+        }
+
+        /// <summary>You picked a new target (a mob, an NPC or an object): what it is and where.</summary>
+        private void ReadTarget(Snap prev, Snap s)
+        {
+            if (s.TargetId == 0 || s.TargetId == s.PlayerId || s.TargetId == s.CompanionId)
+                return;
+            if (prev != null && prev.TargetId == s.TargetId)
+                return;
+            ObjRef t = Describe(HeroObjectManager.GetByNodeId(s.TargetId), "you targeted it");
+            if (t != null && (t.Kind == ObjKind.Npc || t.Kind == ObjKind.Placeable))
+                s.NewTarget = t;
         }
 
         private void Part(string what, Action read)
@@ -373,6 +421,24 @@ namespace QuestRecorder
             if (list.Count == 0 && prev != null && prev.Quests.Count >= 3)
                 return; // a whole quest log never empties in one look: not loaded yet (Read keeps the last list)
 
+            // The scanner only looks for what your missions still need right now: the mob / object types the game counts
+            // for the current step of each mission in your log, and only tasks that aren't full yet. A finished mission or
+            // a full counter stops being scanned for.
+            _taskSpecs.Clear();
+            foreach (QSnap q in list)
+            {
+                StepInfo cur = Step(q.QuestId, q.Branch, q.Step);
+                if (!cur.Resolved)
+                    continue;
+                foreach (TaskInfo ti in cur.Tasks)
+                {
+                    if (ti.Max > 0 && ti.Index >= 0 && ti.Index < q.Counts.Length && q.Counts[ti.Index] >= ti.Max)
+                        continue; // this counter is full
+                    foreach (ulong spec in ti.Targets)
+                        _taskSpecs.Add(spec);
+                }
+            }
+
             foreach (PendingQuestRewards pr in qc.PendingQuestRewards)
             {
                 if (pr != null)
@@ -470,10 +536,39 @@ namespace QuestRecorder
                     var ti = new TaskInfo { Index = i, TaskId = td.TaskId, Max = td.TaskCountMax };
                     if (def != null && !_textDisabled)
                         ti.Text = TaskText(def, td);
+                    ti.Targets = TaskTargets(td);
+                    foreach (ulong spec in ti.Targets)
+                        _taskSpecs.Add(spec); // the task scanner looks for these
                     si.Tasks.Add(ti);
                 }
             }
             si.Resolved = true;
+        }
+
+        /// <summary>
+        /// What the game itself counts for this task: the mob / object type ids (qstTaskObjects, checked live on
+        /// CZ-198: Workforce Reduction lists its 6 Czerka types). Empty for talk / walk tasks.
+        /// </summary>
+        private static List<ulong> TaskTargets(QuestTaskDefinition task)
+        {
+            var list = new List<ulong>();
+            try
+            {
+                GomContainer c;
+                if (task.TryGetField<GomContainer>(GomFieldId.qstTaskObjects, out c) && c.IsValid && c.Count > 0)
+                    foreach (ulong k in c.Keys<ulong>())
+                        if (k != 0 && !list.Contains(k))
+                            list.Add(k);
+                if (task.TryGetField<GomContainer>(GomFieldId.qstTaskInteractionObjects, out c) && c.IsValid && c.Count > 0)
+                    foreach (ulong k in c.Keys<ulong>())
+                        if (k != 0 && !list.Contains(k))
+                            list.Add(k);
+            }
+            catch
+            {
+                // no list for this task: the recorder simply can't double-check it
+            }
+            return list;
         }
 
         /// <summary>Objective text through the quest's text-retriever map (the PugTools path; unverified on a live client).</summary>
@@ -571,6 +666,453 @@ namespace QuestRecorder
             _lastClickTick = s.Tick;
         }
 
+        // the object types your quests' tasks count (from the game's own task data), and the objects already noted
+        // ------------------------------------------------------------------ the game's combat log
+
+        private string _logPath;
+        private long _logPos = -1;
+        private long _logScanTick = NeverRead;
+        private long _logReadTick = NeverRead;
+        private string _logRest = string.Empty;
+        private string _logItemName;
+        private long _logItemSeen;
+        private string _instName;
+        private long _instSeen;
+
+        /// <summary>
+        /// The game's own report of every ability you activate: its combat log (Documents\Star Wars - The Old Republic\
+        /// CombatLogs, when combat logging is on in the game's settings). A mission item used with no cast bar, no
+        /// cooldown and nothing leaving your bags (Section X: the Serum Injector on the Hyperbeast) shows up there as
+        /// "AbilityActivate", with the item and who it was used on. Only your own uses of your mission items; a use the
+        /// recorder already saw (cast, cooldown, item gone) isn't counted twice.
+        /// </summary>
+        private void ReadCombatLog(Snap s)
+        {
+            if (s.Tick - _logReadTick < 500)
+                return;
+            _logReadTick = s.Tick;
+            if (_logPath == null || s.Tick - _logScanTick > 30000)
+            {
+                _logScanTick = s.Tick;
+                string dir = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Star Wars - The Old Republic", "CombatLogs");
+                if (!System.IO.Directory.Exists(dir))
+                    return; // combat logging was never on: nothing to read
+                System.IO.FileInfo newest = null;
+                foreach (System.IO.FileInfo f in new System.IO.DirectoryInfo(dir).GetFiles("combat_*.txt"))
+                    if (newest == null || f.LastWriteTimeUtc > newest.LastWriteTimeUtc)
+                        newest = f;
+                if (newest == null)
+                    return;
+                if (newest.FullName != _logPath)
+                {
+                    _logPath = newest.FullName;
+                    _logPos = newest.Length; // only what happens from now on
+                    _logRest = string.Empty;
+                    return;
+                }
+            }
+            string text;
+            using (var fs = new System.IO.FileStream(_logPath, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete))
+            {
+                if (fs.Length < _logPos)
+                    _logPos = 0;
+                if (fs.Length == _logPos)
+                    return;
+                long n = Math.Min(fs.Length - _logPos, 256 * 1024);
+                fs.Seek(_logPos, System.IO.SeekOrigin.Begin);
+                var buf = new byte[n];
+                int read = fs.Read(buf, 0, (int)n);
+                _logPos += read;
+                text = _logRest + System.Text.Encoding.Latin1.GetString(buf, 0, read);
+            }
+            int last = text.LastIndexOf('\n');
+            _logRest = last < 0 ? text : text.Substring(last + 1);
+            if (last < 0)
+                return;
+            string me = s.PlayerName ?? string.Empty;
+            string meUtf = System.Text.Encoding.Latin1.GetString(System.Text.Encoding.UTF8.GetBytes(me)); // (the log may be UTF-8: read as Latin-1, "Øø" looks like this)
+            string[] lines = text.Substring(0, last).Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].TrimEnd('\r');
+                // [time] [source] [target] [ability {id}] [Event {id}: what {id}]
+                List<string> f = LogFields(line);
+                if (f.Count < 5 || !IsMe(f[1], me, meUtf))
+                    continue;
+                // who you have targeted (the game logs it as TargetSet): who an item with no target of its own went on
+                if (f[4].IndexOf("TargetSet", StringComparison.Ordinal) >= 0)
+                {
+                    _logTargetName = f[2].Length > 0 && f[2] != "=" && !f[2].StartsWith("@", StringComparison.Ordinal) ? LogName(f[2]) : null;
+                    continue;
+                }
+                if (f[4].IndexOf("AbilityActivate", StringComparison.Ordinal) < 0)
+                    continue;
+                string abl = LogName(f[3]);
+                string item = LogItem(abl);
+                if (item == null)
+                    continue; // not one of your mission items
+                if (s.QuestItemName == item || s.InstantItemName == item || IsSameCast(item, s) || (_instName == item && s.Tick - _instSeen < 4000))
+                    continue; // already recorded from its cast / cooldown / leaving your bags
+                // the activation line says [=]: who it went on is on the effect line right after (Radiation Sensor ->
+                // "Tagged" on the Imperial Soldier), or else your target (Serum Injector -> the Hyperbeast)
+                string stamp = f[0];
+                string onName = null;
+                for (int j = i + 1; j < lines.Length && j <= i + 40; j++)
+                {
+                    List<string> g = LogFields(lines[j].TrimEnd('\r'));
+                    if (g.Count < 5 || g[0] != stamp)
+                        break;
+                    if (IsMe(g[1], me, meUtf) && LogName(g[3]) == abl && g[2].Length > 0 && g[2] != "=" && !g[2].StartsWith("@", StringComparison.Ordinal))
+                    {
+                        onName = LogName(g[2]);
+                        break;
+                    }
+                }
+                if (onName == null)
+                    onName = _logTargetName;
+                s.LogItemName = item;
+                s.LogItemTarget = onName != null ? LogTarget(onName, s) : null;
+                _logItemName = item;
+                _logItemSeen = s.Tick;
+                return; // one per look
+            }
+        }
+
+        private string _logTargetName;
+
+        /// <summary>The combat log source is you (not a companion, not another player).</summary>
+        private static bool IsMe(string src, string me, string meUtf)
+        {
+            // "@Name#123|(x,y,z,h)|(hp/max)" is you; "@Name#123/Theron Shan {..}|..." is your companion (the "/" before the
+            // first "|" - the health part has one too)
+            int bar = src.IndexOf('|');
+            string head = bar >= 0 ? src.Substring(0, bar) : src;
+            if (!head.StartsWith("@", StringComparison.Ordinal) || head.IndexOf('/') >= 0)
+                return false;
+            string n = LogName(head.Substring(1));
+            return me.Length == 0 || n == me || n == meUtf;
+        }
+
+        /// <summary>
+        /// The mission item a logged ability belongs to: its own name or its ability's ("Radiation Sensor"), or the cast
+        /// bar text "Using Serum..." for the one mission item whose name starts with it ("Serum Injector").
+        /// </summary>
+        private string LogItem(string abl)
+        {
+            if (abl.Length == 0)
+                return null;
+            string item;
+            if (_questItemByName.TryGetValue(abl, out item))
+                return item;
+            if (!abl.StartsWith("Using ", StringComparison.Ordinal))
+                return null;
+            string bare = abl.Substring(6).TrimEnd('.', ' ');
+            if (bare.Length < 3)
+                return null;
+            string found = null;
+            foreach (string v in _questItemByName.Values)
+                if (v == bare || v.StartsWith(bare + " ", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (found != null && found != v)
+                        return null; // two items fit: don't guess
+                    found = v;
+                }
+            return found;
+        }
+
+        /// <summary>The [..] fields of a combat log line.</summary>
+        private static List<string> LogFields(string line)
+        {
+            var list = new List<string>();
+            int i = 0;
+            while (i < line.Length && list.Count < 6)
+            {
+                int a = line.IndexOf('[', i);
+                if (a < 0)
+                    break;
+                int b = line.IndexOf(']', a + 1);
+                if (b < 0)
+                    break;
+                list.Add(line.Substring(a + 1, b - a - 1).Trim());
+                i = b + 1;
+            }
+            return list;
+        }
+
+        /// <summary>"Hyperbeast {1234}:5678|(x,y,z,h)|(hp)" or "Name#123|..." -> "Hyperbeast" / "Name".</summary>
+        private static string LogName(string field)
+        {
+            int cut = field.Length;
+            foreach (char c in new[] { '{', '#', '|' })
+            {
+                int k = field.IndexOf(c);
+                if (k >= 0 && k < cut)
+                    cut = k;
+            }
+            return field.Substring(0, cut).Trim();
+        }
+
+        /// <summary>Who the combat log says you used it on: that NPC (the nearest of that name), or null for yourself.</summary>
+        private ObjRef LogTarget(string field, Snap s)
+        {
+            if (field.Length == 0 || field == "=" || field.StartsWith("@", StringComparison.Ordinal))
+                return null; // yourself, nothing, or a player
+            string name = LogName(field);
+            if (name.Length == 0)
+                return null;
+            try
+            {
+                HeroCharacter best = null;
+                float bestD = 4f; // within ~40 m
+                foreach (HeroCharacter c in HeroObjectManager.GetObjects<HeroCharacter>())
+                {
+                    if (c == null || !c.IsValid || c is HeroPlayer)
+                        continue;
+                    string n = NameOf(c);
+                    if (n != name)
+                        continue;
+                    float d = V(c.Location).DistanceTo(s.Pos);
+                    if (d < bestD)
+                    {
+                        bestD = d;
+                        best = c;
+                    }
+                }
+                return best != null ? Describe(best, "who the game's combat log says you used it on") : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        // ------------------------------------------------------------------ quest abilities, equipped items
+
+        private HashSet<string> _baseAbilities; // your abilities when the recording began (your class kit)
+        private readonly Dictionary<string, float> _abilityCd = new Dictionary<string, float>(StringComparer.Ordinal);
+        private readonly Dictionary<string, long> _abilityUsedAt = new Dictionary<string, long>(StringComparer.Ordinal);
+        private long _abilityTick = NeverRead;
+        private readonly Dictionary<HeroAbility, string> _abilityName = new Dictionary<HeroAbility, string>();
+        private int _abilityFails;
+        private bool _abilityOff;
+
+        /// <summary>
+        /// Abilities a quest gives you for a while (the special / temporary bar: Macrobinoculars' scan, the Seeker Droid's
+        /// dig): anything you can cast now that you couldn't when the recording began, and that isn't a mission item.
+        /// A use is its cast starting or its cooldown starting (instant ones). The profile builder keeps a use only if a
+        /// mission moved right after, so a new class ability from a level-up never becomes a step.
+        /// </summary>
+        private void ReadQuestAbilities(Snap s)
+        {
+            if (_abilityOff || s.Tick - _abilityTick < 1000)
+                return;
+            _abilityTick = s.Tick;
+            var names = new List<string>();
+            bool trouble = false;
+            try
+            {
+                foreach (HeroAbility a in AbilityManager.KnownAbilities)
+                {
+                    if (a == null)
+                        continue;
+                    // each ability's name is asked once (the wrappers are stable): asking the game for every name on every
+                    // look made it throw ("process exception") over and over
+                    string n;
+                    if (!_abilityName.TryGetValue(a, out n))
+                    {
+                        try
+                        {
+                            n = Fmt.OneLine(a.Name);
+                        }
+                        catch
+                        {
+                            n = null; // some abilities can't give their name (GetAbilityNameStringID not declared): skip them for good
+                        }
+                        if (_abilityName.Count < 2000)
+                            _abilityName[a] = n;
+                    }
+                    if (!string.IsNullOrEmpty(n))
+                        names.Add(n);
+                }
+            }
+            catch
+            {
+                trouble = true;
+            }
+            // the game keeps refusing: stop asking for the rest of this recording (everything else carries on)
+            _abilityFails = trouble ? _abilityFails + 1 : 0;
+            if (_abilityFails >= 5)
+            {
+                _abilityOff = true;
+                RrLog.Info("The game won't say which special-bar abilities you have - quest abilities aren't recorded this time (everything else is).");
+                return;
+            }
+            if (trouble)
+                return;
+            if (names.Count == 0)
+                return;
+            if (_baseAbilities == null)
+            {
+                _baseAbilities = new HashSet<string>(names, StringComparer.Ordinal);
+                return;
+            }
+            foreach (string n in names)
+            {
+                if (_baseAbilities.Contains(n) || _questItemByName.ContainsKey(n))
+                    continue; // your class kit, or a mission item (recorded as an item)
+                float cd;
+                try
+                {
+                    cd = AbilityManager.GetCooldownRemaining(n, true);
+                }
+                catch
+                {
+                    continue;
+                }
+                float before;
+                bool known = _abilityCd.TryGetValue(n, out before);
+                _abilityCd[n] = cd;
+                bool cast = s.IsCasting && s.CastName == n;
+                bool cooled = known && cd > 1.6f && cd > before + 1f;
+                long last;
+                if ((cast || cooled) && (!_abilityUsedAt.TryGetValue(n, out last) || s.Tick - last > 4000))
+                {
+                    _abilityUsedAt[n] = s.Tick;
+                    s.AbilityName = n;
+                    s.AbilityTarget = AbilityTarget(s);
+                    return; // one per look
+                }
+            }
+        }
+
+        /// <summary>Your target when you used a quest ability, if it's an NPC within ~30 m (who you used it on).</summary>
+        private ObjRef AbilityTarget(Snap s)
+        {
+            try
+            {
+                if (s.TargetId == 0 || s.TargetId == s.PlayerId || s.TargetId == s.CompanionId)
+                    return null;
+                var npc = HeroObjectManager.GetByNodeId(s.TargetId) as HeroNPC;
+                if (npc == null || !npc.IsValid || V(npc.Location).DistanceTo(s.Pos) > 3f)
+                    return null;
+                return Describe(npc, "your target when you used the ability");
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private HashSet<string> _equipped;
+        private long _equipTick = NeverRead;
+
+        /// <summary>An item you put on during the recording (a quest disguise): anything newly equipped. The profile builder
+        /// keeps it only if a mission moved soon after.</summary>
+        private void ReadEquipped(HeroLocalPlayer me, Snap s)
+        {
+            if (s.Tick - _equipTick < 1000)
+                return;
+            _equipTick = s.Tick;
+            var now = new HashSet<string>(StringComparer.Ordinal);
+            foreach (HeroItem it in me.EquippedItems)
+            {
+                if (it == null)
+                    continue;
+                string n = Fmt.OneLine(it.Name);
+                if (n.Length > 0)
+                    now.Add(n);
+            }
+            if (now.Count == 0)
+                return; // not loaded yet
+            if (_equipped != null)
+                foreach (string n in now)
+                    if (!_equipped.Contains(n))
+                    {
+                        s.EquippedName = n;
+                        break;
+                    }
+            _equipped = now;
+        }
+
+        private readonly HashSet<ulong> _taskSpecs = new HashSet<ulong>();
+        private readonly HashSet<ulong> _taskSpotted = new HashSet<ulong>();
+        private long _taskScanTick = NeverRead;
+
+        /// <summary>
+        /// The task scanner: every 3 s, the objects within 80 m that one of your tasks counts (the game says which object
+        /// types each task counts), also the ones you never clicked - the eggs and bones you walked past are spots for the
+        /// collect step too. Up to 30 new ones per look.
+        /// </summary>
+        private void ScanTaskObjects(Snap s)
+        {
+            if (_taskSpecs.Count == 0 || s.Tick - _taskScanTick < 3000 || s.Pos.IsZero)
+                return;
+            _taskScanTick = s.Tick;
+            var found = new List<ObjRef>();
+            try
+            {
+                foreach (HeroPlaceable p in HeroObjectManager.GetObjects<HeroPlaceable>())
+                {
+                    if (p == null || found.Count >= 30 || _taskSpotted.Contains(p.NodeId))
+                        continue;
+                    try
+                    {
+                        Vec3 pos = V(p.Location);
+                        if (pos.IsZero || pos.DistanceTo(s.Pos) > 8f)
+                            continue;
+                        ulong spec;
+                        if (!p.TryGetField<ulong>(GomFieldId.spnSpawnedSpec, out spec) || !_taskSpecs.Contains(spec))
+                            continue;
+                        string n = Fmt.OneLine(p.Name);
+                        if (n.Length == 0)
+                            continue;
+                        _taskSpotted.Add(p.NodeId);
+                        found.Add(new ObjRef { Name = n, NodeId = p.NodeId, Kind = ObjKind.Placeable, Pos = pos, HasPos = true, Spec = spec, How = "an object one of your tasks counts (scanner)" });
+                    }
+                    catch
+                    {
+                        // skip this one
+                    }
+                }
+            }
+            catch
+            {
+                // no scan this time
+            }
+            // the mobs your tasks count, too: every one you came within 80 m of is a spot where that fight can find them
+            try
+            {
+                foreach (HeroNPC npc in HeroObjectManager.GetObjects<HeroNPC>())
+                {
+                    if (npc == null || found.Count >= 60 || _taskSpotted.Contains(npc.NodeId) || npc.NodeId == s.CompanionId)
+                        continue;
+                    try
+                    {
+                        Vec3 pos = V(npc.Location);
+                        if (pos.IsZero || pos.DistanceTo(s.Pos) > 8f)
+                            continue;
+                        ulong spec;
+                        if (!npc.TryGetField<ulong>(GomFieldId.spnSpawnedSpec, out spec) || !_taskSpecs.Contains(spec))
+                            continue;
+                        string n = NameOf(npc);
+                        if (string.IsNullOrEmpty(n))
+                            continue;
+                        _taskSpotted.Add(npc.NodeId);
+                        found.Add(new ObjRef { Name = n, NodeId = npc.NodeId, Kind = ObjKind.Npc, Pos = pos, HasPos = true, Spec = spec, How = "a mob one of your tasks counts (scanner)" });
+                    }
+                    catch
+                    {
+                        // skip this one
+                    }
+                }
+            }
+            catch
+            {
+                // no mob scan this time
+            }
+            s.TaskSpots = found.Count > 0 ? found : null;
+        }
+
         /// <summary>
         /// The scanner: every other object with the same name within 80 m of the one you clicked (up to 20), so a
         /// "click 4 of these" step knows all the spots, not only the ones you happened to use.
@@ -597,7 +1139,7 @@ namespace QuestRecorder
                     {
                         continue;
                     }
-                    if (pos.IsZero || pos.DistanceTo(clicked.Pos) > 80f)
+                    if (pos.IsZero || pos.DistanceTo(clicked.Pos) > 8f)
                         continue;
                     list.Add(new ObjRef { Name = n, NodeId = p.NodeId, Kind = ObjKind.Placeable, Pos = pos, HasPos = true, How = "same kind nearby (scanner)" });
                 }
@@ -639,7 +1181,7 @@ namespace QuestRecorder
             }
             if (s.ConvoIsComlink)
                 return; // a holocom call has nobody standing next to you
-            s.ConvoPartner = GuessPartner(s, cfg.PartnerRadius);
+            s.ConvoPartner = GuessPartner(s, Math.Max(2, cfg.PartnerRadius / 10));
             if (s.ConvoPartner != null && s.ConvoPartner.OffersQuest && s.ConvoPartner.NodeId != 0)
             {
                 try
@@ -704,7 +1246,7 @@ namespace QuestRecorder
             if (s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId)
             {
                 ObjRef t = Describe(HeroObjectManager.GetByNodeId(s.TargetId), "your target");
-                if (t != null && (t.Kind == ObjKind.Npc || t.Kind == ObjKind.Placeable) && (!t.HasPos || t.Pos.DistanceTo(s.Pos) <= 15f))
+                if (t != null && (t.Kind == ObjKind.Npc || t.Kind == ObjKind.Placeable) && (!t.HasPos || t.Pos.DistanceTo(s.Pos) <= 2f))
                     return t;
             }
             List<KeyValuePair<float, HeroObject>> near = Nearby(s, radius);
@@ -718,12 +1260,12 @@ namespace QuestRecorder
             }
             foreach (KeyValuePair<float, HeroObject> kv in near)
             {
-                if (kv.Value is HeroNPC && kv.Key <= 25f)
+                if (kv.Value is HeroNPC && kv.Key <= 4f)
                     return Describe(kv.Value, "nearest NPC (guess)");
             }
             foreach (KeyValuePair<float, HeroObject> kv in near)
             {
-                if (kv.Value is HeroPlaceable && kv.Key <= 16f)
+                if (kv.Value is HeroPlaceable && kv.Key <= 1f)
                     return Describe(kv.Value, "nearest object (guess)");
             }
             return null;
@@ -753,7 +1295,7 @@ namespace QuestRecorder
                     if (r == null)
                         r = RecentClick(s, 8000, "you clicked it");
                     if (r == null)
-                        r = NearestWhere(s, 8, o => o.IsTaxiTerminal, "nearest taxi terminal (guess)");
+                        r = NearestWhere(s, 2, o => o.IsTaxiTerminal, "nearest taxi terminal (guess)");
                     s.InteractionTarget = r;
                     return;
                 }
@@ -764,7 +1306,7 @@ namespace QuestRecorder
                     if (click != null)
                         r = Describe(HeroObjectManager.GetByNodeId(click.NodeId), click.How);
                     if (r == null || !r.IsWonkavator)
-                        r = NearestWhere(s, 8, o => { var p = o as HeroPlaceable; return p != null && p.IsWonkavator; }, "nearest elevator (guess)") ?? r;
+                        r = NearestWhere(s, 2, o => { var p = o as HeroPlaceable; return p != null && p.IsWonkavator; }, "nearest elevator (guess)") ?? r;
                     s.InteractionTarget = r;
                     if (r != null)
                         _wonka = new WonkaMemo { Wonka = r, Stand = s.Pos, AreaId = s.AreaId, Tick = s.Tick };
@@ -776,7 +1318,7 @@ namespace QuestRecorder
                     if (r == null && s.TargetId != 0 && s.TargetId != s.CompanionId)
                         r = Describe(HeroObjectManager.GetByNodeId(s.TargetId), "your target");
                     if (r == null)
-                        r = NearestWhere(s, 6, o => o is HeroNPC, "nearest NPC (guess)");
+                        r = NearestWhere(s, 2, o => o is HeroNPC, "nearest NPC (guess)");
                     s.InteractionTarget = r;
                     return;
                 }
@@ -949,13 +1491,81 @@ namespace QuestRecorder
             if (item != null)
             {
                 s.QuestItemName = item;
-                if (s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId)
-                    s.CastTarget = Describe(HeroObjectManager.GetByNodeId(s.TargetId), "your target");
+                s.CastTarget = ItemTarget(me, s, item);
             }
-            else if (!s.InCombat)
+            else if (!s.InCombat && !(_baseAbilities != null && name.Length > 0 && !_baseAbilities.Contains(name) && AbilityManager.HasAbility(name)))
             {
                 // Clicking a quest object usually starts a channel.
+                // (not a quest ability from a special bar: that's recorded as its own use, not a use of an object nearby)
                 s.CastTarget = CastObject(s);
+            }
+        }
+
+        /// <summary>
+        /// What a mission item was used on, as the game sees it: your target only if the item can be used on it;
+        /// otherwise the nearest thing the item CAN be used on (Black Hole No Trace Left: the Radiation Sensor's spies,
+        /// not General Konya you happened to have targeted). Null when the item isn't used on anything (used at a spot).
+        /// </summary>
+        private ObjRef ItemTarget(HeroLocalPlayer me, Snap s, string itemName)
+        {
+            HeroItem it = null;
+            try
+            {
+                foreach (HeroItem q in me.QuestItems)
+                    if (q != null && Fmt.OneLine(q.Name) == itemName)
+                    {
+                        it = q;
+                        break;
+                    }
+                if (it == null)
+                    foreach (HeroItem q in _bagQuestItems)
+                        if (q != null && Fmt.OneLine(q.Name) == itemName)
+                        {
+                            it = q;
+                            break;
+                        }
+            }
+            catch
+            {
+                it = null;
+            }
+            HeroObject target = s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId ? HeroObjectManager.GetByNodeId(s.TargetId) : null;
+            if (it == null)
+                return target != null ? Describe(target, "your target") : null;
+            try
+            {
+                // an item that doesn't need a marked target is used where you stand, not on whoever you had targeted
+                bool needsTarget = false;
+                if (it.UseTargetMarkers != null)
+                    foreach (var marker in it.UseTargetMarkers)
+                    {
+                        needsTarget = true;
+                        break;
+                    }
+                if (!needsTarget)
+                    // no marked target needed - but if the NPC you had targeted is one it works on, you used it on that NPC
+                    return target != null && it.IsValidUseTarget(target) ? Describe(target, "your target (the item works on it)") : null;
+                if (target != null && it.IsValidUseTarget(target))
+                    return Describe(target, "your target (the item works on it)");
+                foreach (KeyValuePair<float, HeroObject> kv in Nearby(s, 3f))
+                {
+                    try
+                    {
+                        if (kv.Value is HeroPlayer || kv.Value.NodeId == s.CompanionId)
+                            continue;
+                        if (it.IsValidUseTarget(kv.Value))
+                            return Describe(kv.Value, "nearest thing the item works on");
+                    }
+                    catch
+                    {
+                        // skip what can't be checked
+                    }
+                }
+                return null; // nothing near that the item accepts: the profile uses it at your spot
+            }
+            catch
+            {
+                return target != null ? Describe(target, "your target") : null;
             }
         }
 
@@ -969,10 +1579,10 @@ namespace QuestRecorder
             if (s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId)
             {
                 ObjRef t = Describe(HeroObjectManager.GetByNodeId(s.TargetId), "your target when the cast started");
-                if (t != null && t.Kind == ObjKind.Placeable && (!t.HasPos || t.Pos.DistanceTo(s.Pos) <= 10f))
+                if (t != null && t.Kind == ObjKind.Placeable && (!t.HasPos || t.Pos.DistanceTo(s.Pos) <= 2f))
                     return t;
             }
-            List<KeyValuePair<float, HeroObject>> near = Nearby(s, 8f);
+            List<KeyValuePair<float, HeroObject>> near = Nearby(s, 3f);
             foreach (KeyValuePair<float, HeroObject> kv in near)
             {
                 var p = kv.Value as HeroPlaceable;
@@ -989,19 +1599,19 @@ namespace QuestRecorder
                 {
                     continue;
                 }
-                float lim = Math.Max(range, 3f) + 1.5f;
+                float lim = Math.Max(range, 0.5f) + 0.5f; // game units (10 m): its use range plus 5 m
                 if (usable && kv.Key <= lim * lim)
                     return Describe(p, "nearest object usable for a quest when the cast started (inferred from the cast)");
             }
             foreach (KeyValuePair<float, HeroObject> kv in near)
             {
-                if (kv.Value is HeroPlaceable && kv.Key <= 25f)
+                if (kv.Value is HeroPlaceable && kv.Key <= 2.25f)
                     return Describe(kv.Value, "nearest object when the cast started (guess from the cast)");
             }
             // Last try: the nearest interaction prop, named after the placeable it belongs to.
             foreach (KeyValuePair<float, HeroObject> kv in near)
             {
-                if (kv.Key > 25f)
+                if (kv.Key > 2.25f)
                     break;
                 if (kv.Value is HeroNPC || kv.Value is HeroPlaceable)
                     continue;
@@ -1018,62 +1628,201 @@ namespace QuestRecorder
         /// </summary>
         private void ReadInstantItems(HeroLocalPlayer me, Snap s)
         {
-            if (s.Tick - _bagQuestItemsTick > 5000)
+            if (s.Tick - _bagQuestItemsTick > 2000) // every 2 s, so a used-up item is noticed close to when you used it
                 RefreshBagQuestItems(me, s.Tick);
-            int n = 0;
-            foreach (HeroItem item in me.QuestItems)
+            // the item being cast right now (its cast was already recorded): its cooldown / stack / leaving the bags at
+            // the end of that cast is the same use, not a second one
+            if (s.QuestItemName != null)
             {
-                if (item == null || ++n > 60)
-                    break;
-                CheckItemUsed(item, s);
+                _castItemName = s.QuestItemName;
+                _castItemSeen = s.Tick;
             }
+            else if (_castItemName != null && s.IsCasting)
+                _castItemSeen = s.Tick;
+
+            // every mission item, counted by name (two stacks of one item are one item - comparing them one by one made
+            // a fake "use" on every look)
+            var quest = new Dictionary<string, ItemLook>(StringComparer.Ordinal);
+            bool readAll = ReadItems(me.QuestItems, 60, quest);
+            // (two empty reads in a row before believing the list really emptied: a zoning read comes back empty once)
+            bool questOk = readAll && ConfirmEmpty(quest.Count, _questNames.Count, ref _questEmptyReads);
+            foreach (KeyValuePair<string, ItemLook> kv in quest)
+                CheckItemUsed(kv.Key, kv.Value, true, s);
+            if (questOk)
+            {
+                // a mission item that was there a moment ago and is gone now: you used your last one (an injector), or the
+                // game took it away (a click, a loot, a turn-in) - marked "item gone", the profile builder sorts out which
+                foreach (string old in _questNames)
+                    if (!quest.ContainsKey(old) && !_goneQueue.Contains(old))
+                        _goneQueue.Add(old);
+                _questNames = new HashSet<string>(quest.Keys, StringComparer.Ordinal);
+            }
+
+            // usable bag items (stims, plot items kept in the bags), counted by name too
+            var bag = new Dictionary<string, ItemLook>(StringComparer.Ordinal);
             foreach (HeroItem item in _bagQuestItems)
-                CheckItemUsed(item, s);
+                AddItem(item, bag);
+            foreach (KeyValuePair<string, ItemLook> kv in bag)
+                if (!quest.ContainsKey(kv.Key))
+                    CheckItemUsed(kv.Key, kv.Value, false, s);
+            if (_bagGone != null)
+            {
+                if (!_goneQueue.Contains(_bagGone))
+                    _goneQueue.Add(_bagGone);
+                _bagGone = null;
+            }
+
+            // one "gone" per look (the rest wait for the next look, none is lost)
+            while (_goneQueue.Count > 0 && s.InstantItemName == null)
+            {
+                string gone = _goneQueue[0];
+                _goneQueue.RemoveAt(0);
+                int had;
+                _itemStack.TryGetValue(gone, out had);
+                _itemStack[gone] = 0;
+                if (had <= 0 || IsSameCast(gone, s))
+                    continue; // never had any, or the end of a cast already recorded
+                s.InstantItemName = gone;
+                _instName = gone;
+                _instSeen = s.Tick;
+                bool plot = _questItemByName.ContainsKey(gone) || _bagPlot.Contains(gone) || _bagPlotBefore.Contains(gone) || _wasQuestItem.Contains(gone);
+                s.InstantItemBag = !plot; // a stim: kept only when a quest moves right after
+                s.InstantItemGone = plot; // a mission item: the builder checks what made it go
+                s.CastTarget = GoneTarget(s); // your target then, if it's an NPC right next to you
+            }
         }
 
-        /// <summary>
-        /// An item was used if its cooldown just started (a scanner), or its stack just went down while you still
-        /// have some (collars, probes, charges that get used up).
-        /// </summary>
-        private void CheckItemUsed(HeroItem item, Snap s)
+        private sealed class ItemLook
         {
-            string name;
-            float cd;
-            int stack;
+            public int Stack;
+            public float Cooldown;
+            public string FirstName;
+        }
+
+        private static void AddItem(HeroItem item, Dictionary<string, ItemLook> into)
+        {
             try
             {
-                name = Fmt.OneLine(item.Name);
+                if (item == null)
+                    return;
+                string name = Fmt.OneLine(item.Name);
+                if (name.Length == 0)
+                    return;
                 HeroAbility a = item.Ability;
-                cd = a != null ? a.CooldownRemaining : 0f;
-                stack = item.StackCount;
+                float cd = a != null ? a.CooldownRemaining : 0f;
+                ItemLook look;
+                if (!into.TryGetValue(name, out look))
+                    into[name] = look = new ItemLook { FirstName = name };
+                look.Stack += item.StackCount;
+                if (cd > look.Cooldown)
+                    look.Cooldown = cd;
             }
             catch
             {
-                return;
-            }
-            if (name.Length == 0)
-                return;
-            float before;
-            bool known = _itemCooldown.TryGetValue(name, out before);
-            _itemCooldown[name] = cd;
-            int stackBefore;
-            bool knownStack = _itemStack.TryGetValue(name, out stackBefore);
-            _itemStack[name] = stack;
-            bool cooldownStarted = known && before <= 0.05f && cd > 0.5f;
-            bool usedUp = knownStack && stack > 0 && stack < stackBefore;
-            if ((cooldownStarted || usedUp) && s.QuestItemName != name && s.InstantItemName == null)
-            {
-                s.InstantItemName = name;
-                if (s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId)
-                    s.CastTarget = Describe(HeroObjectManager.GetByNodeId(s.TargetId), "your target");
+                // skip this one
             }
         }
 
+        private static bool ReadItems(IEnumerable<HeroItem> items, int max, Dictionary<string, ItemLook> into)
+        {
+            try
+            {
+                int n = 0;
+                foreach (HeroItem item in items)
+                {
+                    if (item == null)
+                        continue;
+                    if (++n > max)
+                        return false;
+                    AddItem(item, into);
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>An empty list after a non-empty one counts only on the second empty read in a row.</summary>
+        private static bool ConfirmEmpty(int nowCount, int beforeCount, ref int emptyReads)
+        {
+            if (nowCount > 0 || beforeCount == 0)
+            {
+                emptyReads = 0;
+                return true;
+            }
+            emptyReads++;
+            return emptyReads >= 2;
+        }
+
+        /// <summary>The item whose cast was just recorded, still casting or ended under 4 s ago: the same use.</summary>
+        private bool IsSameCast(string name, Snap s)
+        {
+            return (_castItemName != null && name == _castItemName && s.Tick - _castItemSeen < 4000) ||
+                   (_logItemName != null && name == _logItemName && s.Tick - _logItemSeen < 4000); // (or the combat log already reported it)
+        }
+
+        /// <summary>Your target when an item left your bags, if it's an NPC within about 30 m (who you used it on).</summary>
+        private ObjRef GoneTarget(Snap s)
+        {
+            try
+            {
+                if (s.TargetId == 0 || s.TargetId == s.CompanionId)
+                    return null;
+                var npc = HeroObjectManager.GetByNodeId(s.TargetId) as HeroNPC;
+                if (npc == null || !npc.IsValid || V(npc.Location).DistanceTo(s.Pos) > 3f)
+                    return null;
+                return Describe(npc, "your target when the item left your bags");
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// An item was used if its cooldown just started (a scanner: not the 1.5 s global cooldown), or its stack went down
+        /// (collars, probes, charges). A stack drop with no cooldown can also be the game taking one away (a click, a
+        /// turn-in), so that one is marked "item gone" and the profile builder checks what made it go.
+        /// </summary>
+        private void CheckItemUsed(string name, ItemLook look, bool fromQuestItems, Snap s)
+        {
+            float before;
+            bool known = _itemCooldown.TryGetValue(name, out before);
+            _itemCooldown[name] = look.Cooldown;
+            int stackBefore;
+            bool knownStack = _itemStack.TryGetValue(name, out stackBefore);
+            _itemStack[name] = look.Stack;
+            if (fromQuestItems)
+                _wasQuestItem.Add(name);
+            bool cooldownStarted = known && before <= 0.05f && look.Cooldown > 1.6f;
+            bool usedUp = knownStack && look.Stack < stackBefore;
+            if (!(cooldownStarted || usedUp) || s.QuestItemName == name || s.InstantItemName != null || IsSameCast(name, s))
+                return;
+            bool plot = fromQuestItems || _bagPlot.Contains(name);
+            s.InstantItemName = name;
+            _instName = name;
+            _instSeen = s.Tick;
+            s.InstantItemBag = !plot; // a usable bag item (a stim, a medpac), not a mission item
+            s.InstantItemGone = plot && usedUp && !cooldownStarted;
+            var me2 = Core.Me;
+            if (me2 != null)
+                s.CastTarget = ItemTarget(me2, s, name); // what the item works on, not just whoever you had targeted
+        }
+
         /// <summary>Quest items in your bags: plot items you can right-click (not medpacs, gear or other stuff).</summary>
+        private HashSet<string> _bagPlot = new HashSet<string>(StringComparer.Ordinal);
+        private HashSet<string> _bagPlotBefore = new HashSet<string>(StringComparer.Ordinal);
+        private HashSet<string> _bagNames = new HashSet<string>(StringComparer.Ordinal);
+        private string _bagGone; // an item you just used your last one of
+        private HashSet<string> _questNames = new HashSet<string>(StringComparer.Ordinal); // mission items at the last look
+
         private void RefreshBagQuestItems(HeroLocalPlayer me, long now)
         {
             _bagQuestItemsTick = now;
             var list = new List<HeroItem>();
+            var plot = new HashSet<string>(StringComparer.Ordinal);
             try
             {
                 int n = 0;
@@ -1083,8 +1832,13 @@ namespace QuestRecorder
                         break;
                     try
                     {
-                        if (item.IsPlotItem && item.IsUsable && list.Count < 30)
+                        // every item you can use from your bags (a stim that keeps you alive isn't always a "plot" item)
+                        if (item.IsUsable && list.Count < 40)
+                        {
                             list.Add(item);
+                            if (item.IsPlotItem)
+                                plot.Add(Fmt.OneLine(item.Name));
+                        }
                     }
                     catch
                     {
@@ -1096,7 +1850,32 @@ namespace QuestRecorder
             {
                 // bags not readable right now
             }
+            // gone since the last look, with some left then: used up
+            var now2 = new HashSet<string>(StringComparer.Ordinal);
+            foreach (HeroItem it2 in list)
+            {
+                try { now2.Add(Fmt.OneLine(it2.Name)); } catch { }
+            }
+            // (not on a bad read - an empty list once while zoning - and not when the list was cut at 40 items, where an
+            // item can drop off the end after a bag sort without being used)
+            if (!ConfirmEmpty(now2.Count, _bagNames.Count, ref _bagEmptyReads) || list.Count >= 40)
+            {
+                _bagQuestItems = list.Count > 0 ? list : _bagQuestItems;
+                return;
+            }
+            foreach (string old in _bagNames)
+            {
+                int had;
+                if (!now2.Contains(old) && _itemStack.TryGetValue(old, out had) && had > 0 && _bagGone == null)
+                {
+                    _bagGone = old;
+                    // (its stack is zeroed when it's reported)
+                }
+            }
+            _bagNames = now2;
+            _bagPlotBefore = _bagPlot;
             _bagQuestItems = list;
+            _bagPlot = plot;
         }
 
         private void RefreshQuestItems(HeroLocalPlayer me, long now)
@@ -1161,7 +1940,7 @@ namespace QuestRecorder
             }
             if (_taxiPending && !s.IsInTaxi)
             {
-                HeroObject destObj = NearestObject(s, 40, o => o.IsTaxiTerminal);
+                HeroObject destObj = NearestObject(s, 5, o => o.IsTaxiTerminal);
                 ObjRef dest = destObj != null ? Describe(destObj, "taxi terminal where you landed") : null;
                 if (dest != null || s.Tick > _taxiPendingUntil)
                 {
@@ -1233,7 +2012,7 @@ namespace QuestRecorder
                     return a;
                 }
             }
-            foreach (KeyValuePair<float, HeroObject> kv in Nearby(s, 10))
+            foreach (KeyValuePair<float, HeroObject> kv in Nearby(s, 2))
             {
                 var p = kv.Value as HeroPlaceable;
                 if (p == null || !p.IsWonkavator)
@@ -1520,7 +2299,7 @@ namespace QuestRecorder
                 float max;
                 if (prop.TryGetScenePosition(out at) && at != Vector3.Zero)
                 {
-                    max = 4f;
+                    max = 1f; // game units: the clickable part sits on its object
                 }
                 else
                 {
@@ -1667,6 +2446,19 @@ namespace QuestRecorder
             r.Name = NameOf(o);
             r.Pos = V(o.Location);
             r.HasPos = !r.Pos.IsZero;
+            if (npc != null || plc != null)
+            {
+                try
+                {
+                    ulong spec;
+                    if (o.TryGetField<ulong>(GomFieldId.spnSpawnedSpec, out spec))
+                        r.Spec = spec; // its type: what quest tasks list
+                }
+                catch
+                {
+                    r.Spec = 0;
+                }
+            }
             try
             {
                 cnvQuestIndication qi = o.QuestIndication;
@@ -1709,12 +2501,29 @@ namespace QuestRecorder
                 {
                     r.UsableForQuest = false;
                 }
+                try
+                {
+                    r.Anchor = plc.ParentAnchorId; // stable across respawns
+                }
+                catch
+                {
+                    r.Anchor = 0;
+                }
             }
             if (npc != null)
             {
                 r.Level = npc.Level;
                 r.Toughness = npc.Toughness.ToString();
                 r.IsVendor = npc.IsVendor;
+                try
+                {
+                    r.Dead = npc.IsDead;
+                    r.Health = npc.HealthPercent;
+                }
+                catch
+                {
+                    r.Dead = false;
+                }
             }
             return r;
         }
@@ -1744,7 +2553,7 @@ namespace QuestRecorder
             return null;
         }
 
-        /// <summary>Objects within radius metres, nearest first, as (squared distance, object).</summary>
+        /// <summary>Objects within radius game units (1 unit = 10 m), nearest first, as (squared distance, object).</summary>
         private List<KeyValuePair<float, HeroObject>> Nearby(Snap s, float radius)
         {
             var list = new List<KeyValuePair<float, HeroObject>>();

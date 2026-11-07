@@ -1,5 +1,59 @@
 Quest Recorder patch notes - LethToxic
 
+1.2
+The profile now copies what you did, in your order.
+- Steps come in the order you did them, each at the exact spot you used. BuddyCron finds the way in between
+  (no walk points to stop at).
+- Fights: each one at the spots where you fought it, only the mobs whose kill counted for that task. Nothing from
+  elsewhere in the recording. Fights sit at the top of the profile (GrindAreas) and the steps use them by name.
+- Clicks: only the exact object you clicked. When two of the same kind stand close together (CZ-198 pods), the
+  bot stands where you stood first, so it takes the same one you did.
+- Selecting an object and attacking it counts as using that object.
+- A lift you opened but walked past: the bot walks past it too instead of getting stuck at it.
+- A count you stopped short of only runs on to the full count for plain fights (no waiting forever at a used pod).
+- A new recording never joins onto a profile you already saved from the review list.
+- A task's last count is written as its count (35 of 35), not just "step done".
+- Containers that respawn in the same spot count as new ones, so every click you made is in the profile.
+- Casts are recorded from the moment they start, so a step's cause comes before its tick, and a cast isn't lost
+  when a fight starts. A loot that finishes just after the tick stays with that step.
+- Your target is recorded every time it changes, and looting a dead mob is a loot, not "talked to an NPC".
+- Quests that finish by themselves aren't "handed in" to whatever you clicked last.
+- Lifts are left to BuddyCron, which rides them itself.
+- The profile ends with "Done" (or tells you what isn't finished) instead of starting itself over.
+- Distances fixed everywhere: game positions are in 10 m units, and about 20 checks treated them as metres.
+
+- Mission items, exactly as you used them: where you stood, what you used it on (yourself, an NPC by name, a
+  spot), your exact distance (the bot uses it from there - no more "TooFar"), and every use in your order: the last
+  one, items with no cast bar, stims and injectors. Medpacs and items the game takes off you are left out. If the
+  recorder can't tell, the step is yellow - it never guesses or drops a use.
+- An item used on a corpse is used on dead ones (DeadOnly). An item used in a fight on a weakened mob: the bot
+  fights it first and uses the item once its health is down to where you did.
+- Several items in a row (runes): each one in your order, on the NPC you used it on, from as close as you stood.
+- Scanner: while you record, the recorder asks the game what each mission counts and saves every one of those
+  objects and mobs near you, also the ones you only walked past. Only what your missions still need.
+- Collect steps (a counter fed by eggs, bones, and loot): one step until it's full. It takes any of those objects
+  within 150 m, with one spot per cluster so the bot's loop is short.
+- Fights also get the spots of linked groups of the same mobs near where you fought (within ~150 m), so the bot
+  moves on to the next group instead of waiting for a respawn.
+- Rewards: the reward is taken when the game says it's waiting, even if the quest already counts as done.
+- Quest abilities from a special / temporary bar (Macrobinoculars, the Seeker Droid): recorded like mission items
+  (where, on whom, how close, in your order) and cast by the new UseQuestAbility tag, which opens the bar with its
+  mission item first. Only kept when a mission moved right after, so a new class ability never becomes a step.
+- Putting on a quest item (a disguise): its own step (EquipItem), right before the step it was for. A gear swap
+  with no mission progress after it is left out.
+- Defend / hold a spot: when you held a spot while mobs came at you and the step moved on by itself, the bot waits
+  there, fighting, until it moves on (instead of walking there and leaving).
+- Mission items the game gives no sign for (no cast bar, no cooldown, nothing leaves your bags - the Serum Injector):
+  the recorder also reads the game's own combat log, which names the item and who you used it on. Turn on
+  "Enable Combat Logging" in the game's Preferences (Combat Logging) for this.
+- A loot with no corpse click right after a kill (the game's area loot) counts as looting that mob, and a step
+  finished by looting a mob you killed earlier becomes "kill and loot" it.
+- An item the game takes when a mission finishes (handed in) is never guessed as used on someone.
+- Clicks on side-by-side objects go by the exact spot you clicked, in your order (new ClickObject tag).
+- A quick travel or fleet pass you cast never becomes walk points.
+- Picking up a quest waits for the quest board to open. The summary waits for the save. The review list won't
+  save over a profile that was changed outside it.
+
 1.1b
 - 1.1a's pick-up was broken: the bot walked to the giver and didn't pick anything up. Fixed, the Recon Droid in
   Black Hole included.

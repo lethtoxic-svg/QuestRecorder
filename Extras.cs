@@ -302,7 +302,7 @@ namespace QuestRecorder
                 var e = n as XmlElement;
                 if (e == null)
                     continue;
-                steps.Add(new KeyValuePair<string, string>(comment ?? string.Empty, StripNs(e.OuterXml)));
+                steps.Add(new KeyValuePair<string, string>(comment ?? string.Empty, StripNs(Pretty(e))));
                 comment = null;
             }
             if (steps.Count == 0)
@@ -325,6 +325,16 @@ namespace QuestRecorder
                 ed.Add(s.Value, s.Key, before);
             ed.Save();
             return steps.Count;
+        }
+
+        /// <summary>The step laid out on several lines, indented like the profile's own steps (not one long line).</summary>
+        private static string Pretty(XmlElement e)
+        {
+            var sb = new StringBuilder();
+            var set = new XmlWriterSettings { Indent = true, IndentChars = "\t", NewLineChars = "\r\n", OmitXmlDeclaration = true, ConformanceLevel = ConformanceLevel.Fragment };
+            using (XmlWriter w = XmlWriter.Create(sb, set))
+                e.WriteTo(w);
+            return sb.ToString().Replace("\r\n", "\r\n\t\t");
         }
 
         private static bool EndMarker(string comment)

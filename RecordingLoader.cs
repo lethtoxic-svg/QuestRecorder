@@ -131,7 +131,16 @@ namespace QuestRecorder
                 e.Count = U(c("count"));
                 e.Max = U(c("max"));
                 e.Text = c("objective");
+                foreach (string id in c("task_targets").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    ulong v = U(id);
+                    if (v != 0)
+                        e.TaskTargets.Add(v);
+                }
                 e.Option = c("option");
+                long dur;
+                if (long.TryParse(c("duration_ms"), NumberStyles.Integer, CultureInfo.InvariantCulture, out dur))
+                    e.DurationMs = dur; // how long a cast took: when it started, not only when it ended
                 e.Note = c("note");
                 if (kind == EvKind.ConvoChoice)
                 {
@@ -146,6 +155,19 @@ namespace QuestRecorder
                     var o = new ObjRef { Name = c("target_name") };
                     string tk = c("target_kind");
                     o.Kind = tk == "object" ? ObjKind.Placeable : tk == "NPC" ? ObjKind.Npc : tk == "player" ? ObjKind.Player : ObjKind.Other;
+                    string tid = c("target_id");
+                    ulong nid;
+                    if (tid.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
+                        ulong.TryParse(tid.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out nid))
+                        o.NodeId = nid; // the game's id for this one object (a respawn at the same spot is a new id)
+                    o.Dead = c("target_dead") == "yes";
+                    o.Health = c("target_health").Length > 0 ? F(c("target_health")) : -1f;
+                    o.Anchor = U(c("target_anchor"));
+                    o.Level = U(c("target_level"));
+                    o.Toughness = c("target_toughness");
+                    o.UseRange = F(c("target_use_range"));
+                    o.UsableForQuest = c("target_quest_usable") == "yes";
+                    o.Spec = U(c("target_spec"));
                     if (c("target_x").Length > 0)
                     {
                         o.HasPos = true;

@@ -279,7 +279,27 @@ namespace QuestRecorder
                 RefreshStatus();
                 if (addingBit)
                     return; // "Record from here": the bit goes into the other profile by itself
-                ShowSummary();
+                // The recording finishes saving in the background: open the review list only once the final profile is
+                // written. Opened straight away it showed an older copy, and its Save wrote that over the full profile
+                // (Black Hole: the profile lost supplies 4-5 and two rewards).
+                var wait = new System.Windows.Forms.Timer { Interval = 250 };
+                var waited = Stopwatch.StartNew();
+                wait.Tick += (s, a) =>
+                {
+                    if (Recorder.IsRecording && waited.ElapsedMilliseconds < 30000)
+                        return;
+                    wait.Stop();
+                    wait.Dispose();
+                    try
+                    {
+                        ShowSummary();
+                    }
+                    catch (Exception ex)
+                    {
+                        RrLog.Exception("Opening the review list", ex);
+                    }
+                };
+                wait.Start();
             }
             catch (Exception ex)
             {

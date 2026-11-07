@@ -17,6 +17,472 @@ namespace QuestRecorder
             public double At;
             public bool Cast;
             public Vec3 Stand;
+            public ulong Id; // the game's id for the object (0 = not known)
+            public string On; // the NPC a mission item was used on (null = on yourself / at the spot)
+            public float OnDist = -1f; // how far you stood from that NPC (game units), -1 = not known
+            public bool OnDead; // that NPC was dead (a corpse)
+            public float OnHealth = -1f; // that NPC's health (percent) when you used it, -1 = not known
+        }
+
+        /// <summary>
+        /// What you really did, before the steps are made:
+        /// - a click on a mob you had killed is a loot, not a talk (older recordings wrote it as "clicked NPC");
+        /// - the start of a cast on an object is the use (it comes before the tick it causes); when you clicked that
+        ///   object just before, the click already is the use.
+        /// </summary>
+        /// <summary>
+        /// One count task you did in several ways (Section X Hyperbiology: eggs, bones AND looting Muckwings all count to
+        /// 10). Each tick became its own step, and a fight step only knew the one mob at the one spot of its own tick -
+        /// with that mob dead the bot stood there forever. Every fight step of the task now knows every mob you fought for
+        /// that task and every spot you fought them at (also the "step done" fight that finished it), so the bot goes
+        /// round your spots like you did.
+        /// </summary>
+        private static void ShareTaskFights(List<Step> steps)
+        {
+            var byTask = new Dictionary<string, List<Step>>(StringComparer.Ordinal);
+            var stepOf = new Dictionary<Step, string>();
+            foreach (Step s in steps)
+            {
+                // only "kill and loot" counts (a plain kill fight keeps exactly the spots you fought at - CZ-198 Staff Cuts)
+                if (s.Kind != "Grind" || s.Kills == null || s.Kills.Count == 0 || s.Gate == null ||
+                    s.Comment.IndexOf("(kill and loot)", StringComparison.Ordinal) < 0)
+                    continue;
+                Match m = Regex.Match(s.Gate, @"IsTaskValueGreaterThan\((0x[0-9A-F]+), (\d+), (\d+), \d+\)");
+                if (!m.Success)
+                    continue;
+                string key = m.Groups[1].Value + "|" + m.Groups[2].Value + "|" + m.Groups[3].Value;
+                List<Step> list;
+                if (!byTask.TryGetValue(key, out list))
+                    byTask[key] = list = new List<Step>();
+                list.Add(s);
+                stepOf[s] = m.Groups[1].Value + "|" + m.Groups[2].Value;
+            }
+            foreach (KeyValuePair<string, List<Step>> kv in byTask)
+            {
+                List<Step> fights = kv.Value;
+                var names = new HashSet<string>(StringComparer.Ordinal);
+                foreach (Step f in fights)
+                    foreach (Kill k in f.Kills)
+                        names.Add(k.Name);
+                // the fight that finished that quest step (its gate says "step done"), with the same mobs: same task
+                string[] qs = kv.Key.Split('|');
+                foreach (Step s in steps)
+                {
+                    if (s.Kind != "Grind" || s.Kills == null || s.Gate == null || fights.Contains(s))
+                        continue;
+                    Match d = Regex.Match(s.Gate, @"IsBranchStepComplete\((0x[0-9A-F]+), \d+, (\d+)\)");
+                    if (d.Success && d.Groups[1].Value == qs[0] && d.Groups[2].Value == qs[1] && s.Kills.Exists(k => names.Contains(k.Name)))
+                        fights.Add(s);
+                }
+                if (fights.Count < 2)
+                    continue;
+                var all = new List<Kill>();
+                foreach (Step f in fights)
+                    foreach (Kill k in f.Kills)
+                        if (!all.Exists(a => a.Name == k.Name && a.Pos.DistanceTo(k.Pos) < 0.5f))
+                            all.Add(k);
+                // only from the same part of the map, near where this fight's own mobs were (within ~150 m: Hyperbiology spots are 80-100 m apart)
+                foreach (Step f in fights)
+                {
+                    List<Kill> own = new List<Kill>(f.Kills);
+                    foreach (Kill k in all)
+                        if (!f.Kills.Exists(a => a.Name == k.Name && a.Pos.DistanceTo(k.Pos) < 0.5f) &&
+                            own.Exists(o => o.Leg == k.Leg && o.Pos.DistanceTo(k.Pos) <= 15f))
+                            f.Kills.Add(k);
+                }
+            }
+        }
+
+        /// <summary>
+        /// A counter you fed from more than one kind of thing (Section X Hyperbiology "Collect Biological Samples 0/10":
+        /// Mutated Beast Eggs, Mutated Beast Bones AND looting Muckwings). One step per tick made the bot walk your exact
+        /// spots one by one, past eggs it could have taken. Now it's one collect step until the count is full: click any of
+        /// those objects nearby (the spots you clicked plus the same objects the recorder saw around you), and kill and
+        /// loot those mobs on the way. A counter fed by one kind of thing stays exactly as you did it.
+        /// </summary>
+        private static void CollectSteps(List<Step> steps, Dictionary<string, ulong> maxFor, Dictionary<string, List<Vec3>> scanner)
+        {
+            var byTask = new Dictionary<string, List<Step>>(StringComparer.Ordinal);
+            foreach (Step s in steps)
+            {
+                if (s.Gate == null || (s.Kind != "Use" && !(s.Kind == "Grind" && s.Comment.IndexOf("(kill and loot)", StringComparison.Ordinal) >= 0)))
+                    continue;
+                Match m = Regex.Match(s.Gate, @"IsTaskValueGreaterThan\((0x[0-9A-F]+), (\d+), (\d+), \d+\)");
+                if (!m.Success)
+                    continue;
+                string key = m.Groups[1].Value + ", " + m.Groups[2].Value + ", " + m.Groups[3].Value;
+                List<Step> list;
+                if (!byTask.TryGetValue(key, out list))
+                    byTask[key] = list = new List<Step>();
+                list.Add(s);
+            }
+            foreach (KeyValuePair<string, List<Step>> kv in byTask)
+            {
+                List<Step> parts = kv.Value;
+                string[] k3 = kv.Key.Split(new[] { ", " }, StringSplitOptions.None);
+                // the step that finished it ("step done"), if it was one of these too
+                Step finish = null;
+                foreach (Step s in steps)
+                {
+                    if (s.Gate == null || parts.Contains(s))
+                        continue;
+                    Match d = Regex.Match(s.Gate, @"IsBranchStepComplete\((0x[0-9A-F]+), (\d+), (\d+)\)");
+                    if (d.Success && d.Groups[1].Value == k3[0] && d.Groups[3].Value == k3[1] &&
+                        (s.Kind == "Use" || (s.Kind == "Grind" && s.Comment.IndexOf("(kill and loot)", StringComparison.Ordinal) >= 0)))
+                    {
+                        finish = s;
+                        break;
+                    }
+                }
+                var all = new List<Step>(parts);
+                if (finish != null)
+                    all.Add(finish);
+                // what you did for it: object names and their spots, mobs you looted
+                var objects = new List<string>();
+                var spots = new List<KeyValuePair<string, Vec3>>();
+                var mobs = new List<Kill>();
+                foreach (Step s in all)
+                {
+                    foreach (string l in s.Lines)
+                    {
+                        Match o = Regex.Match(l, "^<UseObject ObjectName=\"([^\"]+)\"[^>]*XYZ=\"([^\"]+)\"");
+                        if (!o.Success)
+                            continue;
+                        string name = o.Groups[1].Value;
+                        if (!objects.Contains(name))
+                            objects.Add(name);
+                        foreach (Match h in Regex.Matches(l, "XYZ=\"(-?[0-9.]+),(-?[0-9.]+),(-?[0-9.]+)\""))
+                        {
+                            var v = new Vec3(float.Parse(h.Groups[1].Value, CultureInfo.InvariantCulture), float.Parse(h.Groups[2].Value, CultureInfo.InvariantCulture),
+                                             float.Parse(h.Groups[3].Value, CultureInfo.InvariantCulture));
+                            if (!spots.Exists(p => p.Value.DistanceTo(v) < 0.3f))
+                                spots.Add(new KeyValuePair<string, Vec3>(name, v));
+                        }
+                    }
+                    if (s.Kind == "Grind" && s.Kills != null)
+                        foreach (Kill k in s.Kills)
+                            if (!mobs.Exists(a => a.Name == k.Name && a.Pos.DistanceTo(k.Pos) < 0.5f))
+                                mobs.Add(k);
+                }
+                // only a counter fed in more than one way: two kinds of objects, or objects and loots
+                if (objects.Count == 0 || (objects.Count < 2 && mobs.Count == 0))
+                    continue;
+                // the same objects the recorder saw around you (the scanner), near your own spots (~150 m)
+                var own = new List<Vec3>();
+                foreach (KeyValuePair<string, Vec3> p in spots)
+                    own.Add(p.Value);
+                foreach (Kill k in mobs)
+                    own.Add(k.Pos);
+                foreach (string name in objects)
+                {
+                    List<Vec3> seen;
+                    if (scanner == null || !scanner.TryGetValue(name, out seen))
+                        continue;
+                    foreach (Vec3 v in seen)
+                        if (own.Exists(o => o.DistanceTo(v) <= 15f) && !spots.Exists(p => p.Value.DistanceTo(v) < 0.3f))
+                            spots.Add(new KeyValuePair<string, Vec3>(name, v));
+                }
+                // One hotspot per cluster (BuddyCron's UseObject sorts the hotspots by distance from where it starts and
+                // loops them, taking the nearest object within the step's Radius of the hotspot it's heading to): every
+                // spot within ~60 m of a cluster's first spot is that cluster; its hotspot is the real spot nearest the
+                // cluster's middle. A short loop, each cluster once, and the 150 m Radius takes every object around it.
+                if (spots.Count > 1)
+                {
+                    var left = new List<KeyValuePair<string, Vec3>>(spots);
+                    var hubs = new List<KeyValuePair<string, Vec3>>();
+                    while (left.Count > 0)
+                    {
+                        Vec3 seed = left[0].Value;
+                        string kind = left[0].Key; // one cluster per object kind, so eggs and bones each keep a spot
+                        var group = left.FindAll(p => p.Key == kind && p.Value.DistanceTo(seed) <= 6f);
+                        left.RemoveAll(p => p.Key == kind && p.Value.DistanceTo(seed) <= 6f);
+                        float mx = 0f, my = 0f, mz = 0f;
+                        foreach (KeyValuePair<string, Vec3> p in group)
+                        {
+                            mx += p.Value.X;
+                            my += p.Value.Y;
+                            mz += p.Value.Z;
+                        }
+                        var mid = new Vec3(mx / group.Count, my / group.Count, mz / group.Count);
+                        KeyValuePair<string, Vec3> hub = group[0];
+                        foreach (KeyValuePair<string, Vec3> p in group)
+                            if (p.Value.DistanceTo(mid) < hub.Value.DistanceTo(mid))
+                                hub = p;
+                        hubs.Add(hub);
+                    }
+                    spots = hubs;
+                }
+                ulong max;
+                string gate = finish != null ? finish.Gate
+                            : maxFor.TryGetValue(kv.Key, out max) ? "HasQuest(" + k3[0] + ") and not IsTaskValueGreaterThan(" + kv.Key + ", " + (max - 1) + ")" : parts[parts.Count - 1].Gate;
+                string done = gate.StartsWith("HasQuest(", StringComparison.Ordinal) ? gate : "HasQuest(" + k3[0] + ") and " + gate;
+                Step first = parts[0];
+                var c = new Step
+                {
+                    Kind = mobs.Count > 0 ? "Grind" : "Use",
+                    Gate = done,
+                    Comment = Regex.Replace(first.Comment, @" \(\d+/\d+\).*$", string.Empty) + " - collect: any " + string.Join(", any ", objects.ToArray()) +
+                              (mobs.Count > 0 ? ", and kill and loot " + string.Join(", ", mobs.ConvertAll(k => k.Name).FindAll(n => true).ToArray()) : string.Empty),
+                    Quest = first.Quest,
+                    Task = first.Task,
+                    Targets = first.Targets,
+                    Kills = mobs.Count > 0 ? mobs : null,
+                    At = first.At
+                };
+                // dedupe mob names in the comment
+                if (mobs.Count > 0)
+                {
+                    var names = new List<string>();
+                    foreach (Kill k in mobs)
+                        if (!names.Contains(k.Name))
+                            names.Add(k.Name);
+                    c.Comment = Regex.Replace(first.Comment, @" \(\d+/\d+\).*$", string.Empty) + " - collect: any " + string.Join(", any ", objects.ToArray()) +
+                                ", and kill and loot " + string.Join(", ", names.ToArray());
+                }
+                string ids = finish != null
+                    ? Regex.Replace(Regex.Match(finish.Gate, @"IsBranchStepComplete\((0x[0-9A-F]+), (\d+), (\d+)\)").Value, @"IsBranchStepComplete\((0x[0-9A-F]+), (\d+), (\d+)\)", " QuestId=\"$1\" BranchId=\"$2\" StepId=\"$3\"")
+                    : " QuestId=\"" + k3[0] + "\" BranchId=\"1\" StepId=\"" + k3[1] + "\" TaskId=\"" + k3[2] + "\"";
+                var sb = new StringBuilder();
+                sb.Append("<UseObject").Append(ids).Append(" Radius=\"150\" UseRange=\"5\" WaitTime=\"3000\" BlacklistDuration=\"30\" IgnoreLOS=\"True\"><Placeables>");
+                foreach (string name in objects)
+                    sb.Append("<Placeable>").Append(name).Append("</Placeable>");
+                sb.Append("</Placeables><Hotspots>");
+                foreach (KeyValuePair<string, Vec3> p in spots)
+                    sb.Append("<Hotspot Name=\"").Append(p.Key).Append("\" XYZ=\"").Append(X(p.Value)).Append("\" />");
+                sb.Append("</Hotspots></UseObject>");
+                c.Lines.Add(sb.ToString());
+                int at = steps.IndexOf(first);
+                foreach (Step s in all)
+                    steps.Remove(s);
+                steps.Insert(Math.Min(at, steps.Count), c);
+            }
+        }
+
+        /// <summary>
+        /// UseItem's Range for an item used on an NPC: how close you stood when you used it (BuddyCron reads Range in tenths
+        /// of a game unit). Section X Shackle Remote: you stood 4-5 m away, the fixed 15 m was "TooFar". Unknown: 15 m.
+        /// </summary>
+        /// <summary>
+        /// How long you held this spot (within ~20 m) right before t, in seconds, and whether it was a defend: at least two
+        /// mobs came and died there and you did nothing else (no loot, click, talk, item or cast on an object) - the step
+        /// then moved on by itself (waves, "hold the position").
+        /// </summary>
+        private static double StayedAt(IList<RecEvent> events, double t, Vec3 pos, out bool fought)
+        {
+            fought = false;
+            double from = t;
+            int kills = 0;
+            bool acted = false;
+            for (int i = events.Count - 1; i >= 0; i--)
+            {
+                RecEvent x = events[i];
+                if (x.Elapsed > t)
+                    continue;
+                if (t - x.Elapsed > 600)
+                    break;
+                if (!x.Pos.IsZero && x.Pos.DistanceTo(pos) > 2f)
+                    break; // you were somewhere else
+                if (x.Kind == EvKind.Loading || x.Kind == EvKind.AreaChange)
+                    break;
+                // the step moving on because of another mission's step: not this spot's doing
+                if (x.Elapsed < t && (x.Kind == EvKind.QuestTask || x.Kind == EvKind.QuestStep || x.Kind == EvKind.QuestCompleted))
+                    break;
+                from = x.Elapsed;
+                if (x.Kind == EvKind.Kill)
+                    kills++;
+                if (x.Kind == EvKind.Loot || x.Kind == EvKind.ObjectClick || x.Kind == EvKind.NpcClick || x.Kind == EvKind.CastStart ||
+                    x.Kind == EvKind.ConvoStart || x.Kind == EvKind.QuestItem || (x.Kind == EvKind.Cast && x.Target != null))
+                    acted = true;
+            }
+            fought = kills >= 2 && !acted;
+            return t - from;
+        }
+
+        private static string UseRangeFor(float distUnits)
+        {
+            if (distUnits <= 0f)
+                return "15"; // not known
+            // exactly how far you stood, however far that was
+            int r = (int)Math.Ceiling(distUnits * 10f - 0.01f); // (5.0000001 m is 5, not 6)
+            return Math.Max(3, r).ToString(CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>Profile condition: the game has a reward waiting for this quest (its reward window is up).</summary>
+        private static string RewardWaiting(string questHex)
+        {
+            return "any(r.QuestId == " + questHex + " for r in Me.Quests.PendingQuestRewards)";
+        }
+
+        /// <summary>A normal (not hidden) mission moved within 2 s of this time.</summary>
+        private static bool NormalTickNear(IList<RecEvent> events, HashSet<ulong> hidden, double t)
+        {
+            foreach (RecEvent x in events)
+                if ((x.Kind == EvKind.QuestTask || x.Kind == EvKind.QuestStep) && !x.QuestHidden && !hidden.Contains(x.QuestId) &&
+                    Math.Abs(x.Elapsed - t) <= 2.0)
+                    return true;
+            return false;
+        }
+
+        private static IList<RecEvent> ExactActions(IList<RecEvent> events)
+        {
+            var killed = new HashSet<ulong>();
+            var list = new List<RecEvent>(events.Count);
+            // A usable bag item (not a mission item - a stim, a medpac): only part of the run when a quest moves
+            // within 6 s of it, even the game's hidden helper quests (Black Hole Glow: the stim that keeps you alive).
+            // A use that didn't tick, followed within 2 minutes by a use of the same item that did, is part of that search
+            // (Black Hole Radiation Sensor: 5 scans, 3 found a spy - the other 2 spots are where the bot looks too).
+            // A stim used in a fight after it did its job stays out.
+            var movedAt = new List<KeyValuePair<string, double>>(); // a use that moved a quest itself
+            var searchAt = new List<KeyValuePair<string, double>>(); // ... and not just a kill counting (a medpac mid-fight)
+            var helpers = new HashSet<ulong>(); // the game's own helper quests (marked hidden at least once)
+            foreach (RecEvent h in events)
+                if (h.QuestHidden && h.QuestId != 0)
+                    helpers.Add(h.QuestId);
+            for (int i = 0; i < events.Count; i++)
+            {
+                RecEvent e = events[i];
+                if (e.Kind != EvKind.QuestItem || e.Note != "bag item" || e.Option.Length == 0)
+                    continue;
+                for (int j = i + 1; j < events.Count && events[j].Elapsed - e.Elapsed <= 6.0; j++)
+                    if (events[j].Kind == EvKind.QuestTask || events[j].Kind == EvKind.QuestStep || events[j].Kind == EvKind.QuestAdded)
+                    {
+                        // a count your kill moved isn't the medpac's doing (a medpac pressed mid-fight right before a kill)
+                        bool byKill = false;
+                        for (int k = j - 1; k >= 0 && events[j].Elapsed - events[k].Elapsed <= 1.0; k--)
+                            if (events[k].Kind == EvKind.Kill)
+                                byKill = true;
+                        if (!byKill)
+                        {
+                            movedAt.Add(new KeyValuePair<string, double>(e.Option, e.Elapsed));
+                            searchAt.Add(new KeyValuePair<string, double>(e.Option, e.Elapsed));
+                        }
+                        break;
+                    }
+            }
+            for (int i = 0; i < events.Count; i++)
+            {
+                RecEvent e = events[i];
+                if (e.Kind == EvKind.Kill && e.Target != null && e.Target.NodeId != 0)
+                    killed.Add(e.Target.NodeId);
+                if (e.Kind == EvKind.QuestItem && e.Note == "bag item" &&
+                    !movedAt.Exists(m => m.Key == e.Option && m.Value == e.Elapsed) &&
+                    !searchAt.Exists(m => m.Key == e.Option && m.Value > e.Elapsed && m.Value - e.Elapsed <= 120.0))
+                    continue; // a medpac in a fight: not a step
+                // A mission item that left your mission items (you used your last one, or the game took it away):
+                // - a use: a mission step or count moved with it (Section X Egg Sample at the Science Station, the Serum
+                //   Injector on the Hyperbeast), or the game's hidden helper quest moved right after (the Glow injector)
+                // - taken away: a mission completed or left the log at that same moment (the Hyperbeast Tissue, the last
+                //   Shackle Remote, Republic Research) - not a step
+                if (e.Kind == EvKind.QuestItem && e.Note == "item gone")
+                {
+                    bool moved = false, finished = false;
+                    for (int j = 0; j < events.Count; j++)
+                    {
+                        RecEvent x = events[j];
+                        double dt = x.Elapsed - e.Elapsed;
+                        if (dt < -0.3 || dt > 6.0)
+                            continue;
+                        if ((x.Kind == EvKind.QuestStep || x.Kind == EvKind.QuestTask) && x.QuestHidden && dt >= 0)
+                            moved = true; // the helper quest (Glow injector)
+                        else if ((x.Kind == EvKind.QuestStep || x.Kind == EvKind.QuestTask) && !x.QuestHidden && dt <= 4.0 &&
+                                 !(x.Kind == EvKind.QuestTask && (x.Text ?? string.Empty).StartsWith("Complete ", StringComparison.OrdinalIgnoreCase)))
+                            moved = true; // a mission step or count moved with it
+                        else if ((x.Kind == EvKind.QuestCompleted || x.Kind == EvKind.QuestRemoved) && !helpers.Contains(x.QuestId) && dt <= 0.3)
+                            finished = true; // a mission ended right then: the game took the item away
+                    }
+                    // something you did just before explains the step (a loot, a click, a kill): that's the step, and the game
+                    // took the item away with it (Section X: looting the Hyperbeast took the Serum Injector; the Science
+                    // Station click used up the Egg Sample)
+                    // (also a turn-in conversation, and a kill or object cast in the same look - those come after the item
+                    // in the event list; a kill only counts right at the item, a fight a few seconds earlier doesn't)
+                    for (int j = 0; j < events.Count; j++)
+                    {
+                        if (j == i)
+                            continue;
+                        double dt = events[j].Elapsed - e.Elapsed;
+                        if (dt < -5.0 || dt > 1.0)
+                            continue;
+                        EvKind k = events[j].Kind;
+                        bool before = dt <= 0;
+                        if ((before && (k == EvKind.Loot || k == EvKind.ObjectClick || k == EvKind.NpcClick || k == EvKind.ConvoStart ||
+                                        k == EvKind.ConvoChoice || k == EvKind.ConvoEnd || k == EvKind.InteractionOpen)) ||
+                            (k == EvKind.Kill && dt >= -1.0) ||
+                            ((k == EvKind.Cast || k == EvKind.CastStart) && events[j].Target != null && events[j].Target.Kind == ObjKind.Placeable))
+                            finished = true;
+                    }
+                    if (!moved || finished)
+                        continue;
+                }
+                if (e.Kind == EvKind.NpcClick && e.Target != null && (e.Target.Dead || (e.Target.NodeId != 0 && killed.Contains(e.Target.NodeId))))
+                {
+                    e = e.As(EvKind.Loot);
+                }
+                else if (e.Kind == EvKind.CastStart)
+                {
+                    bool clicked = false;
+                    for (int j = list.Count - 1; j >= 0 && e.Elapsed - list[j].Elapsed <= 3; j--)
+                    {
+                        RecEvent c = list[j];
+                        if ((c.Kind == EvKind.ObjectClick || c.Kind == EvKind.Command) && c.Target != null && e.Target != null &&
+                            (c.Target.NodeId == e.Target.NodeId || c.Target.Name == e.Target.Name))
+                        {
+                            clicked = true;
+                            break;
+                        }
+                    }
+                    if (clicked)
+                        continue;
+                    e = e.As(EvKind.ObjectClick); // the interact key, a cast you started without a click: the use starts here
+                }
+                // You selected an object (left-click) and a cast started right after with nothing tied to it:
+                // you used / attacked that exact object (CZ-198 Give And Take: Biotoxin 5/6).
+                if (e.Kind == EvKind.Command && e.Target != null && e.Target.Kind == ObjKind.Placeable && e.Target.Name.Length > 0 &&
+                    !e.Target.Name.StartsWith("#", StringComparison.Ordinal))
+                {
+                    bool asUse = false;
+                    for (int j = i + 1; j < events.Count && events[j].Elapsed - e.Elapsed <= 15.0; j++)
+                    {
+                        RecEvent c = events[j];
+                        // a cast that STARTED within 2 s of the select (a cast is written when it ends: "Opening" on the
+                        // 4th Hypermatter Supplies crate ended 3 s later)
+                        double started = c.Kind == EvKind.Cast ? c.Elapsed - c.DurationMs / 1000.0 : c.Elapsed;
+                        if ((c.Kind == EvKind.Cast || c.Kind == EvKind.CastStart) && started - e.Elapsed <= 2.0 &&
+                            (c.Target == null || c.Target.Name.Length == 0 || c.Target.NodeId == e.Target.NodeId))
+                        {
+                            asUse = true;
+                            break;
+                        }
+                        if (c.Elapsed - e.Elapsed > 2.0 && c.Kind != EvKind.Cast && c.Kind != EvKind.QuestTask && c.Kind != EvKind.QuestStep && c.Kind != EvKind.Breadcrumb)
+                            break;
+                        if (c.Kind == EvKind.ObjectClick || c.Kind == EvKind.Command)
+                            break;
+                    }
+                    // ...or the quest counted within 4 s of you selecting it, with nothing else used in between (you
+                    // pressed the interact key on it: Black Hole Hypermatter Supplies 4/5 had only this)
+                    if (!asUse)
+                        for (int j = i + 1; j < events.Count && events[j].Elapsed - e.Elapsed <= 4.0; j++)
+                        {
+                            RecEvent c = events[j];
+                            if (c.Kind == EvKind.ObjectClick || c.Kind == EvKind.CastStart || c.Kind == EvKind.Cast || c.Kind == EvKind.QuestItem || c.Kind == EvKind.Command)
+                                break;
+                            if ((c.Kind == EvKind.QuestTask || c.Kind == EvKind.QuestStep) && !c.QuestHidden)
+                            {
+                                asUse = true;
+                                break;
+                            }
+                        }
+                    if (asUse)
+                        list.Add(e.As(EvKind.ObjectClick));
+                }
+                list.Add(e);
+            }
+            return list;
+        }
+
+        /// <summary>"Already used" is about one object: its game id, or its spot when the id isn't known.</summary>
+        private static string UseKey(ulong id, Vec3 pos)
+        {
+            return id != 0 ? "#" + id.ToString("X") : X(pos);
         }
 
         private sealed class Kill
@@ -24,6 +490,9 @@ namespace QuestRecorder
             public string Name;
             public Vec3 Pos;
             public double At;
+            public int Leg; // the part of the map (between lifts / taxis / loading screens) you killed it in
+            public HashSet<string> Credit = new HashSet<string>(StringComparer.Ordinal); // "quest|task" counts this kill moved
+            public ulong Spec; // its type id (what quest tasks list), 0 = not known
         }
 
         /// <summary>Stands in for "Heroic Transport: &lt;mission&gt;" until the mission is known.</summary>
@@ -37,6 +506,7 @@ namespace QuestRecorder
             public readonly List<string> Lines = new List<string>();
             public ulong Quest;
             public int Task = -1;
+            public List<ulong> Targets; // what the game counts for this step's task (null = not known)
             public List<Kill> Kills;
             /// <summary>Other quests the same kills counted for: the fight goes on until they're done too.</summary>
             public Dictionary<ulong, string> Also;
@@ -219,6 +689,7 @@ namespace QuestRecorder
                 {
                     case EvKind.ObjectClick: what = "clicked object \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
                     case EvKind.NpcClick: what = "clicked NPC \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
+                    case EvKind.Loot: what = "looted \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
                     case EvKind.BoardOpen: what = "mission board \"" + e.Option + "\" opened"; break;
                     case EvKind.InteractionOpen: what = e.Option + " window with \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
                     case EvKind.ConvoStart: what = "talked to \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
@@ -340,7 +811,7 @@ namespace QuestRecorder
                         foreach (string l in s.Lines)
                             if (l.StartsWith("<UseObject", StringComparison.Ordinal))
                                 what = "use " + Attr(l, "ObjectName") + " at " + Attr(l, "XYZ") + ", then " + what;
-                            else if (l.StartsWith("<Interact", StringComparison.Ordinal))
+                            else if ((l.StartsWith("<Interact", StringComparison.Ordinal) || l.StartsWith("<ClickObject", StringComparison.Ordinal)))
                                 what = "click " + Attr(l, "Name") + " (it starts the fight), then " + what;
                         break;
                     }
@@ -350,7 +821,7 @@ namespace QuestRecorder
                         foreach (string l in s.Lines)
                             if (l.StartsWith("<UseObject", StringComparison.Ordinal))
                                 objs.Add("use " + Attr(l, "ObjectName") + " at " + Attr(l, "XYZ"));
-                            else if (l.StartsWith("<Interact", StringComparison.Ordinal))
+                            else if ((l.StartsWith("<Interact", StringComparison.Ordinal) || l.StartsWith("<ClickObject", StringComparison.Ordinal)))
                                 objs.Add("click " + Attr(l, "Name"));
                         what = string.Join(" -> ", objs);
                         break;
@@ -402,6 +873,68 @@ namespace QuestRecorder
                 }
             }
             events = ordered;
+            // the mission items that left your bags during the recording (before the filter below drops the ones that
+            // weren't a use): a step that ticked right after you targeted an NPC may have been one of them used on it
+            var goneItems = new List<RecEvent>();
+            foreach (RecEvent ev in events)
+                if (ev.Kind == EvKind.QuestItem && ev.Note == "item gone" && ev.Option.Length > 0)
+                    goneItems.Add(ev);
+            events = ExactActions(events);
+            // Quest abilities (special / temporary bar) and items you put on: kept only when a mission moved soon after
+            // (6 s for an ability, 20 s for an item you put on), so a new class ability or a gear swap never becomes a step.
+            // Each ability remembers the mission item you used before it (Macrobinoculars opens the scan).
+            var abilityNames = new HashSet<string>(StringComparer.Ordinal);
+            var abilityOpen = new Dictionary<string, string>(StringComparer.Ordinal);
+            {
+                var keep = new List<RecEvent>(events.Count);
+                string lastItem = null;
+                double lastItemAt = -1e9;
+                for (int i = 0; i < events.Count; i++)
+                {
+                    RecEvent x = events[i];
+                    bool ability = x.Kind == EvKind.QuestItem && x.Note == "ability";
+                    bool equip = x.Kind == EvKind.QuestItem && x.Note == "equipped";
+                    if (x.Kind == EvKind.QuestItem && !ability && !equip && x.Note != "item gone" && x.Option.Length > 0)
+                    {
+                        lastItem = x.Option;
+                        lastItemAt = x.Elapsed;
+                    }
+                    if (ability || equip)
+                    {
+                        double win = ability ? 6 : 20;
+                        bool moved = false;
+                        for (int j = i + 1; j < events.Count && events[j].Elapsed - x.Elapsed <= win; j++)
+                            if (events[j].Kind == EvKind.QuestTask || events[j].Kind == EvKind.QuestStep || events[j].Kind == EvKind.QuestCompleted)
+                            {
+                                moved = true;
+                                break;
+                            }
+                        if (!moved)
+                            continue;
+                        if (ability)
+                        {
+                            abilityNames.Add(x.Option);
+                            if (!abilityOpen.ContainsKey(x.Option) && lastItem != null && x.Elapsed - lastItemAt <= 120)
+                                abilityOpen[x.Option] = lastItem;
+                        }
+                    }
+                    keep.Add(x);
+                }
+                events = keep;
+            }
+            _sameName = new Dictionary<string, List<Vec3>>(StringComparer.Ordinal);
+            foreach (RecEvent e in events)
+            {
+                if ((e.Kind == EvKind.ObjectClick || e.Kind == EvKind.Spot || e.Kind == EvKind.Cast || e.Kind == EvKind.CastStart) &&
+                    e.Target != null && e.Target.Kind == ObjKind.Placeable && e.Target.HasPos && e.Target.Name.Length > 0)
+                {
+                    List<Vec3> l;
+                    if (!_sameName.TryGetValue(e.Target.Name, out l))
+                        _sameName[e.Target.Name] = l = new List<Vec3>();
+                    if (!l.Exists(p => p.DistanceTo(e.Target.Pos) <= 0.05f))
+                        l.Add(e.Target.Pos);
+                }
+            }
             // lifts and taxis are ridden by the navigator: clicks on them are not object uses
             var transport = new HashSet<string>(StringComparer.Ordinal);
             foreach (RecEvent e in events)
@@ -454,7 +987,17 @@ namespace QuestRecorder
             var seen = new Dictionary<string, Vec3>(StringComparer.Ordinal);
             var kills = new List<Kill>();
             var allKills = new List<Kill>(); // every kill in the recording (more spots for each fight)
+            var mobSeen = new List<Kill>(); // the mob scanner: mobs your missions count that you came near (not killed - spots only)
+            int leg = 0; // which part of the map you're in (goes up with each lift / taxi / loading screen)
+            double legAt = -1e9;
             ObjRef talk = null;
+            ObjRef lastLoot = null; // the last body you looted
+            string lastBagItem = null; // the last usable bag item you used (a stim)
+            string pendingEquip = null; // an item you just put on (a quest disguise)
+            double pendingEquipAt = -1e9;
+            double lastBagItemAt = -1e9;
+            Vec3 lastBagItemPos = default(Vec3);
+            double lastLootAt = -1e9;
             double talkAt = -1e9;
             double boardAt = -1e9; // when you last opened a mission board
             ObjRef lastClicked = null; // the last object or NPC you clicked (not lifts or taxis)
@@ -468,12 +1011,18 @@ namespace QuestRecorder
             double fightAt = -1e9;
             double castEndAt = -1e9;
             Step pendingRide = null;
+            bool pendingOpenOnly = false; // the lift's panel opened, no ride seen yet
             Vec3 rideFrom = default(Vec3);
             ObjRef pendingLift = null;
             string pendingDest = string.Empty;
             double liftOpenAt = -1e9;
             Vec3 itemPos = default(Vec3);
             string itemOn = null; // the NPC you used the item on, if you had one targeted
+            bool inCombat = false, itemInCombat = false; // in a fight right now / when you used the item
+            float itemOnDist = -1f; // how far you stood from the NPC you used the item on
+            bool itemOnDead = false; // that NPC was a corpse
+            float itemOnHealth = -1f; // that NPC's health when you used it
+            double actionAt = -1e9; // your last click or cast (not a loot)
             string castItem = null; // a cast on nothing (maybe a mission item) and where it ended
             double castItemAt = -1e9;
             Vec3 castItemPos = default(Vec3);
@@ -489,12 +1038,32 @@ namespace QuestRecorder
             ulong lastProgressQuest = 0;
             EvKind lastProgressKind = EvKind.Start;
             var stepText = new Dictionary<ulong, string>();
+            var countsSeen = new Dictionary<string, long[]>(StringComparer.Ordinal); // "quest|step|task" -> {count, max}
+            var taskTexts = new Dictionary<string, string>(StringComparer.Ordinal); // "quest|step|task" -> its objective text
             var picked = new List<ulong>();
             var weeklies = new HashSet<ulong>(); // a weekly can be picked up again (3 times a week): never loop just for it
             var knownItems = new List<string>(); // every mission item you used in this recording
             var itemForTask = new Dictionary<string, string>(StringComparer.Ordinal); // quest/step/task -> the item you did it with
             var scanner = new Dictionary<string, List<Vec3>>(StringComparer.Ordinal); // same-kind objects near your clicks
             var itemOrder = new List<Use>(); // mission items used since the last tick, in order
+            ObjRef targetNpc = null; // the NPC you last selected
+            double targetNpcAt = -1e9;
+            var usedItemNames = new HashSet<string>(StringComparer.Ordinal); // items already written as a "used on your target" step
+            // every spot you used each mission item, in your order - also the uses that didn't count
+            // (Black Hole spies: 5 scans, 3 counted - the spies aren't always in the same place)
+            var itemSpots = new Dictionary<string, List<Vec3>>(StringComparer.Ordinal);
+            foreach (RecEvent ev in events)
+            {
+                string used = ev.Kind == EvKind.QuestItem ? ev.Option
+                            : ev.Kind == EvKind.Cast ? ItemFromCast(ev.Option) : null;
+                if (string.IsNullOrEmpty(used) || used.StartsWith("Heroic Transport", StringComparison.Ordinal) || ev.Pos.IsZero)
+                    continue;
+                List<Vec3> sl;
+                if (!itemSpots.TryGetValue(used, out sl))
+                    itemSpots[used] = sl = new List<Vec3>();
+                if (sl.Count < 20 && !sl.Exists(v => v.DistanceTo(ev.Pos) < 0.5f))
+                    sl.Add(ev.Pos);
+            }
             var completedOrder = new List<ulong>();
             double bareCastAt = -1e9;
             Vec3 bareCastPos = default(Vec3);
@@ -536,6 +1105,18 @@ namespace QuestRecorder
                         convo = null;
                         break;
                 }
+                if (pendingRide != null && !e.Pos.IsZero && e.Pos.DistanceTo(rideFrom) >= 3f && pendingOpenOnly && pendingLift.NodeId != 0 &&
+                    e.Kind != EvKind.ElevatorRide && e.Kind != EvKind.Loading && e.Kind != EvKind.AreaChange && e.Kind != EvKind.Jump)
+                {
+                    // You opened the lift's panel but didn't ride it: you walked off (this recorder sees every ride, even
+                    // a short one). No ride - but one spot where you walked to, so the navigator goes your way and doesn't
+                    // stand at the lift (CZ-198 22:11: the bot froze at that lift until LethToxic took it down by hand).
+                    pendingRide.Kind = "Ride"; // its own gate: only while you're still on the lift's side
+                    pendingRide.Gate = SideOf(rideFrom, e.Pos);
+                    pendingRide.Comment = "Walk past the " + pendingLift.Name + " (you didn't ride it)";
+                    pendingRide.Lines[0] = "<MoveTo QuestId=\"1\" Name=\"Past the " + A(pendingLift.Name) + "\" XYZ=\"" + X(e.Pos) + "\" />";
+                    pendingRide = null;
+                }
                 if (pendingRide != null && !e.Pos.IsZero && e.Pos.DistanceTo(rideFrom) >= 3f)
                 {
                     pendingRide.Gate = SideOf(rideFrom, e.Pos);
@@ -553,6 +1134,20 @@ namespace QuestRecorder
                     }
                     pendingRide = null;
                 }
+                // A lift, taxi, loading screen or area change starts a new part of the map: a fight only roams
+                // spots from its own part (CZ-198: the first fight must not take the Freight Depot spots below).
+                if (e.Kind == EvKind.ElevatorOpen || e.Kind == EvKind.TaxiStart || e.Kind == EvKind.Loading || e.Kind == EvKind.AreaChange)
+                {
+                    if (e.Elapsed - legAt > 60)
+                        leg++;
+                    legAt = e.Elapsed;
+                }
+                else if (e.Kind == EvKind.ElevatorRide || e.Kind == EvKind.TaxiEnd)
+                {
+                    if (e.Elapsed - legAt > 60)
+                        leg++; // a ride the recorder saw without the panel opening first
+                    legAt = e.Elapsed;
+                }
                 // Follow your footsteps: a walk point every WalkSpacing metres; BuddyCron finds the way in between.
                 if ((e.Kind == EvKind.ElevatorRide || e.Kind == EvKind.Loading || e.Kind == EvKind.Jump || e.Kind == EvKind.AreaChange) && !e.Pos.IsZero)
                 {
@@ -566,7 +1161,10 @@ namespace QuestRecorder
                         haveTrail = true;
                         lastTrail = e.Pos;
                     }
-                    else if (WalkSpacing > 0f && lastTrail.DistanceTo(e.Pos) >= WalkSpacing)
+                    // Walk points only when you ask for them (setting): the steps are already in your order at your
+                    // exact spots, so the bot runs straight from one to the next. A point every 10 m made it crawl.
+                    // Positions are in game units of 10 m.
+                    else if (WalkSpacing > 0f && lastTrail.DistanceTo(e.Pos) * 10f >= WalkSpacing)
                     {
                         markers.Add(new KeyValuePair<string, Vec3>("Your path", e.Pos));
                         lastTrail = e.Pos;
@@ -610,6 +1208,19 @@ namespace QuestRecorder
                     case EvKind.ObjectClick:
                     case EvKind.Cast:
                     {
+                        // The game's loot cast with nothing clicked (area loot): you looted the mob that just died next to you
+                        // (Section X Lost Reconnaissance: a Flight Recorder out of a Tuk'ata - "Partially Digested").
+                        if ((e.Option == "Looting" || e.Option == "Loot") && e.Target == null && (lastLoot == null || t - lastLootAt > 5) && allKills.Count > 0)
+                        {
+                            Kill lk = allKills[allKills.Count - 1];
+                            if (t - lk.At <= 20 && !e.Pos.IsZero && lk.Pos.DistanceTo(e.Pos) <= 3f)
+                            {
+                                lastLoot = new ObjRef { Name = lk.Name, Kind = ObjKind.Npc, Pos = lk.Pos, HasPos = true, Spec = lk.Spec, How = "the mob that just died next to you (the game's loot cast)" };
+                                lastLootAt = t;
+                            }
+                        }
+                        if (e.Option != "Loot")
+                            actionAt = t; // a click or a cast of yours (not the loot cast itself)
                         // "Using Rune of Passion..." is the cast of the mission item "Rune of Passion" (older recordings
                         // didn't tie it to the item): a mission item use, in your order
                         string usedItem = e.Kind == EvKind.Cast ? ItemFromCast(e.Option) : null;
@@ -645,8 +1256,14 @@ namespace QuestRecorder
                         string key = X(p);
                         seen[o.Name] = p;
                         double when;
-                        if (e.Kind == EvKind.ObjectClick && consumed.TryGetValue(key, out when) && t - when <= 30)
-                            break; // a second click on an object already used (no new cast on it)
+                        // a second click on the same object already used (no new cast on it). Same object = same game id:
+                        // a container that respawns at the same spot is a new one and counts (CZ-198 Biotoxin 3-5).
+                        if (e.Kind == EvKind.ObjectClick && consumed.TryGetValue(UseKey(o.NodeId, p), out when) && t - when <= 30)
+                            break;
+                        // the cast of that same object ending just after its tick (the game counted it first): part of that use,
+                        // not a new one for the next step (CZ-198: Biotoxin loot finishing after Biotoxin 3/6 counted)
+                        if (e.Kind == EvKind.Cast && o.NodeId != 0 && consumed.TryGetValue(UseKey(o.NodeId, p), out when) && t - when <= 3)
+                            break;
                         if (e.Kind == EvKind.ObjectClick && t - castEndAt <= 1.5 && uses.Count > 0 && uses[uses.Count - 1].Name != o.Name)
                             break; // a stray click right as a cast on another object ended (CZ-198 Kolto after the last pod)
                         if (e.Kind == EvKind.Cast)
@@ -654,13 +1271,29 @@ namespace QuestRecorder
                         if (uses.Count > 0 && X(uses[uses.Count - 1].Pos) == key)
                         {
                             uses[uses.Count - 1].At = t; // the click and its cast are one use
+                            if (o.NodeId != 0)
+                                uses[uses.Count - 1].Id = o.NodeId;
                             if (e.Kind == EvKind.Cast)
                                 uses[uses.Count - 1].Cast = true;
                             break;
                         }
-                        uses.Add(new Use { Name = o.Name, Pos = p, At = t, Cast = e.Kind == EvKind.Cast, Stand = e.Pos });
+                        uses.Add(new Use { Name = o.Name, Pos = p, At = t, Cast = e.Kind == EvKind.Cast, Stand = e.Pos, Id = o.NodeId });
                         break;
                     }
+                    case EvKind.Loot:
+                        if (e.Target != null)
+                        {
+                            lastLoot = e.Target;
+                            lastLootAt = t;
+                            // a loot is also what the "kill and loot" step looks for (Section X Targeting Beacon)
+                            if (e.Target.Name.Length > 0)
+                            {
+                                npcClickName = e.Target.Name;
+                                npcClickPos = e.Target.HasPos ? e.Target.Pos : e.Pos;
+                                npcClickAt = t;
+                            }
+                        }
+                        break;
                     case EvKind.ConvoStart:
                         if (e.Note == How.HolocomCall)
                             holoAt = t;
@@ -674,8 +1307,14 @@ namespace QuestRecorder
                         boardAt = t;
                         break;
                     case EvKind.Spot:
+                        // the scanner: a mob one of your missions counts, seen near you - another spot where its fight finds them
+                        if (e.Target != null && e.Target.Kind == ObjKind.Npc && e.Target.HasPos && e.Target.Name.Length > 0)
+                        {
+                            if (mobSeen.Count < 2000)
+                                mobSeen.Add(new Kill { Name = e.Target.Name, Pos = e.Target.Pos, At = t, Leg = leg, Spec = e.Target.Spec });
+                        }
                         // the scanner: another object like the one you clicked, nearby
-                        if (e.Target != null && e.Target.HasPos && e.Target.Name.Length > 0)
+                        else if (e.Target != null && e.Target.HasPos && e.Target.Name.Length > 0)
                         {
                             List<Vec3> sl;
                             if (!scanner.TryGetValue(e.Target.Name, out sl))
@@ -685,16 +1324,52 @@ namespace QuestRecorder
                         }
                         break;
                     case EvKind.QuestItem:
+                        if (e.Note == "equipped")
+                        {
+                            // an item you put on (a quest disguise): its own step, right before the mission moved
+                            pendingEquip = e.Option;
+                            pendingEquipAt = t;
+                            break;
+                        }
+                        if (e.Note == "bag item" && e.Option.Length > 0)
+                        {
+                            lastBagItem = e.Option;
+                            lastBagItemAt = t;
+                            lastBagItemPos = e.Pos;
+                        }
                         if (e.Option.Length > 0)
                         {
                             if (!knownItems.Contains(e.Option))
                                 knownItems.Add(e.Option);
-                            if (itemOrder.Count == 0 || itemOrder[itemOrder.Count - 1].Name != e.Option || t - itemOrder[itemOrder.Count - 1].At > 5)
-                                itemOrder.Add(new Use { Name = e.Option, Pos = e.Pos, At = t }); // (its cast may have been noted already)
+                            string on = e.Target != null && e.Target.Kind != ObjKind.Placeable && e.Target.Name.Length > 0 && !string.Equals(e.Target.Toughness, "companion", StringComparison.OrdinalIgnoreCase) ? e.Target.Name : null;
+                            float onDist = on != null && e.Target.HasPos && !e.Pos.IsZero ? e.Pos.DistanceTo(e.Target.Pos) : -1f;
+                            bool onDead = on != null && e.Target.Dead;
+                            float onHealth = on != null ? e.Target.Health : -1f;
+                            // the same use seen twice (its cast, then its cooldown): one use - but the same item on another
+                            // NPC a moment later is a second use (two prisoners freed with one Shackle Remote)
+                            Use lastUse = itemOrder.Count > 0 ? itemOrder[itemOrder.Count - 1] : null;
+                            if (lastUse == null || lastUse.Name != e.Option || t - lastUse.At > 5 || (on != null && lastUse.On != null && on != lastUse.On))
+                                itemOrder.Add(new Use { Name = e.Option, Pos = e.Pos, At = t, On = on, OnDist = onDist, OnDead = onDead, OnHealth = onHealth }); // (its cast may have been noted already)
+                            else if (lastUse.On == null)
+                            {
+                                lastUse.On = on;
+                                lastUse.OnDist = onDist;
+                                lastUse.OnDead = onDead;
+                                lastUse.OnHealth = onHealth;
+                            }
+                            else if (on != null && lastUse.On == on)
+                            {
+                                onDead = lastUse.OnDead;
+                                onHealth = lastUse.OnHealth; // the same use seen again: keep how it was when you used it
+                            }
                             item = e.Option;
                             itemAt = t;
                             itemPos = e.Pos;
-                            itemOn = e.Target != null && e.Target.Kind != ObjKind.Placeable && e.Target.Name.Length > 0 && !string.Equals(e.Target.Toughness, "companion", StringComparison.OrdinalIgnoreCase) ? e.Target.Name : null;
+                            itemOn = on;
+                            itemInCombat = inCombat;
+                            itemOnDist = onDist;
+                            itemOnDead = onDead;
+                            itemOnHealth = onHealth;
                         }
                         break;
                     case EvKind.Loading:
@@ -708,6 +1383,15 @@ namespace QuestRecorder
                             npcClickName = e.Target.Name;
                             npcClickPos = e.Target.HasPos ? e.Target.Pos : e.Pos;
                             npcClickAt = t;
+                        }
+                        break;
+                    case EvKind.Target:
+                        // the NPC you selected (a friendly one you then used a mission item on: the Section X Hyperbeast)
+                        if (e.Target != null && e.Target.Kind != ObjKind.Placeable && e.Target.Name.Length > 0 && !e.Target.Dead &&
+                            !string.Equals(e.Target.Toughness, "companion", StringComparison.OrdinalIgnoreCase))
+                        {
+                            targetNpc = e.Target;
+                            targetNpcAt = t;
                         }
                         break;
                     case EvKind.ConvoChoice:
@@ -730,6 +1414,7 @@ namespace QuestRecorder
                             // the window you opened, now ridden: that step already covers it (just take the floor if new)
                             if (pendingRide != null && dest.Length > 0 && pendingDest.Length == 0)
                                 pendingDest = dest;
+                            pendingOpenOnly = false; // ridden (Section X lifts move you less than 3 m)
                             break;
                         }
                         liftOpenAt = t;
@@ -749,6 +1434,7 @@ namespace QuestRecorder
                             ride.Lines.Add(string.Empty); // written when you come out (below)
                             steps.Add(ride);
                             pendingRide = ride;
+                            pendingOpenOnly = e.Kind == EvKind.ElevatorOpen;
                             pendingLift = w;
                             pendingDest = dest;
                             rideFrom = e.HasStand ? e.Stand : (e.Kind == EvKind.ElevatorOpen ? e.Pos : e.FromPos);
@@ -812,7 +1498,11 @@ namespace QuestRecorder
                             break;
                         }
                         // a phase door / doorway you went through.
-                        if (t - rideAt > 20 && e.HasFrom && !e.Note.StartsWith(How.Revived, StringComparison.Ordinal))
+                        // (not a quick travel or fleet pass you cast: BuddyCron plans its own way, no walk points for it)
+                        if (t - rideAt > 20 && e.HasFrom && !e.Note.StartsWith(How.Revived, StringComparison.Ordinal) &&
+                            e.Note.IndexOf("Quick Travel", StringComparison.OrdinalIgnoreCase) < 0 &&
+                            e.Note.IndexOf("Fleet Pass", StringComparison.OrdinalIgnoreCase) < 0 &&
+                            e.Note.IndexOf("Stronghold", StringComparison.OrdinalIgnoreCase) < 0)
                         {
                             markers.Add(new KeyValuePair<string, Vec3>("Before the " + (e.Kind == EvKind.AreaChange ? "area change" : "door / phase"), e.FromPos));
                             markers.Add(new KeyValuePair<string, Vec3>("Came out here", e.Pos));
@@ -820,11 +1510,15 @@ namespace QuestRecorder
                         break;
                     case EvKind.CombatStart:
                         fightAt = t;
+                        inCombat = true;
+                        break;
+                    case EvKind.CombatEnd:
+                        inCombat = false;
                         break;
                     case EvKind.Kill:
                         if (e.Note.Length == 0 && e.Target != null)
                         {
-                            var k = new Kill { Name = e.Target.Name, Pos = e.Target.HasPos ? e.Target.Pos : e.Pos, At = t };
+                            var k = new Kill { Name = e.Target.Name, Pos = e.Target.HasPos ? e.Target.Pos : e.Pos, At = t, Leg = leg, Spec = e.Target.Spec };
                             kills.Add(k);
                             allKills.Add(k);
                             if (lastWalk != null && t - lastWalkAt <= 2 && steps.Contains(lastWalk))
@@ -872,8 +1566,90 @@ namespace QuestRecorder
                     case EvKind.QuestTask:
                     case EvKind.QuestStep:
                     {
-                        if (e.QuestHidden || e.QuestId == 0)
+                        if (e.QuestId == 0)
                             break;
+                        if (pendingEquip != null && t - pendingEquipAt <= 20 && !e.QuestHidden && !hiddenQuests.Contains(e.QuestId))
+                        {
+                            string eq = Fmt.Hex(e.QuestId);
+                            string worn = pendingEquip.Replace("'", "\\'");
+                            var eqLines = new List<string> { "<EquipItem ItemName=\"" + A(pendingEquip) + "\" />" };
+                            AddStep(steps, "Item", "HasQuest(" + eq + ") and not HasItemEquipped('" + worn + "')", "Put on " + pendingEquip + " (like you did, right before " + e.QuestName + " moved on)", eqLines, e.QuestId);
+                            pendingEquip = null;
+                        }
+                        if (e.QuestHidden || hiddenQuests.Contains(e.QuestId)) // the game marks its helper quests hidden only sometimes
+                        {
+                            // A loot that moved the game's own helper quest (Black Hole Glow: looting a Radiation Treatment
+                            // Droid gives the anti-rad injector that keeps you alive on the lower level): kill and loot that
+                            // mob there, until the helper quest has moved on. Without it the bot walks into the radiation.
+                            if (e.Kind == EvKind.QuestStep && lastLoot != null && t - lastLootAt <= 4 && lastLoot.Name.Length > 0)
+                            {
+                                string hq = Fmt.Hex(e.QuestId);
+                                ulong hb = e.HasOldStep ? e.OldBranch : e.Branch, hs = e.HasOldStep ? e.OldStep : e.Step;
+                                var lootStep = new Step
+                                {
+                                    Kind = "Grind",
+                                    Gate = Fmt.Format("HasQuest({0}) and not IsBranchStepComplete({0}, {1}, {2})", hq, hb, hs),
+                                    Comment = "Kill and loot " + lastLoot.Name + " (your loot moved the game's helper quest - e.g. an anti-radiation injector)",
+                                    Quest = e.QuestId,
+                                    Kills = new List<Kill> { new Kill { Name = lastLoot.Name, Pos = lastLoot.HasPos ? lastLoot.Pos : e.Pos, At = t, Leg = leg, Spec = lastLoot.Spec } }
+                                };
+                                steps.Add(lootStep);
+                                lastLoot = null;
+                                break;
+                            }
+                            // A bag item (a stim) that moved the game's helper quest: use it here, where you did (Glow: the
+                            // stim that keeps you alive on the lower level). Used once; the helper quest moving on ends it.
+                            // (not when a normal mission moved at the same moment: a medpac in a Black Hole fight isn't a step)
+                            if (lastBagItem != null && t - lastBagItemAt <= 6 && !NormalTickNear(events, hiddenQuests, t))
+                            {
+                                string iq = Fmt.Hex(e.QuestId);
+                                ulong ib = e.HasOldStep ? e.OldBranch : e.Branch, ist = e.HasOldStep ? e.OldStep : e.Step;
+                                var useStep = new Step
+                                {
+                                    Kind = "Item",
+                                    Gate = Fmt.Format("HasQuest({0}) and not IsBranchStepComplete({0}, {1}, {2})", iq, ib, ist),
+                                    Comment = "Use " + lastBagItem + " (it moved the game's helper quest - e.g. a stim that keeps you alive)",
+                                    Quest = e.QuestId
+                                };
+                                useStep.Lines.Add("<MoveTo QuestId=\"1\" Name=\"Where you used " + A(lastBagItem) + "\" XYZ=\"" + X(lastBagItemPos) + "\" />");
+                                useStep.Lines.Add("<UseMissionItemOnce ItemName=\"" + A(lastBagItem) + "\" />");
+                                steps.Add(useStep);
+                                // that stim is done: it doesn't carry on to the next step or into a row of item uses
+                                if (item == lastBagItem)
+                                    item = null;
+                                itemOrder.RemoveAll(u => u.Name == lastBagItem);
+                                lastBagItem = null;
+                                break;
+                            }
+                            // The same with a mission item (an injector you pressed from the mission items): use it here, once.
+                            // (not when a normal mission moved at the same moment: then the item belongs to that step)
+                            // (only a quest hidden right now: a bonus mission that started hidden keeps its normal count steps)
+                            if (e.QuestHidden && item != null && t - itemAt <= 6 && !item.StartsWith("Heroic Transport", StringComparison.Ordinal) &&
+                                !NormalTickNear(events, hiddenQuests, t))
+                            {
+                                string mq = Fmt.Hex(e.QuestId);
+                                ulong mb = e.HasOldStep ? e.OldBranch : e.Branch, ms = e.HasOldStep ? e.OldStep : e.Step;
+                                var mStep = new Step
+                                {
+                                    Kind = "Item",
+                                    Gate = Fmt.Format("HasQuest({0}) and not IsBranchStepComplete({0}, {1}, {2})", mq, mb, ms),
+                                    Comment = "Use " + item + " (it moved the game's helper quest - e.g. an injector that keeps you alive)",
+                                    Quest = e.QuestId
+                                };
+                                Vec3 at = itemPos.IsZero ? e.Pos : itemPos;
+                                mStep.Lines.Add("<MoveTo QuestId=\"1\" Name=\"Where you used " + A(item) + "\" XYZ=\"" + X(at) + "\" />");
+                                mStep.Lines.Add("<UseMissionItemOnce ItemName=\"" + A(item) + "\" />");
+                                steps.Add(mStep);
+                                string doneItem = item;
+                                itemOrder.RemoveAll(u => u.Name == doneItem);
+                                item = null;
+                                break;
+                            }
+                            // only skip what the game marks hidden right now: a bonus mission starts hidden and then
+                            // counts normally (Section X Cleanse the Cannon), its counts must stay in the profile
+                            if (e.QuestHidden)
+                                break;
+                        }
                         if (e.Kind == EvKind.QuestTask && e.Text.StartsWith("Complete ", StringComparison.OrdinalIgnoreCase))
                             break; // a weekly's "Complete X" ticks by itself
                         string q = Fmt.Hex(e.QuestId);
@@ -884,6 +1660,12 @@ namespace QuestRecorder
                         {
                             gate = Fmt.Format("HasQuest({0}) and not IsTaskValueGreaterThan({0}, {1}, {2}, {3})", q, e.Step, task, e.Count > 0 ? e.Count - 1 : 0);
                             what = Fmt.Format("{0}: {1} ({2}/{3})", e.QuestName, e.Text, e.Count, e.Max);
+                            countsSeen[q + "|" + e.Step + "|" + task] = new[] { (long)e.Count, (long)e.Max };
+                            taskTexts[q + "|" + e.Step + "|" + task] = e.Text;
+                            // the kill right before this count moved it: remember which task it counted for
+                            if (allKills.Count > 0 && t - allKills[allKills.Count - 1].At <= 1.0 &&
+                                (e.TaskTargets.Count == 0 || allKills[allKills.Count - 1].Spec == 0 || e.TaskTargets.Contains(allKills[allKills.Count - 1].Spec))) // only if the game counts that mob type for this task
+                                allKills[allKills.Count - 1].Credit.Add(q + "|" + task);
                         }
                         else
                         {
@@ -891,11 +1673,39 @@ namespace QuestRecorder
                             ulong os = e.HasOldStep ? e.OldStep : e.Step;
                             gate = Fmt.Format("HasQuest({0}) and not IsBranchStepComplete({0}, {1}, {2})", q, ob, os);
                             what = Fmt.Format("{0}: step {2} done{3}", e.QuestName, ob, os, e.Text.Length > 0 ? " (next: " + e.Text + ")" : string.Empty);
+                            // The last count of a task finished the step (Staff Cuts 34/35 -> step done): write it as
+                            // that count, 35/35. Only when exactly one task of the step was one short.
+                            string oneShort = null;
+                            long oneShortMax = 0;
+                            int shortTasks = 0;
+                            foreach (KeyValuePair<string, long[]> cs in countsSeen)
+                            {
+                                if (!cs.Key.StartsWith(q + "|" + os + "|", StringComparison.Ordinal) || cs.Value[0] >= cs.Value[1])
+                                    continue;
+                                shortTasks++;
+                                if (cs.Value[0] == cs.Value[1] - 1)
+                                {
+                                    oneShort = cs.Key.Substring(cs.Key.LastIndexOf('|') + 1);
+                                    oneShortMax = cs.Value[1];
+                                }
+                            }
+                            if (shortTasks == 1 && oneShort != null)
+                            {
+                                string tt;
+                                taskTexts.TryGetValue(q + "|" + os + "|" + oneShort, out tt);
+                                gate = Fmt.Format("HasQuest({0}) and not IsTaskValueGreaterThan({0}, {1}, {2}, {3})", q, os, oneShort, oneShortMax - 1);
+                                what = Fmt.Format("{0}: {1} ({2}/{2}) - step {3} done{4}", e.QuestName, tt ?? "count", oneShortMax, os,
+                                                  e.Text.Length > 0 ? " (next: " + e.Text + ")" : string.Empty);
+                            }
                         }
                         // the same moment: another quest counting the same action, or this quest's task finishing its step
                         if (e.Kind == EvKind.QuestStep || (isCount && e.Count >= e.Max))
                             finalAt[e.QuestId] = t; // this tick finished the step / count
                         bool sameMoment = t - lastProgressAt <= 1.0;
+                        // (not when a second use of an item is still waiting for its count: two prisoners freed with one
+                        // Shackle Remote, both counts within a second - each count is its own use on its own NPC)
+                        if (sameMoment && item != null && t - itemAt <= 20 && isCount && lastProgressQuest == e.QuestId)
+                            sameMoment = false;
                         if (sameMoment && (lastProgressQuest != e.QuestId || lastProgressKind == EvKind.QuestTask)) // another quest, or a second count / the step of this quest ticking for the same action (Section X Hyperbiology ticks two counts per sample)
                         {
                             // One kill counting for two quests (Control the Battlefield + Asset Liquidation): the fight
@@ -1001,7 +1811,7 @@ namespace QuestRecorder
                             lines.Add("<UserDialog Title=\"Quest Recorder\" Message=\"" + A("Do the " + at.Name + " by hand, then press Continue.") + "\" />");
                             foreach (Use u in take)
                             {
-                                consumed[X(u.Pos)] = t;
+                                consumed[UseKey(u.Id, u.Pos)] = t;
                                 uses.Remove(u);
                             }
                             AddStep(steps, "Use", gate, what + " (do it by hand)", lines, e.QuestId);
@@ -1015,16 +1825,16 @@ namespace QuestRecorder
                         {
                             if (spawners.Contains(u))
                             {
-                                // the object only starts the fight.
-                                if (!u.Stand.IsZero && u.Stand.DistanceTo(u.Pos) > 1.5f && u.Stand.DistanceTo(u.Pos) < 10f)
-                                    lines.Add("<MoveTo QuestId=\"1\" Name=\"Stand for " + A(u.Name) + "\" XYZ=\"" + X(u.Stand) + "\" />");
-                                lines.Add("<Interact QuestId=\"" + q + "\" Name=\"" + A(u.Name) + "\" XYZ=\"" + X(u.Pos) + "\" />");
-                                consumed[X(u.Pos)] = t;
+                                // the object only starts the fight. Clicked by its exact spot (Quest Recorder's ClickObject):
+                                // BuddyCron's Interact takes the one nearest the bot and skips one it clicked for 30 s, so
+                                // a row of clicks on side-by-side objects (Torvix Pipeline Controls) came out wrong.
+                                lines.Add("<ClickObject QuestId=\"" + q + "\" Name=\"" + A(u.Name) + "\" XYZ=\"" + X(u.Pos) + "\" />");
+                                consumed[UseKey(u.Id, u.Pos)] = t;
                                 uses.Remove(u);
                                 continue;
                             }
                             lines.AddRange(UseAt(u.Name, u.Pos, u.Stand, countIds));
-                            consumed[X(u.Pos)] = t;
+                            consumed[UseKey(u.Id, u.Pos)] = t;
                             uses.Remove(u);
                         }
                         if (named.Count == 0 && !keepRest)
@@ -1048,10 +1858,14 @@ namespace QuestRecorder
                             }
                             else
                             {
-                                var g = new Step { Kind = "Grind", Gate = gate, Comment = what, Quest = e.QuestId, Task = e.TaskIndex, Kills = use };
+                                var g = new Step { Kind = "Grind", Gate = gate, Comment = what, Quest = e.QuestId, Task = e.TaskIndex, Targets = e.TaskTargets.Count > 0 ? e.TaskTargets : null, Kills = use };
                                 g.Lines.AddRange(lines);
                                 steps.Add(g);
                             }
+                            // an item used before that kill wasn't what moved this count, and it doesn't carry on to the next
+                            // step either (a medpac pressed mid-fight became "use Medpac" on the next talk)
+                            if (item != null && itemAt <= kills[kills.Count - 1].At)
+                                item = null;
                             kills.Clear();
                             break;
                         }
@@ -1064,9 +1878,31 @@ namespace QuestRecorder
                             string itemIds = isCount
                                 ? Fmt.Format(" BranchId=\"{0}\" StepId=\"{1}\" TaskId=\"{2}\" TaskValue=\"{3}\"", e.Branch, e.Step, task, e.Count > 0 ? e.Count - 1 : 0) // done as soon as this count goes up
                                 : Fmt.Format(" BranchId=\"{0}\" StepId=\"{1}\"", e.HasOldStep ? e.OldBranch : e.Branch, e.HasOldStep ? e.OldStep : e.Step);
+                            // the same item used on two NPCs before the first tick (two prisoners, one Shackle Remote): this
+                            // tick is the first use, the next one waits for the next tick - each on its own NPC
+                            List<Use> sameUses = orderNow.FindAll(u => u.Name == item && t - u.At <= 20);
+                            Use nextUse = null;
+                            if (sameUses.Count > 1 && sameUses.Exists(u => u.On != null && u.On != sameUses[0].On))
+                            {
+                                itemOn = sameUses[0].On;
+                                itemOnDist = sameUses[0].OnDist;
+                                itemOnDead = sameUses[0].OnDead;
+                                itemOnHealth = sameUses[0].OnHealth;
+                                itemPos = sameUses[0].Pos;
+                                nextUse = sameUses[1];
+                                for (int su = 1; su < sameUses.Count; su++)
+                                    itemOrder.Add(sameUses[su]);
+                            }
                             Vec3 usedAt = itemPos.IsZero ? e.Pos : itemPos;
                             // used on an NPC (a scanner on a spy): on the nearest one of that name around the spot, like the Korriban ID Scanner (1.5 m, radius 200)
-                            string onNpc = itemOn != null ? " Range=\"15\" Radius=\"200\" InCombat=\"False\"><Npcs><Npc>" + A(itemOn) + "</Npc></Npcs>" : ">";
+                            // (used in a fight: may be used in a fight again)
+                            // a corpse: BuddyCron only uses it on dead ones with DeadOnly. Used in a fight on a weakened mob
+                            // ("weaken it, then use the item"): fight it first, use it once its health is down to where you did.
+                            string howNpc = itemOnDead ? " DeadOnly=\"True\""
+                                          : itemInCombat && itemOnHealth > 0f && itemOnHealth < 95f
+                                              ? " HealthPercent=\"" + Math.Min(100, (int)Math.Ceiling(itemOnHealth) + 5).ToString(CultureInfo.InvariantCulture) + "\""
+                                              : string.Empty;
+                            string onNpc = itemOn != null ? " Range=\"" + UseRangeFor(itemOnDist) + "\" Radius=\"200\" InCombat=\"" + (itemInCombat ? "True" : "False") + "\"" + howNpc + "><Npcs><Npc>" + A(itemOn) + "</Npc></Npcs>" : ">";
                             // several items used one after another with nothing ticking in between (the Sith runes at the
                             // altar): each one once, in your order, then the last one as usual
                             var earlierUses = orderNow.FindAll(u => t - u.At <= 120 && !u.Name.StartsWith("Heroic Transport", StringComparison.Ordinal));
@@ -1082,18 +1918,57 @@ namespace QuestRecorder
                                         lines.Add("<MoveTo QuestId=\"" + q + "\" Name=\"Where you used " + A(u.Name) + "\" XYZ=\"" + X(u.Pos) + "\" />");
                                         lastSpot = u.Pos;
                                     }
-                                    lines.Add("<UseMissionItemOnce ItemName=\"" + A(u.Name) + "\" />");
+                                    // on the NPC you used it on, from as close as you stood (a corpse: DeadOnly)
+                                    lines.Add("<UseMissionItemOnce ItemName=\"" + A(u.Name) + "\"" +
+                                              (u.On != null ? " Npc=\"" + A(u.On) + "\" Range=\"" + UseRangeFor(u.OnDist) + "\"" + (u.OnDead ? " DeadOnly=\"True\"" : string.Empty) : string.Empty) + " />");
                                 }
                                 // the last one once too: if the order went wrong, the whole row is tried again next round
                                 // instead of pressing one rune forever
-                                lines.Add("<UseMissionItemOnce ItemName=\"" + A(item) + "\" />");
+                                lines.Add("<UseMissionItemOnce ItemName=\"" + A(item) + "\"" +
+                                          (itemOn != null ? " Npc=\"" + A(itemOn) + "\" Range=\"" + UseRangeFor(itemOnDist) + "\"" + (itemOnDead ? " DeadOnly=\"True\"" : string.Empty) : string.Empty) + " />");
                                 lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"3\" />");
                             }
                             else
+                            {
+                                // a count done with this item: every spot you used it, in your order (also the ones that
+                                // didn't count), so the bot tries them all like you did until the count goes up
+                                string spots = "<Hotspot Name=\"Where you used it\" XYZ=\"" + X(usedAt) + "\" />";
+                                List<Vec3> all;
+                                // (also the last count, which shows up as "step done": that step's counts were done with it too)
+                                // (a step change carries no task number: any count of that step done with this item)
+                                bool countTask = isCount;
+                                if (!countTask && e.HasOldStep)
+                                {
+                                    string stepKey = q + "/" + e.OldStep + "/";
+                                    foreach (KeyValuePair<string, string> kv in itemForTask)
+                                        if (kv.Key.StartsWith(stepKey, StringComparison.Ordinal) && kv.Value == item)
+                                            countTask = true;
+                                }
+                                // (only the spots near this one - within ~150 m - not every spot that item was ever used, from
+                                // other steps or other places)
+                                if (countTask && itemSpots.TryGetValue(item, out all) && all.FindAll(v => v.DistanceTo(usedAt) <= 15f).Count > 1)
+                                {
+                                    spots = string.Empty;
+                                    foreach (Vec3 v in all)
+                                        if (v.DistanceTo(usedAt) <= 15f)
+                                            spots += "<Hotspot Name=\"Where you used it\" XYZ=\"" + X(v) + "\" />";
+                                }
                                 lines.Add("<UseItem QuestId=\"" + q + "\"" + itemIds + " ItemName=\"" + A(item) + "\" WaitTime=\"3000\" XYZ=\"" + X(usedAt) + "\"" + onNpc +
-                                          "<Hotspots><Hotspot Name=\"Where you used it\" XYZ=\"" + X(usedAt) + "\" /></Hotspots></UseItem>");
+                                          "<Hotspots>" + spots + "</Hotspots></UseItem>");
+                            }
                             itemForTask[q + "/" + e.Step + "/" + task] = item; // this task is done with this item
-                            item = null;
+                            if (nextUse != null)
+                            {
+                                // the next use of the same item (on the next NPC) belongs to the next tick
+                                itemAt = nextUse.At;
+                                itemPos = nextUse.Pos;
+                                itemOn = nextUse.On;
+                                itemOnDist = nextUse.OnDist;
+                                itemOnDead = nextUse.OnDead;
+                                itemOnHealth = nextUse.OnHealth;
+                            }
+                            else
+                                item = null;
                             AddStep(steps, "Item", gate, what, lines, e.QuestId);
                             break;
                         }
@@ -1117,19 +1992,47 @@ namespace QuestRecorder
                             AddStep(steps, "Talk", gate, what, lines, e.QuestId);
                             break;
                         }
+                        // A count that moved right after you looted a mob whose kill already counted for another task (Section X
+                        // Lost Reconnaissance: the Tuk'ata counted as a Wild Beast, then its loot was a Flight Recorder): kill and
+                        // loot that mob for this count too.
+                        if (isCount && lootKills.Count == 0 && lastLoot != null && lastLoot.Kind == ObjKind.Npc && t - lastLootAt <= 2.5 && actionAt <= lastLootAt)
+                        {
+                            List<Kill> again = allKills.FindAll(k => k.Name == lastLoot.Name && t - k.At <= 30);
+                            if (again.Count > 0)
+                                lootKills = new List<Kill> { new Kill { Name = again[again.Count - 1].Name, Pos = again[again.Count - 1].Pos, At = again[again.Count - 1].At, Leg = again[again.Count - 1].Leg, Spec = again[again.Count - 1].Spec } };
+                        }
                         if (isCount && lootKills.Count > 0)
                         {
                             // Story quests "Collect 6 datapads" style: you killed, then looted, then it ticked.
-                            var lg = new Step { Kind = "Grind", Gate = gate, Comment = what + " (kill and loot)", Quest = e.QuestId, Task = e.TaskIndex, Kills = lootKills };
+                            var lg = new Step { Kind = "Grind", Gate = gate, Comment = what + " (kill and loot)", Quest = e.QuestId, Task = e.TaskIndex, Targets = e.TaskTargets.Count > 0 ? e.TaskTargets : null, Kills = lootKills };
                             lg.Lines.AddRange(lines);
                             steps.Add(lg);
+                            break;
+                        }
+                        // (only when the loot was the last thing you did - within 2.5 s, no cast or click after it: in CZ-198
+                        // the Pipes / Junction Box casts right at the tick did those steps, not the loot a few seconds before)
+                        // (the mob may have died a while before and already counted for another mission's fight - you fought on and
+                        // came back for its body: Section X Targeted Misfire, the Jedi Special Operative)
+                        List<Kill> stepLoot = lastLoot != null && !lootKills.Exists(k => k.Name == lastLoot.Name)
+                            ? allKills.FindAll(k => k.Name == lastLoot.Name && t - k.At <= 60 && k.Pos.DistanceTo(lastLoot.HasPos ? lastLoot.Pos : e.Pos) <= 3f)
+                            : lootKills;
+                        if (!isCount && lastLoot != null && t - lastLootAt <= 2.5 && actionAt <= lastLootAt && stepLoot.Exists(k => k.Name == lastLoot.Name))
+                        {
+                            // a step finished by looting a mob you had just killed (Section X Hyperbiology: kill the Hyperbeast,
+                            // loot its tissue): kill and loot it until the step is done
+                            string lootName = lastLoot.Name;
+                            var ls = new Step { Kind = "Grind", Gate = gate, Comment = what + " (kill and loot)", Quest = e.QuestId, Task = e.TaskIndex, Targets = e.TaskTargets.Count > 0 ? e.TaskTargets : null,
+                                                Kills = stepLoot.FindAll(k => k.Name == lootName).ConvertAll(k => new Kill { Name = k.Name, Pos = k.Pos, At = k.At, Leg = k.Leg, Spec = k.Spec }) };
+                            ls.Lines.AddRange(lines);
+                            steps.Add(ls);
+                            lastLoot = null;
                             break;
                         }
                         if (isCount && npcClickName != null && t - npcClickAt <= 6 && killedNames.Contains(npcClickName))
                         {
                             // you looted the body of a mob you had killed.
-                            var lk = new Step { Kind = "Grind", Gate = gate, Comment = what + " (kill and loot)", Quest = e.QuestId, Task = e.TaskIndex,
-                                                Kills = new List<Kill> { new Kill { Name = npcClickName, Pos = npcClickPos, At = t } } };
+                            var lk = new Step { Kind = "Grind", Gate = gate, Comment = what + " (kill and loot)", Quest = e.QuestId, Task = e.TaskIndex, Targets = e.TaskTargets.Count > 0 ? e.TaskTargets : null,
+                                                Kills = new List<Kill> { new Kill { Name = npcClickName, Pos = npcClickPos, At = t, Leg = leg } } };
                             lk.Lines.AddRange(lines);
                             steps.Add(lk);
                             npcClickName = null;
@@ -1156,6 +2059,85 @@ namespace QuestRecorder
                         }
                         if (hiddenQuests.Contains(e.QuestId) && !isCount)
                             break; // a hidden helper quest moving on by itself (the game's own bookkeeping): nothing to walk to
+                        // You targeted an NPC just before and nothing else of yours was seen, but a mission item you held left
+                        // your bags later in this same mission (Section X Hyperbiology: the Serum Injector used on the friendly
+                        // Hyperbeast - no cast bar, no cooldown; the game took the injector away two steps later). Use that
+                        // item on that NPC. Marked "not sure" (yellow): the game gave no direct signal for the use.
+                        if (!isCount && targetNpc != null && (t - targetNpcAt <= 6 || (t - targetNpcAt <= 15 && fightAt < targetNpcAt && !(allKills.Count > 0 && allKills[allKills.Count - 1].At > targetNpcAt))) && !kills.Exists(kk => kk.Name == targetNpc.Name && kk.At <= t))
+                        {
+                            RecEvent later = null;
+                            // (only an item the game took away at a later STEP of this same mission - not one another mission
+                            // ended with, and not one the game took when this mission finished: that's the item it hands in,
+                            // like Section X Research Cancellation's Republic Research - "using" it on the boss would stall)
+                            foreach (RecEvent g in goneItems)
+                            {
+                                if (g.Elapsed <= t || g.Elapsed - t > 300 || usedItemNames.Contains(g.Option))
+                                    continue;
+                                bool sameQuest = false;
+                                bool handedIn = false;
+                                foreach (RecEvent x in events)
+                                    if (x.QuestId == e.QuestId && Math.Abs(x.Elapsed - g.Elapsed) <= 0.5 &&
+                                        (x.Kind == EvKind.QuestCompleted || x.Kind == EvKind.QuestRemoved))
+                                        handedIn = true;
+                                if (handedIn)
+                                    continue;
+                                foreach (RecEvent x in events)
+                                    if (x.QuestId == e.QuestId && Math.Abs(x.Elapsed - g.Elapsed) <= 2.0 &&
+                                        (x.Kind == EvKind.QuestStep || x.Kind == EvKind.QuestTask || x.Kind == EvKind.QuestCompleted))
+                                    {
+                                        sameQuest = true;
+                                        break;
+                                    }
+                                if (sameQuest)
+                                {
+                                    later = g;
+                                    break;
+                                }
+                            }
+                            if (later != null)
+                            {
+                                string ids = Fmt.Format(" BranchId=\"{0}\" StepId=\"{1}\"", e.HasOldStep ? e.OldBranch : e.Branch, e.HasOldStep ? e.OldStep : e.Step);
+                                Vec3 np = targetNpc.HasPos ? targetNpc.Pos : e.Pos;
+                                lines.Add("<UseItem QuestId=\"" + q + "\"" + ids + " ItemName=\"" + A(later.Option) + "\" WaitTime=\"3000\" XYZ=\"" + X(np) +
+                                          "\" Range=\"" + UseRangeFor(targetNpc.HasPos ? e.Pos.DistanceTo(targetNpc.Pos) : -1f) + "\" Radius=\"200\" InCombat=\"False\"><Npcs><Npc>" + A(targetNpc.Name) + "</Npc></Npcs>" +
+                                          "<Hotspots><Hotspot Name=\"" + A(targetNpc.Name) + "\" XYZ=\"" + X(np) + "\" /></Hotspots></UseItem>");
+                                usedItemNames.Add(later.Option);
+                                string onWho = targetNpc.Name;
+                                targetNpc = null;
+                                AddStep(steps, "Item", gate, what + " (not sure: you targeted " + onWho + " and held " + later.Option + " - the game gave no signal for the use)", lines, e.QuestId);
+                                break;
+                            }
+                        }
+                        // A count the game didn't say how you did (Section X Lost Reconnaissance: a Flight Recorder you looted
+                        // that the recorder didn't see), but your other counts of it were done with an object: any of that
+                        // object near where it ticked (yellow - not sure).
+                        if (isCount && !e.Pos.IsZero)
+                        {
+                            string key = "IsTaskValueGreaterThan(" + q + ", " + e.Step + ", " + task + ",";
+                            string sibling = null;
+                            foreach (Step ps in steps)
+                                if (ps.Gate != null && ps.Gate.Contains(key))
+                                    foreach (string l in ps.Lines)
+                                        if (l.StartsWith("<UseObject ", StringComparison.Ordinal))
+                                            sibling = Attr(l, "ObjectName"); // (XML-escaped as written)
+                            if (!string.IsNullOrEmpty(sibling))
+                            {
+                                lines.Add("<UseObject ObjectName=\"" + sibling + "\"" + countIds + " UseRange=\"20\" IgnoreLOS=\"True\" WaitTime=\"3000\" BlacklistDuration=\"5\" Radius=\"50\" XYZ=\"" + X(e.Pos) + "\" />");
+                                AddStep(steps, "Use", gate, what + " (not sure: the game didn't say what you used - any " + sibling + " near where it ticked, like your other counts)", lines, e.QuestId);
+                                break;
+                            }
+                        }
+                        // Defend / hold here: you stood at this spot a while, the fight came to you, and the step moved on by
+                        // itself (waves, "hold the position", a timer). Walking there and moving straight on would leave
+                        // before it's done: the bot waits there, fighting what comes, until the step moves on.
+                        bool fought = false;
+                        double stay = !isCount && !e.Pos.IsZero ? StayedAt(events, t, e.Pos, out fought) : 0;
+                        if (!isCount && stay >= 20 && fought)
+                        {
+                            lines.Add("<While Condition=\"" + A(gate) + "\"><MoveTo QuestId=\"1\" Name=\"Defend here\" XYZ=\"" + X(e.Pos) + "\" /><WaitTimer QuestId=\"1\" WaitTime=\"3\" /></While>");
+                            AddStep(steps, "Walk", gate, what + " (defend: you held this spot " + ((int)stay).ToString(CultureInfo.InvariantCulture) + " s while the fight came to you - the bot waits here until it moves on)", lines, e.QuestId);
+                            break;
+                        }
                         lines.Add("<MoveTo QuestId=\"" + q + "\" Name=\"Where it ticked\" XYZ=\"" + X(e.Pos) + "\" />");
                         AddStep(steps, "Walk", gate, what, lines, e.QuestId);
                         if (isCount)
@@ -1235,10 +2217,20 @@ namespace QuestRecorder
                             s.Lines.Add("<TurnInQuest QuestName=\"" + A(e.QuestName) + "\" QuestId=\"" + q + "\"" + (by.Kind == ObjKind.Placeable ? " SearchRadius=\"20\" UseRange=\"20\"" : string.Empty) +
                                         " TurnInName=\"" + A(by.Name) + "\" XYZ=\"" + X(by.HasPos ? by.Pos : e.Pos) + "\" />");
                         }
-                        // BuddyCron only takes a reward that is already up.
+                        // Take the reward right here, where you did (CZ-198: the quest leaves your log the moment it's
+                        // done while its reward waits, so "HasQuest" skipped this and every reward came at the end).
+                        // CompleteQuest finishes at once when no reward is waiting.
+                        // The game counts the quest complete the moment it finishes, while its reward window still waits
+                        // (checked live, Section X Data Raid: IsQuestComplete was already true, reward not taken) - so
+                        // "not IsQuestComplete" skipped the reward, and also paused 5 s here for quests not even done yet.
+                        // Now: the quest is still finishing, or the game says its reward is waiting.
                         if (s.Gate == null)
-                            s.Gate = "HasQuest(" + q + ") and not IsQuestComplete(" + q + ")";
-                        s.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"5\" />");
+                        {
+                            s.Gate = "(HasQuest(" + q + ") and not IsQuestComplete(" + q + ")) or " + RewardWaiting(q);
+                            s.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"3\" />");
+                        }
+                        else
+                            s.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"5\" />");
                         s.Lines.Add("<CompleteQuest QuestId=\"" + q + "\" />");
                         steps.Add(s);
                         if (!completedOrder.Contains(e.QuestId))
@@ -1260,6 +2252,54 @@ namespace QuestRecorder
 
             if (pendingRide != null)
                 steps.Remove(pendingRide); // the recording ended before you came out of the lift
+            // A weekly that was already in your log when you started (Black Hole: you had the weekly, the board only
+            // offered the 4 dailies): picked up at the same mission board as the missions you took - marked "not sure"
+            // (yellow in the review list), the recording never saw where it came from.
+            {
+                string board = null, boardXyz = null;
+                int boardIdx = -1;
+                for (int i = 0; i < steps.Count; i++)
+                {
+                    if (steps[i].Kind != "Pickup" || steps[i].Lines.Count == 0)
+                        continue;
+                    Match bm = Regex.Match(steps[i].Lines[0], "SearchRadius=\"20\" UseRange=\"20\" GiverName=\"([^\"]+)\" XYZ=\"([^\"]+)\"");
+                    if (!bm.Success || (bm.Groups[1].Value.IndexOf("Terminal", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                        bm.Groups[1].Value.IndexOf("Mission", StringComparison.OrdinalIgnoreCase) < 0))
+                        continue; // only a mission board / terminal gives area weeklies
+                    board = bm.Groups[1].Value;
+                    boardXyz = bm.Groups[2].Value;
+                    boardIdx = i;
+                }
+                if (board != null)
+                {
+                    var had = new List<KeyValuePair<ulong, string>>();
+                    foreach (RecEvent ev in events)
+                    {
+                        if (ev.QuestId == 0 || ev.QuestHidden || hiddenQuests.Contains(ev.QuestId) || picked.Contains(ev.QuestId))
+                            continue;
+                        if (ev.Kind != EvKind.QuestTask && ev.Kind != EvKind.QuestStep && ev.Kind != EvKind.QuestCompleted)
+                            continue;
+                        string nm = ev.QuestName ?? string.Empty;
+                        if (!nm.StartsWith("[WEEKLY", StringComparison.OrdinalIgnoreCase) || had.Exists(h => h.Key == ev.QuestId))
+                            continue;
+                        had.Add(new KeyValuePair<ulong, string>(ev.QuestId, nm));
+                    }
+                    foreach (KeyValuePair<ulong, string> h in had)
+                    {
+                        string hq = Fmt.Hex(h.Key);
+                        weeklies.Add(h.Key);
+                        var ws = new Step
+                        {
+                            Kind = "Pickup",
+                            Gate = "(not HasQuest(" + hq + "))",
+                            Comment = "Pick up " + h.Value + " (not sure: it was already in your log when you recorded - picked up at " + System.Net.WebUtility.HtmlDecode(board) + " like your other missions)",
+                            At = steps[boardIdx].At
+                        };
+                        ws.Lines.Add("<PickUpIfOffered QuestName=\"" + A(h.Value) + "\" QuestId=\"" + hq + "\" SearchRadius=\"20\" UseRange=\"20\" GiverName=\"" + board + "\" XYZ=\"" + boardXyz + "\" />");
+                        steps.Insert(++boardIdx, ws);
+                    }
+                }
+            }
             foreach (Step made in steps)
                 if (made.At < -1e8)
                     made.At = prevT;
@@ -1270,6 +2310,8 @@ namespace QuestRecorder
             foreach (RecEvent ev in events)
                 if (ev.Kind == EvKind.QuestTask && ev.Max > 0 && !ev.QuestHidden)
                     maxFor[Fmt.Hex(ev.QuestId) + ", " + ev.Step + ", " + Math.Max(0, ev.TaskIndex)] = ev.Max;
+            ShareTaskFights(steps);
+            CollectSteps(steps, maxFor, scanner);
             var lastOfTask = new Dictionary<string, Step>(StringComparer.Ordinal);
             foreach (Step s in steps)
             {
@@ -1284,6 +2326,12 @@ namespace QuestRecorder
                 if (!maxFor.TryGetValue(kv.Key, out max))
                     continue;
                 Step s = kv.Value;
+                // Only a plain fight runs on to the full count. A step that uses an object first (a ZX-10 pod that lets
+                // out the droid) can't: the pods you used are spent, so no droid would ever come and the bot would wait
+                // forever (CZ-198 Manual Shutdown, stopped at 4/5). It stays at your count; the end says it's unfinished.
+                if (s.Lines.Exists(l => l.StartsWith("<UseObject", StringComparison.Ordinal) || (l.StartsWith("<Interact", StringComparison.Ordinal) || l.StartsWith("<ClickObject", StringComparison.Ordinal)) ||
+                                        l.StartsWith("<UseItem", StringComparison.Ordinal) || l.StartsWith("<UseMissionItemOnce", StringComparison.Ordinal)))
+                    continue;
                 // a later step already finishes this quest step: nothing to stretch
                 string[] k3 = kv.Key.Split(new[] { ", " }, StringSplitOptions.None);
                 string finish = @"IsBranchStepComplete\(" + Regex.Escape(k3[0]) + @", \d+, " + k3[1] + @"\)";
@@ -1297,6 +2345,16 @@ namespace QuestRecorder
                         s.Also[k] = Regex.Replace(s.Also[k], @"IsTaskValueGreaterThan\(" + Regex.Escape(kv.Key) + @", \d+\)", full);
             }
             KeepBestOfRepeats(steps);
+            // A fight where none of the mobs you killed are on the game's list for that task: say so (yellow in the
+            // review list) instead of guessing.
+            foreach (Step s in steps)
+            {
+                if (s.Kind != "Grind" || s.Targets == null || s.Targets.Count == 0 || s.Kills == null || s.Comment.IndexOf("(not sure", StringComparison.Ordinal) >= 0)
+                    continue;
+                bool known = s.Kills.Exists(k => k.Spec != 0);
+                if (known && !s.Kills.Exists(k => k.Spec != 0 && s.Targets.Contains(k.Spec)))
+                    s.Comment += " (not sure: the game doesn't count the mobs you killed here for this task)";
+            }
             MergeCountClicks(steps, scanner);
             // a fight roams every spot you killed those mobs at near it, not one spot where it camps the respawn
             foreach (Step s in steps)
@@ -1305,10 +2363,92 @@ namespace QuestRecorder
                     continue;
                 var names = new HashSet<string>(s.Kills.ConvertAll(k => k.Name));
                 var own = new List<Kill>(s.Kills);
+                // You fought it in a few places: those are the fight, exactly where you did it (CZ-198 Staff Cuts).
+                // Only a fight you did all in one spot gets your other spots too, so it doesn't camp one respawn.
+                var spots = new List<Vec3>();
+                foreach (Kill k in own)
+                    if (!spots.Exists(p => p.DistanceTo(k.Pos) <= 1f))
+                        spots.Add(k.Pos);
+                if (spots.Count >= 3)
+                    continue;
                 foreach (Kill k in allKills)
-                    if (names.Contains(k.Name) && !s.Kills.Contains(k) && own.Exists(o => o.Pos.DistanceTo(k.Pos) <= 60f))
-                        s.Kills.Add(new Kill { Name = k.Name, Pos = k.Pos, At = k.At });
+                    if (names.Contains(k.Name) && !s.Kills.Contains(k) && own.Exists(o => o.Leg == k.Leg && o.Pos.DistanceTo(k.Pos) <= 3f)) // 3 = about 30 m in game units
+                        s.Kills.Add(new Kill { Name = k.Name, Pos = k.Pos, At = k.At, Leg = k.Leg, Credit = k.Credit, Spec = k.Spec });
             }
+            // the mob scanner: every mob this fight's mission counts that you came near (killed or not) is a spot too,
+            // after your own spots. Groups linked to each other (each within ~50 m of the next) all count, so the bot goes on
+            // to the next group instead of waiting for a respawn; ordered nearest-next, so it walks group to group, not
+            // a big circle. Same part of the map, at most ~150 m from where you fought.
+            if (mobSeen.Count > 0)
+                foreach (Step s in steps)
+                {
+                    if (s.Kind != "Grind" || s.Kills == null || s.Kills.Count == 0)
+                        continue;
+                    var names = new HashSet<string>(s.Kills.ConvertAll(k => k.Name));
+                    var own = new List<Kill>(s.Kills);
+                    var cands = new List<Kill>();
+                    foreach (Kill m in mobSeen)
+                    {
+                        bool counts = m.Spec != 0 && s.Targets != null && s.Targets.Contains(m.Spec);
+                        if (!counts && !(names.Contains(m.Name) && (s.Targets == null || m.Spec == 0)))
+                            continue;
+                        if (!own.Exists(o => o.Leg == m.Leg && o.Pos.DistanceTo(m.Pos) <= 15f)) // ~150 m: BuddyCron picks fight hotspots at random, so keep them close
+                            continue;
+                        if (s.Kills.Exists(k => k.Pos.DistanceTo(m.Pos) <= 2f) || cands.Exists(c => c.Pos.DistanceTo(m.Pos) <= 2f))
+                            continue; // already a spot
+                        cands.Add(m);
+                    }
+                    Vec3 last = own[own.Count - 1].Pos;
+                    for (int added = 0; added < 40 && cands.Count > 0; added++)
+                    {
+                        // linked: within ~50 m of a spot the fight already has; of those, the nearest to the last one
+                        Kill next = null;
+                        float best = float.MaxValue;
+                        foreach (Kill c in cands)
+                        {
+                            if (!s.Kills.Exists(k => k.Leg == c.Leg && k.Pos.DistanceTo(c.Pos) <= 5f))
+                                continue;
+                            float d = c.Pos.DistanceTo(last);
+                            if (d < best)
+                            {
+                                best = d;
+                                next = c;
+                            }
+                        }
+                        if (next == null)
+                            break; // the rest aren't linked to this fight
+                        cands.Remove(next);
+                        s.Kills.Add(new Kill { Name = next.Name, Pos = next.Pos, At = next.At, Leg = next.Leg, Spec = next.Spec });
+                        last = next.Pos;
+                    }
+                }
+            // Quest abilities (special / temporary bar) were recorded like mission items: cast them with Quest Recorder's
+            // UseQuestAbility (same spots, NPCs and range as UseItem), opening the bar with its mission item first.
+            if (abilityNames.Count > 0)
+                foreach (Step s in steps)
+                    for (int li = 0; li < s.Lines.Count; li++)
+                    {
+                        string l = s.Lines[li];
+                        bool use = l.StartsWith("<UseItem ", StringComparison.Ordinal);
+                        bool once = l.StartsWith("<UseMissionItemOnce ", StringComparison.Ordinal);
+                        if (!use && !once)
+                            continue;
+                        string an = Attr(l, "ItemName"); // as written in the line (XML-escaped)
+                        string raw = null;
+                        foreach (string nm in abilityNames)
+                            if (A(nm) == an)
+                                raw = nm;
+                        if (raw == null)
+                            continue;
+                        string open;
+                        string openAttr = abilityOpen.TryGetValue(raw, out open) && open != raw ? " OpenWith=\"" + A(open) + "\"" : string.Empty;
+                        if (use)
+                            l = "<UseQuestAbility " + l.Substring("<UseItem ".Length).Replace(" ItemName=\"" + an + "\"", " AbilityName=\"" + an + "\"" + openAttr)
+                                                                                  .Replace("</UseItem>", "</UseQuestAbility>");
+                        else
+                            l = l.Replace(" ItemName=\"" + an + "\"", " AbilityName=\"" + an + "\"" + openAttr);
+                        s.Lines[li] = l;
+                    }
             if (trace != null)
             {
                 FillTrace(steps, trace);
@@ -1376,15 +2516,33 @@ namespace QuestRecorder
         private static string LinkedUse(string name, Vec3 pos, string ids, int useRange)
         {
             return "<UseObject ObjectName=\"" + A(name) + "\"" + ids + " UseRange=\"" + useRange.ToString(CultureInfo.InvariantCulture) +
-                   "\" IgnoreLOS=\"True\" WaitTime=\"3000\" BlacklistDuration=\"5\" XYZ=\"" + X(pos) + "\" />";
+                   "\" IgnoreLOS=\"True\" WaitTime=\"3000\" BlacklistDuration=\"5\" Radius=\"2\" XYZ=\"" + X(pos) + "\" />"; // Radius 2 = only the object within 2 m of where you used it (default is any within 5 m)
         }
 
         /// <summary>One object use.</summary>
+        /// <summary>Every spot an object of each name was seen at in this recording (clicked or seen nearby).</summary>
+        [ThreadStatic]
+        private static Dictionary<string, List<Vec3>> _sameName;
+
+        /// <summary>
+        /// Another object with the same name stands within 10 m of this one. BuddyCron's UseObject and Interact take
+        /// the object with that name NEAREST TO THE BOT (within 10 m of it), not the one at the profile's spot - so
+        /// the bot must stand where you stood (CZ-198 pods come in pairs 3 m apart).
+        /// </summary>
+        private static bool HasTwin(string name, Vec3 pos)
+        {
+            List<Vec3> spots;
+            if (_sameName == null || !_sameName.TryGetValue(name, out spots))
+                return false;
+            return spots.Exists(p => p.DistanceTo(pos) > 0.1f && p.DistanceTo(pos) < 1f);
+        }
+
         private static List<string> UseAt(string name, Vec3 pos, Vec3 stand, string ids)
         {
             var l = new List<string>();
             float d = stand.IsZero ? 0f : stand.DistanceTo(pos);
-            if (!stand.IsZero && (d > 1.5f || Math.Abs(stand.Y - pos.Y) > 1f) && d < 10f)
+            bool twin = !stand.IsZero && d < 10f && HasTwin(name, pos);
+            if (!stand.IsZero && (twin || d > 1.5f || Math.Abs(stand.Y - pos.Y) > 1f) && d < 10f)
             {
                 l.Add("<MoveTo QuestId=\"1\" Name=\"Stand for " + A(name) + "\" XYZ=\"" + X(stand) + "\" />");
                 l.Add(LinkedUse(name, pos, ids, Math.Max(20, (int)Math.Ceiling((d + 1f) * 10f))));
@@ -1396,7 +2554,7 @@ namespace QuestRecorder
 
         private static string OneUse(string name, Vec3 pos)
         {
-            return "<UseObject ObjectName=\"" + A(name) + "\" QuestId=\"1\" IgnoreQuestRelation=\"True\" UseRange=\"20\" IgnoreLOS=\"True\" WaitTime=\"3000\" XYZ=\"" + X(pos) + "\" />";
+            return "<UseObject ObjectName=\"" + A(name) + "\" QuestId=\"1\" IgnoreQuestRelation=\"True\" UseRange=\"20\" IgnoreLOS=\"True\" WaitTime=\"3000\" Radius=\"2\" XYZ=\"" + X(pos) + "\" />";
         }
 
         /// <summary>
@@ -1424,9 +2582,8 @@ namespace QuestRecorder
                     if (n.Gate.IndexOf("IsBranchStepComplete", StringComparison.Ordinal) >= 0)
                         break; // the click that finished the step ends the run
                 }
-                List<Vec3> scanned;
-                if (!scanner.TryGetValue(name, out scanned))
-                    scanned = new List<Vec3>();
+                // only the spots you clicked: nothing added from elsewhere (no scanner spots)
+                var scanned = new List<Vec3>();
                 if (run.Count < 2 && scanned.Count == 0)
                     continue;
                 Step last = run[run.Count - 1];
@@ -1455,7 +2612,7 @@ namespace QuestRecorder
                 string line = last.Lines[0].TrimEnd();
                 if (line.EndsWith("/>", StringComparison.Ordinal))
                     line = line.Substring(0, line.Length - 2).TrimEnd();
-                line = Regex.Replace(line, " Radius=\"[^\"]*\"", string.Empty) + " Radius=\"50\">";
+                line = Regex.Replace(line, " Radius=\"[^\"]*\"", string.Empty) + " Radius=\"2\">"; // each spot: only the object you used there
                 last.Lines[0] = line + "<Hotspots>" + string.Concat(spots.ToArray()) + "</Hotspots></UseObject>";
                 last.Comment = last.Comment + " - any " + name + " (" + spots.Count + " spots)";
                 foreach (Step r in run)
@@ -1554,6 +2711,11 @@ namespace QuestRecorder
                 sb.Append("\t</Vendors>").Append(nl);
             }
             sb.Append(nl);
+            // Fights go in the header as GrindAreas (the way the hand-made profiles do it); the steps use GrindRef.
+            StringBuilder head = sb;
+            var areas = new StringBuilder();
+            var areaNames = new HashSet<string>(StringComparer.Ordinal);
+            sb = new StringBuilder();
             sb.Append("\t<Questing>").Append(nl);
             // Route steps: walk them only while the step they lead to is still to do.
             for (int i = 0; i < steps.Count; i++)
@@ -1598,6 +2760,8 @@ namespace QuestRecorder
             foreach (Step s in steps)
             {
                 // nothing to do in it (e.g. a lift ride at the very end of the recording): leave it out - an empty step stops BuddyCron loading the profile
+                // Lifts are ridden by BuddyCron's navigator by itself (Timothy: no UseTransport for lifts).
+                s.Lines.RemoveAll(l => l.StartsWith("<UseTransport", StringComparison.Ordinal) && l.Contains("Type=\"Wonkavator\""));
                 if ((s.Kills == null || s.Kills.Count == 0) && s.Lines.TrueForAll(l => string.IsNullOrWhiteSpace(l) || l.TrimStart().StartsWith("<!--", StringComparison.Ordinal)))
                     continue;
                 if (s.Kind == "Skip")
@@ -1624,6 +2788,36 @@ namespace QuestRecorder
                         if (!near)
                             anchors.Add(k);
                     }
+                    // Mobs: only the kinds whose kill moved this fight's count (a Loyalist doesn't belong in the
+                    // Partisans fight). A fight whose kills moved no count keeps every kind you killed.
+                    if (s.Quest != 0 && s.Task >= 0)
+                    {
+                        string mine = Fmt.Hex(s.Quest) + "|" + s.Task;
+                        var counted = new List<string>();
+                        foreach (Kill k in s.Kills)
+                        {
+                            bool ok = k.Credit.Contains(mine);
+                            if (!ok && s.Also != null)
+                                foreach (ulong aq in s.Also.Keys)
+                                    foreach (string c in k.Credit)
+                                        if (c.StartsWith(Fmt.Hex(aq) + "|", StringComparison.Ordinal))
+                                            ok = true;
+                            if (ok && !counted.Contains(k.Name))
+                                counted.Add(k.Name);
+                        }
+                        if (counted.Count > 0)
+                            mobs = counted;
+                    }
+                    // ask the game: only the mob types it counts for this task
+                    if (s.Targets != null && s.Targets.Count > 0)
+                    {
+                        var listed = new List<string>();
+                        foreach (Kill k in s.Kills)
+                            if (k.Spec != 0 && s.Targets.Contains(k.Spec) && !listed.Contains(k.Name))
+                                listed.Add(k.Name);
+                        if (listed.Count > 0)
+                            mobs = listed;
+                    }
                     string fightGate = s.Gate;
                     if (s.Also != null && s.Also.Count > 0)
                     {
@@ -1631,18 +2825,26 @@ namespace QuestRecorder
                         foreach (string g in s.Also.Values)
                             fightGate += " or (" + g + ")";
                     }
+                    // the fight's area goes in the header under a name of its own
+                    string area = Fmt.OneLine(s.Comment);
+                    if (area.Length > 90)
+                        area = area.Substring(0, 90).TrimEnd();
+                    string baseArea = area;
+                    for (int n = 2; !areaNames.Add(area); n++)
+                        area = baseArea + " (" + n + ")";
+                    areas.Append("\t\t<GrindArea Name=\"").Append(A(area)).Append("\">").Append(nl);
+                    areas.Append("\t\t\t<MinLevel>1</MinLevel>").Append(nl).Append("\t\t\t<MaxLevel>100</MaxLevel>").Append(nl).Append("\t\t\t<Mobs>");
+                    foreach (string m in mobs)
+                        areas.Append("<Mob>").Append(A(m)).Append("</Mob>");
+                    areas.Append("</Mobs>").Append(nl).Append("\t\t\t<Hotspots>").Append(nl);
+                    foreach (Kill a in anchors)
+                        areas.Append("\t\t\t\t<Hotspot Name=\"").Append(A(a.Name)).Append("\" XYZ=\"").Append(X(a.Pos)).Append("\" />").Append(nl);
+                    areas.Append("\t\t\t</Hotspots>").Append(nl).Append("\t\t</GrindArea>").Append(nl);
                     sb.Append("\t\t<If Condition=\"").Append(fightGate).Append("\">").Append(nl);
                     foreach (string l in s.Lines)
                         sb.Append("\t\t\t").Append(l).Append(nl);
-                    sb.Append("\t\t\t<Grind While=\"").Append(fightGate).Append("\">").Append(nl);
-                    sb.Append("\t\t\t\t<GrindArea Name=\"").Append(A(s.Comment)).Append("\">").Append(nl);
-                    sb.Append("\t\t\t\t\t<MinLevel>1</MinLevel>").Append(nl).Append("\t\t\t\t\t<MaxLevel>100</MaxLevel>").Append(nl).Append("\t\t\t\t\t<Mobs>");
-                    foreach (string m in mobs)
-                        sb.Append("<Mob>").Append(A(m)).Append("</Mob>");
-                    sb.Append("</Mobs>").Append(nl).Append("\t\t\t\t\t<Hotspots>").Append(nl);
-                    foreach (Kill a in anchors)
-                        sb.Append("\t\t\t\t\t\t<Hotspot Name=\"").Append(A(a.Name)).Append("\" XYZ=\"").Append(X(a.Pos)).Append("\" />").Append(nl);
-                    sb.Append("\t\t\t\t\t</Hotspots>").Append(nl).Append("\t\t\t\t</GrindArea>").Append(nl).Append("\t\t\t</Grind>").Append(nl).Append("\t\t</If>").Append(nl);
+                    sb.Append("\t\t\t<Grind GrindRef=\"").Append(A(area)).Append("\" While=\"").Append(fightGate).Append("\" />").Append(nl);
+                    sb.Append("\t\t</If>").Append(nl);
                 }
                 else if (s.Gate != null)
                 {
@@ -1665,9 +2867,9 @@ namespace QuestRecorder
                 foreach (ulong q in completedOrder)
                     sb.Append("\t\t<CompleteQuest QuestId=\"").Append(Fmt.Hex(q)).Append("\" />").Append(nl);
             }
-            if (picked.Count > 0 && fileName.Length > 0)
+            if (picked.Count > 0)
             {
-                // a use that did not register leaves its quest unfinished: go round again (finished steps are skipped)
+                // the end, like the hand-made profiles: no reload loop. Something left over is said plainly.
                 var conds = new List<string>();
                 foreach (ulong q in picked)
                 {
@@ -1676,14 +2878,16 @@ namespace QuestRecorder
                     if (!conds.Contains(c))
                         conds.Add(c);
                 }
-                sb.Append("\t\t<!-- Not finished? Go round again (done steps get skipped) -->").Append(nl);
+                sb.Append("\t\t<!-- Not finished? Say so instead of starting over -->").Append(nl);
                 sb.Append("\t\t<If Condition=\"").Append(string.Join(" or ", conds)).Append("\">").Append(nl);
-                sb.Append("\t\t\t<WaitTimer QuestId=\"1\" WaitTime=\"3\" />").Append(nl);
-                sb.Append("\t\t\t<LoadProfile Path=\"").Append(A(fileName)).Append("\" />").Append(nl);
+                sb.Append("\t\t\t<UserDialog Title=\"Quest Recorder\" Message=\"A quest from this profile isn't finished. Finish it by hand, or start the profile again.\" />").Append(nl);
                 sb.Append("\t\t</If>").Append(nl);
             }
+            sb.Append("\t\t<UserDialog Title=\"Done!\" Message=\"This profile is done.\" />").Append(nl);
             sb.Append("\t</Questing>").Append(nl).Append("</Profile>").Append(nl);
-            return sb.ToString();
+            if (areas.Length > 0)
+                head.Append("\t<GrindAreas>").Append(nl).Append(areas).Append("\t</GrindAreas>").Append(nl).Append(nl);
+            return head.Append(sb).ToString();
         }
     }
 }

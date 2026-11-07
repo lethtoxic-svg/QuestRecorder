@@ -36,6 +36,7 @@ namespace QuestRecorder
         {
             _path = profilePath;
             _doc.PreserveWhitespace = false;
+            _loadedStamp = Stamp(profilePath);
             _doc.Load(profilePath);
             _questing = _doc.SelectSingleNode("/Profile/Questing") as XmlElement;
 
@@ -98,7 +99,10 @@ namespace QuestRecorder
                 else if (n is XmlElement)
                 {
                     var el = (XmlElement)n;
-                    _items.Add(new Item { Comment = pending, Element = el, NoProof = NoProof(el) });
+                    // yellow: nothing you did was seen for it, or the recorder marked it "not sure" (the game doesn't
+                    // count what it would do)
+                    bool unsure = pending != null && pending.Value.IndexOf("(not sure", StringComparison.OrdinalIgnoreCase) >= 0;
+                    _items.Add(new Item { Comment = pending, Element = el, NoProof = unsure || NoProof(el) });
                     pending = null;
                 }
             }
@@ -155,11 +159,15 @@ namespace QuestRecorder
                     case "TurnInQuest": parts.Add("hand in"); break;
                     case "CompleteQuest": parts.Add("take the reward"); break;
                     case "UseObject": parts.Add("click " + e.GetAttribute("ObjectName")); break;
-                    case "Interact": parts.Add("click " + name); break;
+                    case "Interact":
+                    case "ClickObject": parts.Add("click " + name); break;
                     case "TalkTo": parts.Add("talk to " + name); break;
                     case "TalkAndReply": parts.Add("talk to " + name + ", replies " + e.GetAttribute("Replies")); break;
                     case "UseItem":
-                    case "UseMissionItemOnce": parts.Add("use " + e.GetAttribute("ItemName")); break;
+                    case "UseMissionItemOnce": parts.Add("use " + (e.GetAttribute("AbilityName").Length > 0 ? e.GetAttribute("AbilityName") : e.GetAttribute("ItemName"))); break;
+                    case "UseQuestAbility": parts.Add("use ability " + e.GetAttribute("AbilityName")); break;
+                    case "EquipItem": parts.Add("put on " + e.GetAttribute("ItemName")); break;
+                    case "While": parts.Add("wait here until it moves on"); break;
                     case "Grind": parts.Add("fight"); break;
                     case "UseTransport": parts.Add("lift to " + e.GetAttribute("Option")); break;
                     case "UserDialog": parts.Add("PAUSE: you do it"); break;
@@ -228,10 +236,35 @@ namespace QuestRecorder
             _changed = true;
         }
 
+        // when the file was read (time + size): Save never writes over a newer file
+        private string _loadedStamp;
+
+        private static string Stamp(string path)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                return fi.Exists ? fi.LastWriteTimeUtc.Ticks + "/" + fi.Length : string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
         private void Save()
         {
             if (_questing == null)
                 return;
+            // the file changed after this list read it (the recorder finished saving, or another review saved): writing
+            // this list's copy would throw the newer steps away (Black Hole: supplies 4-5 and two rewards lost)
+            if (Stamp(_path) != _loadedStamp)
+            {
+                MessageBox.Show(this, "Your profile file changed after this list opened (the recorder saved newer steps).\r\n\r\n" +
+                                      "Nothing was saved, so nothing is lost. Close this list and open the review again to see the newest version.",
+                                "Quest Recorder");
+                return;
+            }
             try
             {
                 // keep a copy of what it was
@@ -257,6 +290,7 @@ namespace QuestRecorder
                 var settings = new XmlWriterSettings { Indent = true, IndentChars = "\t", NewLineChars = "\r\n", Encoding = new UTF8Encoding(false), OmitXmlDeclaration = true };
                 using (XmlWriter w = XmlWriter.Create(_path, settings))
                     _doc.Save(w);
+                _loadedStamp = Stamp(_path); // our own save: a second Save from this list is fine
                 _changed = false;
                 RrLog.Info("Profile saved from your review: {0}", _path);
                 MessageBox.Show(this, "Saved. Load it in BuddyCron with Load Profile.", "Quest Recorder");

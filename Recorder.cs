@@ -633,6 +633,9 @@ namespace QuestRecorder
             {
                 if (!TreeRoot.IsRunning)
                     return false;
+                // "Keep recording while the bot plays": record the bot (or a helper driving it) building a profile
+                if (RrSettings.Instance.RecordBot)
+                    return false;
                 var bot = BotManager.Current;
                 return bot == null || bot.IsAutonomous;
             }
