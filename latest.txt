@@ -1,4 +1,0 @@
-3.9.99
-QuestRecorder-1.1b.zip
-This installs Quest Recorder 1.1b.
-- 1.1a's pick-up was broken: the bot walked to the giver and didn't pick anything up. Fixed, the Recon Droid in Black Hole included.
