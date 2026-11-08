@@ -55,6 +55,13 @@ namespace QuestRecorder
         /// <summary>Reads patch.txt in the background; never throws.</summary>
         public static void CheckInBackground()
         {
+            // Installed with git clone: BuddyCron's UpdateBuddy keeps it up to date, so no pop-up (and no files
+            // copied over the clone, which would get in the way of UpdateBuddy's own update).
+            if (IsGitClone())
+            {
+                RrLog.Debug("Installed with git clone - UpdateBuddy keeps Quest Recorder up to date.");
+                return;
+            }
             Task.Run(async () =>
             {
                 try
@@ -129,6 +136,13 @@ namespace QuestRecorder
             t.Start();
         }
 
+        /// <summary>True when the plugin folder is a git clone of the repository (UpdateBuddy updates those).</summary>
+        public static bool IsGitClone()
+        {
+            try { return Directory.Exists(Path.Combine(PluginFolder(), ".git")) || File.Exists(Path.Combine(PluginFolder(), ".git")); }
+            catch { return false; }
+        }
+
         private static string PluginFolder()
         {
             return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Plugins", "QuestRecorder");
@@ -142,6 +156,8 @@ namespace QuestRecorder
         /// <summary>Downloads and installs the latest version. Returns a message for the player.</summary>
         public static async Task<string> InstallAsync()
         {
+            if (IsGitClone())
+                return "You installed Quest Recorder with git clone - BuddyCron's UpdateBuddy keeps it up to date, nothing to do here.";
             if (!UpdateAvailable)
                 return "No update available.";
             if (InstalledVersion == LatestVersion)

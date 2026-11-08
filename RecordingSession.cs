@@ -516,6 +516,20 @@ namespace QuestRecorder
                     replay = text;
                 }
                 File.WriteAllText(_profilePath, replay, new UTF8Encoding(false));
+                // Load check: the profile must run on plain BuddyCron - no step only Quest Recorder knows
+                try
+                {
+                    var found = new System.Collections.Generic.List<string>();
+                    foreach (string tag in ReplayBuilder.RecorderOnlySteps)
+                        if (replay.IndexOf("<" + tag + " ", StringComparison.Ordinal) >= 0 || replay.IndexOf("<" + tag + ">", StringComparison.Ordinal) >= 0)
+                            found.Add(tag);
+                    if (found.Count > 0 && RrLog.Every("plain-check", TimeSpan.FromMinutes(10)))
+                        RrLog.Warn("This profile still has steps only Quest Recorder knows ({0}) - other players would need the plugin. Send the recording to LethToxic.", string.Join(", ", found.ToArray()));
+                }
+                catch (Exception ex)
+                {
+                    RrLog.Debug("Plain BuddyCron check: {0}", ex.Message);
+                }
                 try
                 {
                     // every interaction you made, where, and what your quest log did right after

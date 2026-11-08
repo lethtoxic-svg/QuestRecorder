@@ -1,5 +1,6 @@
-1.2a
+1.3
 main
-- Weeklies get picked up again on your 2nd and 3rd run of the week (the game calls a weekly "complete" after the first one).
-- "Do this part by hand, then press Continue" pop-ups now have a working Continue button.
-- Mission items the combat log names by their cast bar text are matched too.
+- Profiles you record now run on plain BuddyCron: anyone can run them without Quest Recorder installed.
+- Mission pickups are pinned to the exact giver you clicked (Black Hole twin terminals).
+- Weeklies are taken from the terminal whenever it offers them.
+- Area missions the game hands you by itself no longer send the bot to the last enemy you targeted (Dreadtooth).

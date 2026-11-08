@@ -45,12 +45,14 @@ namespace QuestBehaviors
         [XmlAttribute("Tries")]
         public int Tries { get; set; } = 3;
 
-        /// <summary>A weekly (3 times a week since 7.0): the game calls it "complete" after the first one that week, so
-        /// "complete" doesn't count as done - it's picked up whenever the giver offers it (and given up on when it doesn't).</summary>
+        /// <summary>Kept so older profiles still load. Every pickup now works this way: if the giver offers the mission, it's
+        /// taken - weekly or daily, whatever the game says about "complete" from an earlier run.</summary>
         [XmlAttribute("Repeatable")]
         public bool Repeatable { get; set; }
 
-        public override bool IsDone => _gaveUp || HasQuest || (IsQuestComplete && !Repeatable);
+        // Done = in the log, or the giver doesn't offer it. "Complete" from an earlier run doesn't count (a weekly stays
+        // "complete" all week after the first run, but the board offers it again).
+        public override bool IsDone => _gaveUp || HasQuest;
 
         public override string StatusText => "Picking up " + QuestName + " from " + ObjectName + " (if it's offered)";
 
@@ -91,11 +93,63 @@ namespace QuestBehaviors
                 // every 0.3 s, and a mission board takes almost a second to open, so each click cancelled the one before
                 // and the board never opened (Black Hole terminal, BuddyCron 1.0.76: 27 clicks in 10 s).
                 new Decorator(ret => WaitForBoard(), new Action(ret => RunStatus.Success)),
+                // the board is open and this mission isn't on it (done today, or this week's runs used up): skip it now
+                new Decorator(ret => BoardOpenWithout(), new ActionRunCoroutine(GiveUp)),
                 // everything else is BuddyCron's PickUpQuest, as it is
                 PickUpBehavior());
         }
 
         private Stopwatch _sinceClick;
+        private Stopwatch _boardOpen;
+
+        /// <summary>True when a mission board is open (for a second, so its list has filled in) and this mission isn't on it.</summary>
+        private bool BoardOpenWithout()
+        {
+            try
+            {
+                if (HasQuest || Core.Player == null || !Core.Player.MissionBoardOpen)
+                {
+                    _boardOpen = null;
+                    return false;
+                }
+                if (_boardOpen == null)
+                    _boardOpen = Stopwatch.StartNew();
+                if (_boardOpen.ElapsedMilliseconds < 1000)
+                    return false;
+                var list = Core.Player.MissionBoardQuests;
+                if (list == null)
+                    return false;
+                int n = 0;
+                foreach (var mq in list)
+                {
+                    if (mq == null)
+                        continue;
+                    ulong id = BoardId(mq);
+                    if (id == 0)
+                        continue; // can't tell what this entry is
+                    n++;
+                    if (id == QuestId)
+                        return false; // it's there: PickUpQuest takes it
+                }
+                return n > 0; // a list we could read, without this mission (an unreadable list never skips)
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>The quest id of a board entry (its own 0xE000... id field; the definition's id as a fallback).</summary>
+        private static ulong BoardId(object mq)
+        {
+            ulong id = 0;
+            const System.Reflection.BindingFlags all = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+            foreach (System.Reflection.FieldInfo fi in mq.GetType().GetFields(all))
+                if (fi.FieldType == typeof(ulong)) { ulong v = (ulong)fi.GetValue(mq); if ((v >> 48) == 0xE000) id = v; }
+            foreach (System.Reflection.PropertyInfo pi in mq.GetType().GetProperties(all))
+                if (pi.PropertyType == typeof(ulong) && pi.GetIndexParameters().Length == 0) { try { ulong v = (ulong)pi.GetValue(mq); if ((v >> 48) == 0xE000) id = v; } catch { } }
+            return id;
+        }
 
         /// <summary>True while a click at the giver is still waiting for its board / quest window (don't click again yet).</summary>
         private bool WaitForBoard()
@@ -156,16 +210,46 @@ namespace QuestBehaviors
                 if (_giverField == null)
                     return;
                 var kept = _giverField.GetValue(_pickUp) as BuddyCron.Objects.HeroObject;
-                if (kept == null)
-                    return;
                 // stale (gone, or not where the giver stands) -> look again
-                if (!kept.IsValid || kept.Location.DistanceSqr(Position) > 4f) // more than 20 m from the giver's spot
+                if (kept != null && (!kept.IsValid || kept.Location.DistanceSqr(Position) > 4f)) // more than 20 m from the giver's spot
+                {
                     _giverField.SetValue(_pickUp, null);
+                    kept = null;
+                }
+                // Two givers with the same name at the same spot (Black Hole: two "Black Hole Mission Terminal"s 7 cm
+                // apart, only one has missions): BuddyCron takes whichever it finds first. Take the one the game marks
+                // as giving something, nearest the recorded spot.
+                BuddyCron.Objects.HeroObject best = BestGiver();
+                if (best != null && (kept == null || kept.NodeId != best.NodeId))
+                    _giverField.SetValue(_pickUp, best);
             }
             catch
             {
                 // leave BuddyCron's lookup as it is
             }
+        }
+
+        /// <summary>Of the objects with the giver's name within 30 m of the recorded spot: the one the game marks as
+        /// giving a mission (any quest marker), else the one nearest the recorded spot. Null when there's only one or none.</summary>
+        private BuddyCron.Objects.HeroObject BestGiver()
+        {
+            BuddyCron.Objects.HeroObject marked = null, nearest = null;
+            int count = 0;
+            foreach (BuddyCron.Objects.HeroObject o in HeroObjectManager.GetObjects<BuddyCron.Objects.HeroObject>())
+            {
+                if (o == null || !o.IsValid || o.Name != ObjectName || o.Location.DistanceSqr(Position) > 9f)
+                    continue;
+                count++;
+                if (nearest == null || o.Location.DistanceSqr(Position) < nearest.Location.DistanceSqr(Position))
+                    nearest = o;
+                string ind = string.Empty;
+                try { ind = o.QuestIndication.ToString(); } catch { }
+                if (ind.Length > 0 && ind != "None" && (marked == null || o.Location.DistanceSqr(Position) < marked.Location.DistanceSqr(Position)))
+                    marked = o;
+            }
+            if (count < 2)
+                return null;
+            return marked ?? nearest;
         }
 
         private bool ShouldGiveUp()

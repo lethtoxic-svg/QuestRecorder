@@ -134,6 +134,22 @@ namespace QuestRecorder
                         break;
                     }
                 }
+                // A "step done" click is this counter's last tick only while the counter still had room (the 10th egg after 9/10).
+                // A counter already full (Shadow Spawn "Rune of Freedom 1/1") isn't fed by it - that click was another task's.
+                if (finish != null)
+                {
+                    int reached = 0;
+                    foreach (Step s in parts)
+                    {
+                        Match g = Regex.Match(s.Gate, @"IsTaskValueGreaterThan\(0x[0-9A-F]+, \d+, \d+, (\d+)\)");
+                        int n;
+                        if (g.Success && int.TryParse(g.Groups[1].Value, out n) && n + 1 > reached)
+                            reached = n + 1;
+                    }
+                    ulong full;
+                    if (maxFor.TryGetValue(kv.Key, out full) && (ulong)reached >= full)
+                        finish = null;
+                }
                 var all = new List<Step>(parts);
                 if (finish != null)
                     all.Add(finish);
@@ -644,6 +660,236 @@ namespace QuestRecorder
         {
             return Fmt.XmlAttr(s ?? string.Empty);
         }
+
+        // ---- Plain BuddyCron: the profile uses only BuddyCron's own steps, so nobody needs this plugin to run it ----
+
+        /// <summary>The &lt;CodeChunks&gt; the last plain pass made (BuddyCron's own code-in-profile), written into the header.</summary>
+        [ThreadStatic] private static List<string> _codeChunks;
+
+        /// <summary>A C# string literal from an XML-escaped attribute value.</summary>
+        private static string CsString(string xmlValue)
+        {
+            string s = System.Net.WebUtility.HtmlDecode(xmlValue ?? string.Empty);
+            return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+        }
+
+        /// <summary>
+        /// Turns every step only Quest Recorder knows into BuddyCron's own:
+        /// PickUpIfOffered -> PickUpQuest, TalkAndReply -> TalkTo, EquipItem -> UseInventoryItem, ClickObject -> MoveTo + Interact,
+        /// one mission item -> UseItem with a condition, and a row of mission items or a special-bar quest ability -> a BuddyCron
+        /// Hook (code inside the profile, like the CZ-198 Tentacle code) that waits for each cast.
+        /// </summary>
+        private static void PlainSteps(List<Step> steps)
+        {
+            _codeChunks = new List<string>();
+            int hookNo = 0;
+            foreach (Step s in steps)
+            {
+                var outLines = new List<string>();
+                string lastSpot = null;
+                for (int li = 0; li < s.Lines.Count; li++)
+                {
+                    string l = s.Lines[li];
+                    if (l.StartsWith("<MoveTo ", StringComparison.Ordinal))
+                    {
+                        string xyz = Attr(l, "XYZ");
+                        if (xyz.Length > 0)
+                            lastSpot = xyz;
+                    }
+                    if (l.StartsWith("<PickUpIfOffered ", StringComparison.Ordinal))
+                    {
+                        l = "<PickUpQuest " + l.Substring("<PickUpIfOffered ".Length);
+                        l = Regex.Replace(l, " (Repeatable|Tries)=\"[^\"]*\"", string.Empty);
+                    }
+                    if (l.StartsWith("<PickUpQuest ", StringComparison.Ordinal))
+                    {
+                        outLines.Add(l);
+                        // A weekly: the game can still call it "complete" while the terminal offers it again (even on a new
+                        // character), and BuddyCron's PickUpQuest skips anything "complete". A BuddyCron Hook at the giver takes
+                        // it from the board whenever it's offered.
+                        if (s.Comment.IndexOf("[WEEKLY", StringComparison.OrdinalIgnoreCase) >= 0)
+                            outLines.AddRange(WeeklyHook(l, ++hookNo));
+                        continue;
+                    }
+                    if (l.StartsWith("<TalkAndReply ", StringComparison.Ordinal))
+                    {
+                        // BuddyCron's own talk; when the quest is 1 the pickup / hand-in line after it does the talking
+                        string q = Attr(l, "QuestId");
+                        if (q.Length > 0 && q != "1")
+                            outLines.Add("<TalkTo QuestId=\"" + q + "\" GiverName=\"" + Attr(l, "Name") + "\" UseRange=\"20\" XYZ=\"" + Attr(l, "XYZ") + "\" />");
+                        continue;
+                    }
+                    if (l.StartsWith("<EquipItem ", StringComparison.Ordinal))
+                    {
+                        Match gq = Regex.Match(s.Gate ?? string.Empty, @"HasQuest\((0x[0-9A-F]+)\)");
+                        outLines.Add("<UseInventoryItem QuestId=\"" + (gq.Success ? gq.Groups[1].Value : Fmt.Hex(s.Quest)) + "\" ItemName=\"" + Attr(l, "ItemName") + "\" />");
+                        continue;
+                    }
+                    if (l.StartsWith("<ClickObject ", StringComparison.Ordinal))
+                    {
+                        string n = Attr(l, "Name"), xyz = Attr(l, "XYZ");
+                        outLines.Add("<MoveTo QuestId=\"1\" Name=\"" + n + "\" XYZ=\"" + xyz + "\" />");
+                        outLines.Add("<Interact Name=\"" + n + "\" XYZ=\"" + xyz + "\" />");
+                        continue;
+                    }
+                    bool once = l.StartsWith("<UseMissionItemOnce ", StringComparison.Ordinal);
+                    bool ability = l.StartsWith("<UseQuestAbility ", StringComparison.Ordinal);
+                    if (!once && !ability)
+                    {
+                        outLines.Add(l);
+                        continue;
+                    }
+                    // a run: this line and the item / ability uses right after it (MoveTos to the same row in between skipped)
+                    var run = new List<string> { l };
+                    int lj = li + 1;
+                    while (lj < s.Lines.Count)
+                    {
+                        string n = s.Lines[lj];
+                        if (n.StartsWith("<UseMissionItemOnce ", StringComparison.Ordinal))
+                            run.Add(n);
+                        else if (!n.StartsWith("<MoveTo ", StringComparison.Ordinal))
+                            break;
+                        lj++;
+                    }
+                    li = lj - 1;
+                    bool simple = run.Count == 1 && once && Attr(l, "Npc").Length == 0 && Attr(l, "AbilityName").Length == 0;
+                    if (simple)
+                    {
+                        // one mission item on yourself, once: BuddyCron's UseItem until the step moves on (Vny's Heroic Transport way)
+                        string item = Attr(l, "ItemName");
+                        string has = "any(i.Name == " + A(CsString(item).Replace("\"", "'")) + " for i in Me.QuestItems)";
+                        string cond = has + (s.Gate != null && s.Gate.Length > 0 ? " and (" + s.Gate + ")" : string.Empty);
+                        outLines.Add("<UseItem ItemName=\"" + item + "\" Condition=\"" + cond + "\" WaitTime=\"3000\" Range=\"100000\"><Hotspots><Hotspot Name=\"Where you used it\" XYZ=\"" +
+                                     (lastSpot ?? "0,0,0") + "\" /></Hotspots></UseItem>");
+                        continue;
+                    }
+                    // a row (runes in order), an item on an NPC, or a quest ability: a BuddyCron Hook that does them in order,
+                    // each after the cast before it has finished, and tries the row again if the step didn't move on
+                    hookNo++;
+                    string hook = "UseInOrder" + hookNo, v = "_r" + hookNo;
+                    var names = new List<string>();
+                    var npcs = new List<string>();
+                    var abil = new List<string>();
+                    var opens = new List<string>();
+                    foreach (string r in run)
+                    {
+                        string an = Attr(r, "AbilityName");
+                        bool isAb = an.Length > 0;
+                        names.Add(CsString(isAb ? an : Attr(r, "ItemName")));
+                        abil.Add(isAb ? "true" : "false");
+                        string npc = Attr(r, "Npc");
+                        if (npc.Length == 0)
+                        {
+                            Match nm = Regex.Match(r, "<Npc>([^<]+)</Npc>");
+                            npc = nm.Success ? nm.Groups[1].Value : string.Empty;
+                        }
+                        npcs.Add(CsString(npc));
+                        opens.Add(CsString(Attr(r, "OpenWith")));
+                    }
+                    string nl = "\r\n";
+                    _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl +
+                                    "\t\t\tstatic int " + v + "_i, " + v + "_t;" + nl +
+                                    "\t\t\tstatic bool " + v + "_p, " + v + "_s;" + nl +
+                                    "\t\t\tstatic System.DateTime " + v + "_next, " + v + "_last, " + v + "_at, " + v + "_done;" + nl +
+                                    "\t\t]]></CodeChunk>");
+                    string body =
+                        "var names = new[] { " + string.Join(", ", names) + " };" + nl +
+                        "var npcs = new[] { " + string.Join(", ", npcs) + " };" + nl +
+                        "var isAbility = new[] { " + string.Join(", ", abil) + " };" + nl +
+                        "var openWith = new[] { " + string.Join(", ", opens) + " };" + nl +
+                        "var me = BuddyCron.Core.Player;" + nl +
+                        "var now = System.DateTime.Now;" + nl +
+                        "if ((now - " + v + "_last).TotalSeconds > 60) { " + v + "_i = 0; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_next = now; }" + nl +
+                        v + "_last = now;" + nl +
+                        "if (" + v + "_i >= names.Length) { if ((now - " + v + "_done).TotalSeconds > 8) { " + v + "_i = 0; " + v + "_next = now; } return false; }" + nl +
+                        "if (me.IsCasting) { if (" + v + "_p) " + v + "_s = true; return true; }" + nl +
+                        "if (" + v + "_p && " + v + "_s) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
+                        "if (now < " + v + "_next) return true;" + nl +
+                        "if (" + v + "_p && (now - " + v + "_at).TotalSeconds < 1.5) return true;" + nl +
+                        "if (" + v + "_t >= 4) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
+                        "BuddyCron.Objects.HeroCharacter target = null;" + nl +
+                        "if (npcs[" + v + "_i].Length > 0)" + nl +
+                        "    foreach (var c in BuddyCron.Managers.HeroObjectManager.GetObjects<BuddyCron.Objects.HeroCharacter>())" + nl +
+                        "        if (c != null && c.IsValid && c.Name == npcs[" + v + "_i] && (target == null || c.Distance < target.Distance)) target = c;" + nl +
+                        "if (isAbility[" + v + "_i])" + nl +
+                        "{" + nl +
+                        "    if (openWith[" + v + "_i].Length > 0 && !BuddyCron.Managers.AbilityManager.HasAbility(names[" + v + "_i]))" + nl +
+                        "    {" + nl +
+                        "        var opener = System.Linq.Enumerable.FirstOrDefault(BuddyCron.Core.Me.QuestItems, i => i.Name == openWith[" + v + "_i]);" + nl +
+                        "        if (opener != null) opener.Use();" + nl +
+                        "        " + v + "_next = now.AddSeconds(2); return true;" + nl +
+                        "    }" + nl +
+                        "    BuddyCron.Managers.AbilityManager.Cast(names[" + v + "_i], target ?? (BuddyCron.Objects.HeroCharacter)me, false);" + nl +
+                        "}" + nl +
+                        "else" + nl +
+                        "{" + nl +
+                        "    var item = System.Linq.Enumerable.FirstOrDefault(BuddyCron.Core.Me.QuestItems, i => i.Name == names[" + v + "_i])" + nl +
+                        "            ?? System.Linq.Enumerable.FirstOrDefault(BuddyCron.Core.Me.Backpack, i => i.Name == names[" + v + "_i]);" + nl +
+                        "    if (item == null) { " + v + "_i++; return true; }" + nl +
+                        "    if (target != null) item.UseAbility(target); else item.Use();" + nl +
+                        "}" + nl +
+                        v + "_p = true; " + v + "_s = false; " + v + "_at = now; " + v + "_t++;" + nl +
+                        "return true;";
+                    var sbh = new StringBuilder();
+                    sbh.Append("\t\t<CodeChunk Name=\"").Append(hook).Append("\" Type=\"Hook\"><![CDATA[").Append(nl);
+                    foreach (string bl in body.Split(new[] { nl }, StringSplitOptions.None))
+                        sbh.Append("\t\t\t").Append(bl).Append(nl);
+                    sbh.Append("\t\t]]></CodeChunk>");
+                    _codeChunks.Add(sbh.ToString());
+                    outLines.Add("<Hook Name=\"" + hook + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
+                    if (s.Gate != null && s.Gate.Length > 0)
+                        outLines.Add("<While Condition=\"" + s.Gate + "\"><WaitTimer QuestId=\"1\" WaitTime=\"3\" /></While>");
+                    else
+                        outLines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"" + (run.Count * 6 + 4).ToString(CultureInfo.InvariantCulture) + "\" />");
+                    outLines.Add("<Hook Name=\"" + hook + "\" Operation=\"R\" Location=\"TreeStart\" />");
+                }
+                s.Lines.Clear();
+                s.Lines.AddRange(outLines);
+            }
+        }
+
+        /// <summary>Steps (and a code chunk) that take a weekly from its giver's board when it's offered and not in the log.</summary>
+        private static List<string> WeeklyHook(string pickupLine, int no)
+        {
+            string id = Attr(pickupLine, "QuestId"), giver = Attr(pickupLine, "GiverName"), xyz = Attr(pickupLine, "XYZ");
+            var lines = new List<string>();
+            string[] p = xyz.Split(',');
+            if (id.Length == 0 || giver.Length == 0 || p.Length != 3)
+                return lines;
+            string hook = "TakeWeekly" + no, v = "_w" + no;
+            string nl = "\r\n";
+            string body =
+                "ulong id = " + id + "UL;" + nl +
+                "var spot = new System.Numerics.Vector3(" + p[0] + "f, " + p[1] + "f, " + p[2] + "f);" + nl +
+                "var me = BuddyCron.Core.Player;" + nl +
+                "if (System.Linq.Enumerable.Contains(BuddyCron.Core.Me.Quests.ActiveQuestIds, id)) return false;" + nl +
+                "if (me.MissionBoardOpen) { BuddyCron.Objects.HeroGuiApiGfx.Instance.AcceptMission(id); return false; }" + nl +
+                "if ((System.DateTime.Now - " + v + "_click).TotalSeconds < 3) return false;" + nl +
+                "BuddyCron.Objects.HeroObject best = null; bool bestMarked = false;" + nl +
+                "foreach (var o in BuddyCron.Managers.HeroObjectManager.GetObjects<BuddyCron.Objects.HeroObject>())" + nl +
+                "{" + nl +
+                "    if (o == null || !o.IsValid || o.Name != " + CsString(giver) + " || System.Numerics.Vector3.DistanceSquared(o.Location, spot) > 9f) continue;" + nl +
+                "    bool marked = o.QuestIndication.ToString() != \"None\";" + nl +
+                "    if (best == null || (marked && !bestMarked) || (marked == bestMarked && System.Numerics.Vector3.DistanceSquared(o.Location, spot) < System.Numerics.Vector3.DistanceSquared(best.Location, spot))) { best = o; bestMarked = marked; }" + nl +
+                "}" + nl +
+                "if (best != null && best.IsWithinInteractRange) { best.Interact(); " + v + "_click = System.DateTime.Now; }" + nl +
+                "return false;";
+            _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl + "\t\t\tstatic System.DateTime " + v + "_click;" + nl + "\t\t]]></CodeChunk>");
+            var sbh = new StringBuilder();
+            sbh.Append("\t\t<CodeChunk Name=\"").Append(hook).Append("\" Type=\"Hook\"><![CDATA[").Append(nl);
+            foreach (string bl in body.Split(new[] { nl }, StringSplitOptions.None))
+                sbh.Append("\t\t\t").Append(bl).Append(nl);
+            sbh.Append("\t\t]]></CodeChunk>");
+            _codeChunks.Add(sbh.ToString());
+            lines.Add("<MoveTo QuestId=\"1\" Name=\"" + giver + "\" XYZ=\"" + xyz + "\" />");
+            lines.Add("<Hook Name=\"" + hook + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
+            lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"8\" />");
+            lines.Add("<Hook Name=\"" + hook + "\" Operation=\"R\" Location=\"TreeStart\" />");
+            return lines;
+        }
+
+        /// <summary>The step names only Quest Recorder knows (a profile must have none of them).</summary>
+        public static readonly string[] RecorderOnlySteps = { "PickUpIfOffered", "TalkAndReply", "UseMissionItemOnce", "ClickObject", "UseQuestAbility", "EquipItem" };
 
         /// <summary>
         /// Every interaction in the recording - object, NPC and terminal clicks, quest windows, mission boards, reply
@@ -1547,18 +1793,22 @@ namespace QuestRecorder
                         // put down to the mission board, but you were talking to someone after opening it: they gave it
                         // (End of Torvix comes from General Konya, not the Black Hole Mission Terminal)
                         // the giver is whatever you clicked right before it landed in your log
-                        ObjRef giver = lastClicked != null && t - lastClickedAt <= 60 ? lastClicked : e.Target;
+                        // the game handed it out by itself (an [AREA] mission when you walk in): no giver, not the enemy you had targeted
+                        bool selfGranted = e.Note == How.NoGiver;
+                        ObjRef giver = selfGranted ? null : lastClicked != null && t - lastClickedAt <= 60 ? lastClicked : e.Target;
                         if (giver != null && giver.Name.Length > 0)
                         {
                             Vec3 gp = giver.HasPos ? giver.Pos : e.Pos;
                             // dailies / weeklies / heroics: the giver stops offering them once done today, and BuddyCron's
                             // PickUpQuest would click it forever - PickUpIfOffered gives up after 3 tries.
-                                s.Lines.Add("<" + (repeat ? "PickUpIfOffered" : "PickUpQuest") + " QuestName=\"" + A(e.QuestName) + "\" QuestId=\"" + q + "\"" + (giver.Kind == ObjKind.Placeable ? " SearchRadius=\"20\"" : string.Empty) +
+                                s.Lines.Add("<" + (repeat ? "PickUpIfOffered" : "PickUpQuest") + " QuestName=\"" + A(e.QuestName) + "\" QuestId=\"" + q + "\"" + (giver.Kind == ObjKind.Placeable ? (giver.HasPos ? " SearchRadius=\"0.02\"" : " SearchRadius=\"20\"") : string.Empty) +
                                             " UseRange=\"20\" GiverName=\"" + A(giver.Name) + "\" XYZ=\"" + X(gp) + "\"" + (isWeekly && repeat ? " Repeatable=\"True\"" : string.Empty) + " />");
                         }
                         else
                         {
-                            s.Lines.Add("<!-- " + Fmt.XmlComment(e.QuestName + " - comes by itself, no giver.") + " -->");
+                            // walk to where it landed in your log so the game hands it out again
+                            s.Lines.Add("<MoveTo QuestId=\"1\" Name=\"" + A(e.QuestName) + "\" XYZ=\"" + X(e.Pos) + "\" />");
+                            s.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"3\" />");
                         }
                         steps.Add(s);
                         break;
@@ -1902,7 +2152,15 @@ namespace QuestRecorder
                                           : itemInCombat && itemOnHealth > 0f && itemOnHealth < 95f
                                               ? " HealthPercent=\"" + Math.Min(100, (int)Math.Ceiling(itemOnHealth) + 5).ToString(CultureInfo.InvariantCulture) + "\""
                                               : string.Empty;
-                            string onNpc = itemOn != null ? " Range=\"" + UseRangeFor(itemOnDist) + "\" Radius=\"200\" InCombat=\"" + (itemInCombat ? "True" : "False") + "\"" + howNpc + "><Npcs><Npc>" + A(itemOn) + "</Npc></Npcs>" : ">";
+                            // a mob you killed right after using the item on it (Section X Hyperbeast + Serum Injector): it attacks
+                            // as soon as the bot walks up, and BuddyCron's UseItem with InCombat="False" gives up once a fight starts,
+                            // so the item was never used - allow the use in the fight
+                            bool killedAfter = false;
+                            if (itemOn != null)
+                                foreach (RecEvent ke in events)
+                                    if (ke.Kind == EvKind.Kill && ke.Target != null && ke.Target.Name == itemOn && ke.Elapsed >= t - 1 && ke.Elapsed <= t + 120)
+                                        killedAfter = true;
+                            string onNpc = itemOn != null ? " Range=\"" + UseRangeFor(itemOnDist) + "\" Radius=\"200\" InCombat=\"" + (itemInCombat || killedAfter ? "True" : "False") + "\"" + howNpc + "><Npcs><Npc>" + A(itemOn) + "</Npc></Npcs>" : ">";
                             // several items used one after another with nothing ticking in between (the Sith runes at the
                             // altar): each one once, in your order, then the last one as usual
                             var earlierUses = orderNow.FindAll(u => t - u.At <= 120 && !u.Name.StartsWith("Heroic Transport", StringComparison.Ordinal));
@@ -2098,8 +2356,14 @@ namespace QuestRecorder
                             {
                                 string ids = Fmt.Format(" BranchId=\"{0}\" StepId=\"{1}\"", e.HasOldStep ? e.OldBranch : e.Branch, e.HasOldStep ? e.OldStep : e.Step);
                                 Vec3 np = targetNpc.HasPos ? targetNpc.Pos : e.Pos;
+                                // a mob you killed right after (Section X Hyperbeast + Serum Injector) attacks as soon as the bot walks
+                                // up, and UseItem with InCombat="False" gives up once a fight starts: allow the use in the fight
+                                bool killedAfter = false;
+                                foreach (RecEvent ke in events)
+                                    if (ke.Kind == EvKind.Kill && ke.Target != null && ke.Target.Name == targetNpc.Name && ke.Elapsed >= t - 1 && ke.Elapsed <= t + 120)
+                                        killedAfter = true;
                                 lines.Add("<UseItem QuestId=\"" + q + "\"" + ids + " ItemName=\"" + A(later.Option) + "\" WaitTime=\"3000\" XYZ=\"" + X(np) +
-                                          "\" Range=\"" + UseRangeFor(targetNpc.HasPos ? e.Pos.DistanceTo(targetNpc.Pos) : -1f) + "\" Radius=\"200\" InCombat=\"False\"><Npcs><Npc>" + A(targetNpc.Name) + "</Npc></Npcs>" +
+                                          "\" Range=\"" + UseRangeFor(targetNpc.HasPos ? e.Pos.DistanceTo(targetNpc.Pos) : -1f) + "\" Radius=\"200\" InCombat=\"" + (killedAfter ? "True" : "False") + "\"><Npcs><Npc>" + A(targetNpc.Name) + "</Npc></Npcs>" +
                                           "<Hotspots><Hotspot Name=\"" + A(targetNpc.Name) + "\" XYZ=\"" + X(np) + "\" /></Hotspots></UseItem>");
                                 usedItemNames.Add(later.Option);
                                 string onWho = targetNpc.Name;
@@ -2256,18 +2520,18 @@ namespace QuestRecorder
             // offered the 4 dailies): picked up at the same mission board as the missions you took - marked "not sure"
             // (yellow in the review list), the recording never saw where it came from.
             {
-                string board = null, boardXyz = null;
+                string board = null, boardXyz = null, boardRadius = "20";
                 int boardIdx = -1;
                 for (int i = 0; i < steps.Count; i++)
                 {
                     if (steps[i].Kind != "Pickup" || steps[i].Lines.Count == 0)
                         continue;
-                    Match bm = Regex.Match(steps[i].Lines[0], "SearchRadius=\"20\" UseRange=\"20\" GiverName=\"([^\"]+)\" XYZ=\"([^\"]+)\"");
-                    if (!bm.Success || (bm.Groups[1].Value.IndexOf("Terminal", StringComparison.OrdinalIgnoreCase) < 0 &&
-                                        bm.Groups[1].Value.IndexOf("Mission", StringComparison.OrdinalIgnoreCase) < 0))
+                    Match bm = Regex.Match(steps[i].Lines[0], "SearchRadius=\"([^\"]+)\" UseRange=\"20\" GiverName=\"([^\"]+)\" XYZ=\"([^\"]+)\"");
+                    if (!bm.Success || (bm.Groups[2].Value.IndexOf("Terminal", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                        bm.Groups[2].Value.IndexOf("Mission", StringComparison.OrdinalIgnoreCase) < 0))
                         continue; // only a mission board / terminal gives area weeklies
-                    board = bm.Groups[1].Value;
-                    boardXyz = bm.Groups[2].Value;
+                    board = bm.Groups[2].Value;
+                    boardXyz = bm.Groups[3].Value; boardRadius = bm.Groups[1].Value;
                     boardIdx = i;
                 }
                 if (board != null)
@@ -2295,7 +2559,7 @@ namespace QuestRecorder
                             Comment = "Pick up " + h.Value + " (not sure: it was already in your log when you recorded - picked up at " + System.Net.WebUtility.HtmlDecode(board) + " like your other missions)",
                             At = steps[boardIdx].At
                         };
-                        ws.Lines.Add("<PickUpIfOffered QuestName=\"" + A(h.Value) + "\" QuestId=\"" + hq + "\" SearchRadius=\"20\" UseRange=\"20\" GiverName=\"" + board + "\" XYZ=\"" + boardXyz + "\" Repeatable=\"True\" />");
+                        ws.Lines.Add("<PickUpQuest QuestName=\"" + A(h.Value) + "\" QuestId=\"" + hq + "\" SearchRadius=\"" + boardRadius + "\" UseRange=\"20\" GiverName=\"" + board + "\" XYZ=\"" + boardXyz + "\" />");
                         steps.Insert(++boardIdx, ws);
                     }
                 }
@@ -2478,6 +2742,7 @@ namespace QuestRecorder
                                                          .Replace(HeroicMark, A(full));
             }
             picked.RemoveAll(w => weeklies.Contains(w));
+            PlainSteps(steps);
             return Render(steps, picked, profileName, fileName, recordingName, dark > light ? "Dark" : (light > dark ? "Light" : null), vendors, completedOrder);
         }
 
@@ -2709,6 +2974,13 @@ namespace QuestRecorder
                 foreach (KeyValuePair<string, Vec3> v in vendors)
                     sb.Append("\t\t<Hotspot Name=\"").Append(A(v.Key)).Append("\" XYZ=\"").Append(X(v.Value)).Append("\" />").Append(nl);
                 sb.Append("\t</Vendors>").Append(nl);
+            }
+            if (_codeChunks != null && _codeChunks.Count > 0)
+            {
+                sb.Append("\t<CodeChunks>").Append(nl);
+                foreach (string c in _codeChunks)
+                    sb.Append(c).Append(nl);
+                sb.Append("\t</CodeChunks>").Append(nl);
             }
             sb.Append(nl);
             // Fights go in the header as GrindAreas (the way the hand-made profiles do it); the steps use GrindRef.

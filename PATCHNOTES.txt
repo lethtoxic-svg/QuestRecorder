@@ -1,5 +1,18 @@
 Quest Recorder patch notes - LethToxic
 
+1.3
+- Profiles you record now run on plain BuddyCron: anyone can load and run them without Quest Recorder installed.
+  Every step is one of BuddyCron's own (PickUpQuest, TalkTo, UseObject, Interact, UseItem, UseInventoryItem, Grind, MoveTo,
+  CompleteQuest). Mission items used in a row (runes) and special-bar quest abilities use BuddyCron's own code-in-profile
+  (a Hook, like other community profiles), waiting for each cast before the next.
+- Mission pickups are pinned to the exact giver you clicked, so a twin object with the same name is never picked
+  (Black Hole: two "Black Hole Mission Terminal"s, only one has missions).
+- A rune / item row fix: a corpse that finished the step is no longer lumped together with another task's corpse.
+- Installed with git clone? BuddyCron's UpdateBuddy keeps it up to date, so Quest Recorder's own update pop-up stays out of the way.
+- After every recording, a check warns if anything only Quest Recorder knows ended up in the profile.
+- Missions the game hands you by itself (Section X [AREA] missions) no longer get the last enemy you targeted as their
+  giver: the bot walks to where you got it instead (it went to Dreadtooth before).
+
 1.2a
 - Weeklies get picked up again on your 2nd and 3rd run of the week. The game calls a weekly "complete" after the
   first one, and the pick-up step took that as "already done". Weekly pick-ups now take it whenever the terminal
