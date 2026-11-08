@@ -31,10 +31,12 @@ namespace QuestRecorder
         private readonly ListView _list;
         private bool _changed;
         private bool _filling;
+        private readonly ICollection<string> _unsure; // labels of the steps the recorder isn't sure about (from the task tracker)
 
-        public ReviewForm(string profilePath, string headline)
+        public ReviewForm(string profilePath, string headline, ICollection<string> unsure)
         {
             _path = profilePath;
+            _unsure = unsure;
             _doc.PreserveWhitespace = false;
             _loadedStamp = Stamp(profilePath);
             _doc.Load(profilePath);
@@ -101,12 +103,23 @@ namespace QuestRecorder
                     var el = (XmlElement)n;
                     // yellow: nothing you did was seen for it, or the recorder marked it "not sure" (the game doesn't
                     // count what it would do)
-                    bool unsure = pending != null && pending.Value.IndexOf("(not sure", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool unsure = pending != null && (pending.Value.IndexOf("(not sure", StringComparison.OrdinalIgnoreCase) >= 0 || IsUnsure(pending.Value.Trim()));
                     _items.Add(new Item { Comment = pending, Element = el, NoProof = unsure || NoProof(el) });
                     pending = null;
                 }
             }
             Fill();
+        }
+
+        /// <summary>The recorder marked this step's label "not sure" in the task tracker.</summary>
+        private bool IsUnsure(string label)
+        {
+            if (_unsure == null)
+                return false;
+            foreach (string u in _unsure)
+                if (label == u || label == Fmt.XmlComment(u))
+                    return true;
+            return false;
         }
 
         /// <summary>A step whose only action is walking to where the game moved on: nothing you did was seen.</summary>

@@ -135,12 +135,14 @@ namespace QuestRecorder
         }
 
 
-        private bool _autoRecord = true;
+        private bool _autoRecord;
 
+        // no longer used: recording starts only when you press Start recording (kept so old settings files still load)
+        [Browsable(false)]
         [Category("1. Recording")]
         [DisplayName("Auto-record")]
-        [Description("Starts recording as soon as the plugin is ticked. Only records what you do yourself - it pauses while the bot runs. On by default.")]
-        [DefaultValue(true)]
+        [Description("Not used any more: press Start recording in the Quest Recorder window.")]
+        [DefaultValue(false)]
         public bool AutoRecord
         {
             get { return _autoRecord; }

@@ -1238,31 +1238,75 @@ namespace QuestRecorder
         private ObjRef GuessPartner(Snap s, int radius)
         {
             ObjRef click = RecentClick(s, 6000, "you clicked it");
+            ObjRef clicked = null, fresh = null;
             if (click != null && (click.Kind == ObjKind.Npc || click.Kind == ObjKind.Placeable))
             {
-                // re-read so the quest marker is the one shown now
-                ObjRef fresh = Describe(HeroObjectManager.GetByNodeId(click.NodeId), click.How);
-                return fresh ?? click;
+                fresh = Describe(HeroObjectManager.GetByNodeId(click.NodeId), click.How); // re-read so the marker is the one shown now
+                clicked = fresh ?? click;
             }
+            // an NPC you clicked (not a body you looted): you talk to it
+            if (clicked != null && clicked.Kind == ObjKind.Npc && !clicked.Dead)
+                return clicked;
+            // an object that gives or takes missions (a marker on it, a mission terminal): it talks to you
+            if (clicked != null && clicked.Kind == ObjKind.Placeable && (clicked.OffersQuest || clicked.TakesTurnIn || click.OffersQuest || click.TakesTurnIn))
+                return clicked;
+            ObjRef target = null;
             if (s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId)
             {
                 ObjRef t = Describe(HeroObjectManager.GetByNodeId(s.TargetId), "your target");
-                if (t != null && (t.Kind == ObjKind.Npc || t.Kind == ObjKind.Placeable) && (!t.HasPos || t.Pos.DistanceTo(s.Pos) <= 2f))
-                    return t;
+                if (t != null && (t.Kind == ObjKind.Npc || t.Kind == ObjKind.Placeable) && !t.Dead && (!t.HasPos || t.Pos.DistanceTo(s.Pos) <= 2f))
+                    target = t;
             }
             List<KeyValuePair<float, HeroObject>> near = Nearby(s, radius);
-            foreach (KeyValuePair<float, HeroObject> kv in near)
+            if (clicked != null && clicked.Kind == ObjKind.Placeable)
             {
-                if (!(kv.Value is HeroNPC))
-                    continue;
-                cnvQuestIndication qi = kv.Value.QuestIndication;
-                if (qi != cnvQuestIndication.None)
-                    return Describe(kv.Value, "nearest NPC with a quest marker (guess)");
+                // a plain object you clicked (a case, a console), then a conversation. The object talks only while it still shows
+                // a mission marker or is still usable for a mission (a holoterminal); one already used (the Sealed Case) never.
+                if (fresh != null && (OnMission(fresh.Indication) || fresh.UsableForQuest))
+                    return clicked;
+                // else the NPC in it: the one you have selected next to you, an NPC of one of your missions within 10 m,
+                // or someone right by you (5 m)
+                if (target != null && target.Kind == ObjKind.Npc && (!target.HasPos || target.Pos.DistanceTo(s.Pos) <= 1f))
+                    return target;
+                ObjRef close = null;
+                foreach (KeyValuePair<float, HeroObject> kv in near)
+                {
+                    if (kv.Key > 1f)
+                        break; // nearest first, 10 m at most
+                    if (!(kv.Value is HeroNPC))
+                        continue;
+                    ObjRef n = Describe(kv.Value, "NPC of your mission next to what you clicked (guess)");
+                    if (n == null || n.Dead)
+                        continue;
+                    if (OnMission(n.Indication))
+                        return n;
+                    if (close == null && kv.Key <= 0.25f)
+                    {
+                        close = n;
+                        close.How = "NPC right by what you clicked (guess)";
+                    }
+                }
+                return close ?? clicked;
             }
+            if (target != null && target.Kind == ObjKind.Npc)
+                return target;
             foreach (KeyValuePair<float, HeroObject> kv in near)
             {
-                if (kv.Value is HeroNPC && kv.Key <= 4f)
-                    return Describe(kv.Value, "nearest NPC (guess)");
+                if (!(kv.Value is HeroNPC) || kv.Value.QuestIndication == cnvQuestIndication.None)
+                    continue;
+                ObjRef n = Describe(kv.Value, "nearest NPC with a quest marker (guess)");
+                if (n != null && !n.Dead)
+                    return n;
+            }
+            if (target != null)
+                return target; // an object you had selected
+            foreach (KeyValuePair<float, HeroObject> kv in near)
+            {
+                if (!(kv.Value is HeroNPC) || kv.Key > 4f)
+                    continue;
+                ObjRef n = Describe(kv.Value, "nearest NPC (guess)");
+                if (n != null && !n.Dead)
+                    return n;
             }
             foreach (KeyValuePair<float, HeroObject> kv in near)
             {
@@ -1270,6 +1314,12 @@ namespace QuestRecorder
                     return Describe(kv.Value, "nearest object (guess)");
             }
             return null;
+        }
+
+        /// <summary>A marker of a mission you have (turn-in or progress), not "offers a new mission" of any kind.</summary>
+        private static bool OnMission(string indication)
+        {
+            return !string.IsNullOrEmpty(indication) && indication != "None" && indication.IndexOf("Grant", StringComparison.OrdinalIgnoreCase) < 0;
         }
 
         // ------------------------------------------------------------------ interactions (taxi, elevator, vendor ...)
@@ -1294,7 +1344,12 @@ namespace QuestRecorder
                     if (gui != null)
                         r = Describe(gui.TaxiSourceTerminal, "taxi map opened from");
                     if (r == null)
-                        r = RecentClick(s, 8000, "you clicked it");
+                    {
+                        ObjRef click = RecentClick(s, 8000, "you clicked it");
+                        ObjRef fresh = click != null ? Describe(HeroObjectManager.GetByNodeId(click.NodeId), click.How) : null;
+                        if (fresh != null && fresh.IsTaxiTerminal)
+                            r = fresh; // only a taxi terminal: any other name would never be used as an object again
+                    }
                     if (r == null)
                         r = NearestWhere(s, 2, o => o.IsTaxiTerminal, "nearest taxi terminal (guess)");
                     s.InteractionTarget = r;
@@ -1307,7 +1362,11 @@ namespace QuestRecorder
                     if (click != null)
                         r = Describe(HeroObjectManager.GetByNodeId(click.NodeId), click.How);
                     if (r == null || !r.IsWonkavator)
-                        r = NearestWhere(s, 2, o => { var p = o as HeroPlaceable; return p != null && p.IsWonkavator; }, "nearest elevator (guess)") ?? r;
+                    {
+                        ObjRef lift = NearestWhere(s, 2, o => { var p = o as HeroPlaceable; return p != null && p.IsWonkavator; }, "nearest elevator (guess)");
+                        // the panel you clicked counts only when you stand at it
+                        r = lift ?? (r != null && (!r.HasPos || r.Pos.DistanceTo(s.Pos) <= 1f) ? r : null);
+                    }
                     s.InteractionTarget = r;
                     if (r != null)
                         _wonka = new WonkaMemo { Wonka = r, Stand = s.Pos, AreaId = s.AreaId, Tick = s.Tick };
@@ -1316,10 +1375,16 @@ namespace QuestRecorder
                 default:
                 {
                     ObjRef r = RecentClick(s, 8000, "you clicked it");
-                    if (r == null && s.TargetId != 0 && s.TargetId != s.CompanionId)
+                    if (r != null && (r.Dead || (r.HasPos && r.Pos.DistanceTo(s.Pos) > 1f)))
+                        r = null; // what opened the window stands next to you
+                    if (r == null && s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId)
+                    {
                         r = Describe(HeroObjectManager.GetByNodeId(s.TargetId), "your target");
+                        if (r != null && (r.Dead || (r.HasPos && r.Pos.DistanceTo(s.Pos) > 1f)))
+                            r = null;
+                    }
                     if (r == null)
-                        r = NearestWhere(s, 2, o => o is HeroNPC, "nearest NPC (guess)");
+                        r = NearestWhere(s, 1, o => o is HeroNPC, "nearest NPC (guess)");
                     s.InteractionTarget = r;
                     return;
                 }
@@ -1500,7 +1565,9 @@ namespace QuestRecorder
             {
                 // Clicking a quest object usually starts a channel.
                 // (not a quest ability from a special bar: that's recorded as its own use, not a use of an object nearby)
-                s.CastTarget = CastObject(s);
+                // one of your own abilities (Recuperate, a mount, a class skill): on an object only when you clicked it right before
+                bool own = _baseAbilities != null && name.Length > 0 && _baseAbilities.Contains(name);
+                s.CastTarget = CastObject(s, own);
             }
         }
 
@@ -1573,17 +1640,19 @@ namespace QuestRecorder
         }
 
         /// <summary>The object an out-of-combat cast was most likely used on.</summary>
-        private ObjRef CastObject(Snap s)
+        private ObjRef CastObject(Snap s, bool clickOnly)
         {
             ObjRef click = RecentClick(s, 3000, "you clicked it, then the cast started");
             if (click != null && click.Kind == ObjKind.Placeable)
                 return click;
+            if (clickOnly)
+                return null;
             // Left-click to select, then interact (key or double-click): the selected object is the one used .
             if (s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId)
             {
                 ObjRef t = Describe(HeroObjectManager.GetByNodeId(s.TargetId), "your target when the cast started");
-                if (t != null && t.Kind == ObjKind.Placeable && (!t.HasPos || t.Pos.DistanceTo(s.Pos) <= 2f))
-                    return t;
+                if (t != null && t.Kind == ObjKind.Placeable && (!t.HasPos || t.Pos.DistanceTo(s.Pos) <= Math.Max(t.UseRange, 0.5f) + 0.5f))
+                    return t; // within its use range + 5 m
             }
             List<KeyValuePair<float, HeroObject>> near = Nearby(s, 3f);
             foreach (KeyValuePair<float, HeroObject> kv in near)
@@ -2195,8 +2264,15 @@ namespace QuestRecorder
             b.Name = Fmt.OneLine(me.MissionBoardName);
             foreach (MissionBoardQuest mq in me.MissionBoardQuests)
                 b.Missions.Add(new KeyValuePair<ulong, string>(mq.QuestId, Fmt.OneLine(mq.InternalName)));
-            b.Terminal = RecentClick(s, 10000, "you clicked it") ??
-                         NearestWhere(s, 5, o => o is HeroPlaceable, "nearest object (guess)");
+            b.Terminal = RecentClick(s, 10000, "you clicked it");
+            // a mission board opens from what you stand at: not something you clicked further off, and an NPC only when the
+            // board came up right after you clicked it
+            if (b.Terminal != null && (b.Terminal.Dead || (b.Terminal.HasPos && b.Terminal.Pos.DistanceTo(s.Pos) > 1f) ||
+                                       (b.Terminal.Kind == ObjKind.Npc && RecentClick(s, 2000, "you clicked it") == null)))
+                b.Terminal = null;
+            // nothing like that: a terminal with missions right next to you, else no giver (never just any object next to you)
+            if (b.Terminal == null)
+                b.Terminal = NearestWhere(s, 1, o => o is HeroPlaceable && o.QuestIndication == cnvQuestIndication.Grant, "nearest terminal with missions (guess)");
             s.Board = b;
         }
 

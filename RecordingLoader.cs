@@ -168,6 +168,10 @@ namespace QuestRecorder
                     o.UseRange = F(c("target_use_range"));
                     o.UsableForQuest = c("target_quest_usable") == "yes";
                     o.Spec = U(c("target_spec"));
+                    o.Indication = c("target_marker"); // the mission marker it showed: "Grant" gives missions, "End" takes the hand-in
+                    o.OffersQuest = o.Indication == "Grant";
+                    o.TakesTurnIn = o.Indication == "End";
+                    o.How = c("target_how");
                     if (c("target_x").Length > 0)
                     {
                         o.HasPos = true;
@@ -241,6 +245,15 @@ namespace QuestRecorder
         /// <summary>Builds the ready profile from a recording .csv with the plugin's own builder.</summary>
         public static string MakeProfile(string csvPath, string baseDir, string profileFolderSetting)
         {
+            string[] problems;
+            return MakeProfile(csvPath, baseDir, profileFolderSetting, out problems);
+        }
+
+        /// <summary>Builds the ready profile from a recording .csv with the plugin's own builder; problems = what keeps it
+        /// from running on plain BuddyCron (empty = finished).</summary>
+        public static string MakeProfile(string csvPath, string baseDir, string profileFolderSetting, out string[] problemsOut)
+        {
+            problemsOut = new string[0];
             string place;
             List<RecEvent> events = Load(csvPath, out place);
             if (events.Count == 0)
@@ -285,7 +298,10 @@ namespace QuestRecorder
             string fileName = safe + " - Recorded " + started.ToString("yyyy-MM-dd HH-mm", CultureInfo.InvariantCulture) + extra + ".xml";
             string path = Path.Combine(folder, fileName);
             string name = place + " - Recorded " + started.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
-            string text = ReplayBuilder.Build(events, name, fileName, baseName);
+            List<string> problems;
+            string text = ReplayBuilder.Build(events, name, fileName, baseName, out problems);
+            problemsOut = problems.ToArray();
+            RecordingSession.LiveProblems = problemsOut;
             File.WriteAllText(path, text, new UTF8Encoding(false));
             RecordingSession.LiveTrace = ReplayBuilder.Trace(events).ToArray(); // show it in the task tracker
             RecordingSession.LiveProfile = path;

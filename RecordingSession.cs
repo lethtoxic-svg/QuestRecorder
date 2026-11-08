@@ -49,6 +49,7 @@ namespace QuestRecorder
             Place = place;
             LiveTrace = new string[0];
             LiveActions = new string[0];
+            LiveProblems = new string[0];
             Started = started;
             _lastTime = started;
             TxtPath = Path.Combine(folder, baseName + ".txt");
@@ -442,7 +443,7 @@ namespace QuestRecorder
             // The annotated draft was mistaken for the profile.
             if (!RrSettings.Instance.KeepDraft)
             {
-                WriteProfileCopy(text);
+                WriteProfileCopy(final);
                 return;
             }
             string tmp = DraftPath + ".tmp";
@@ -479,16 +480,19 @@ namespace QuestRecorder
                     // ignore
                 }
             }
-            WriteProfileCopy(text);
+            WriteProfileCopy(final);
         }
 
         // ------------------------------------------------------------------ ready-to-load profile copy
 
+        /// <summary>What keeps the last profile from running on plain BuddyCron (empty = it's finished).</summary>
+        public static volatile string[] LiveProblems = new string[0];
+
         private string _profilePath;
         private bool _profileAnnounced;
 
-        /// <summary>The same draft, saved where players keep their profiles so it can be loaded straight away.</summary>
-        private void WriteProfileCopy(string text)
+        /// <summary>The profile, saved where players keep their profiles so it can be loaded straight away.</summary>
+        private void WriteProfileCopy(bool final)
         {
             try
             {
@@ -501,35 +505,40 @@ namespace QuestRecorder
                     return;
                 // The ready-to-load profile is a REPLAY of the recording.
                 string replay;
+                List<string> problems;
                 try
                 {
                     string place = Place.Length > 0 ? Place : "Recording";
                     string name = place + " - Recorded " + Started.ToString("yyyy-MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture);
                     ReplayBuilder.CreditName = RrSettings.Instance.CreditName;
                     ReplayBuilder.WalkSpacing = RrSettings.Instance.WalkPointMeters;
-                    replay = ReplayBuilder.Build(AllEvents(), name, Path.GetFileName(_profilePath), BaseName);
+                    replay = ReplayBuilder.Build(AllEvents(), name, Path.GetFileName(_profilePath), BaseName, out problems);
                 }
                 catch (Exception ex)
                 {
-                    if (RrLog.Every("replay-build", TimeSpan.FromMinutes(10)))
-                        RrLog.Warn("Couldn't build the profile ({0}). Send the recording to LethToxic.", ex.Message);
-                    replay = text;
+                    // never the draft in its place: the last profile stays, marked not finished
+                    var failed = new List<string> { "the profile couldn't be built (" + ex.Message + ")" };
+                    LiveProblems = failed.ToArray();
+                    LiveProfile = _profilePath; // the problems go with this profile (a profile made from an old recording may have been shown)
+                    if (final || RrLog.Every("replay-build", TimeSpan.FromMinutes(10)))
+                        RrLog.Warn("This profile is NOT finished: couldn't build it ({0}). Send the recording to LethToxic.", ex.Message);
+                    try
+                    {
+                        if (File.Exists(_profilePath))
+                            File.WriteAllText(_profilePath, ReplayBuilder.MarkNotFinished(File.ReadAllText(_profilePath), failed), new UTF8Encoding(false));
+                    }
+                    catch (Exception mex)
+                    {
+                        RrLog.Debug("Marking the profile not finished: {0}", mex.Message);
+                    }
+                    return;
                 }
                 File.WriteAllText(_profilePath, replay, new UTF8Encoding(false));
-                // Load check: the profile must run on plain BuddyCron - no step only Quest Recorder knows
-                try
-                {
-                    var found = new System.Collections.Generic.List<string>();
-                    foreach (string tag in ReplayBuilder.RecorderOnlySteps)
-                        if (replay.IndexOf("<" + tag + " ", StringComparison.Ordinal) >= 0 || replay.IndexOf("<" + tag + ">", StringComparison.Ordinal) >= 0)
-                            found.Add(tag);
-                    if (found.Count > 0 && RrLog.Every("plain-check", TimeSpan.FromMinutes(10)))
-                        RrLog.Warn("This profile still has steps only Quest Recorder knows ({0}) - other players would need the plugin. Send the recording to LethToxic.", string.Join(", ", found.ToArray()));
-                }
-                catch (Exception ex)
-                {
-                    RrLog.Debug("Plain BuddyCron check: {0}", ex.Message);
-                }
+                // Load check: the profile must run on plain BuddyCron (the profile itself says so when it isn't finished)
+                LiveProblems = problems.ToArray();
+                LiveProfile = _profilePath; // the problems go with this profile (a profile made from an old recording may have been shown)
+                if (problems.Count > 0 && (final || RrLog.Every("plain-check", TimeSpan.FromMinutes(10))))
+                    RrLog.Warn("This profile is NOT finished: {0}. Send the recording to LethToxic.", string.Join(", ", problems.ToArray()));
                 try
                 {
                     // every interaction you made, where, and what your quest log did right after

@@ -1,5 +1,32 @@
 Quest Recorder patch notes - LethToxic
 
+1.4
+- Hand-ins go to the NPC you talked to, never to an object you had already used for a step (Coruscant Bugged Out: the bot
+  kept clicking the empty Sealed Case instead of handing in to Tookreek).
+- Mission givers are only what really gave you the mission: never a mob you fought or looted, never something you clicked
+  a while before the conversation that gave it, and never something far from where you got it. Missions you got by walking
+  in or in a holocom call: the bot walks to where you got them.
+- A talk step is only written for the NPC you were still talking to, or the one you clicked and stayed next to. A body you
+  looted is never a talk.
+- Taxi, lift, vendor and mission board names come from what you stood at, not from something you clicked a few seconds before.
+- Your own abilities (Recuperate, a mount) no longer count as using the object next to you.
+- Profile comments and fight names are short step labels. How a step was found is shown in the Quest Recorder window only.
+- Walking out through a door runs while you are still inside (Black Hole Glow only walked out once it was already outside).
+- Objects are clicked from where you stood, not from on top of them. Pick-ups from objects are pinned to that exact object
+  (a twin terminal next to it is never taken). The weekly from the terminal walks to the same spot.
+- A task's last count is in the profile when the mission finished on it (Section X Research Stations: 3 of 3, not 2 of 3).
+- Staged bonus missions wait for the stage before them (Section X Research Cancellation: the Final Stage fight waits until
+  the Research Stations are done).
+- An object that brings out a boss or waves is walked up to and clicked once before the fight (Section X Field Generator,
+  End of Torvix Master Safety Control), not clicked again and again while you fight.
+- Quest abilities from a special bar are used where you used them.
+- A mission item used on NPCs that move around (Black Hole spies) is tried on every one of them, at every spot you used it.
+- PvP missions (warzones, starfighter) are left out of profiles.
+- A talk where you picked other replies than the bot would now names the NPC, so the bot talks to them.
+- If anything in a profile can't run on plain BuddyCron, the profile is named "(not finished)", says so when it starts, and
+  the Quest Recorder window says so too.
+- Recording starts only when you press Start recording. It no longer starts by itself when BuddyCron opens.
+
 1.3
 - Profiles you record now run on plain BuddyCron: anyone can load and run them without Quest Recorder installed.
   Every step is one of BuddyCron's own (PickUpQuest, TalkTo, UseObject, Interact, UseItem, UseInventoryItem, Grind, MoveTo,

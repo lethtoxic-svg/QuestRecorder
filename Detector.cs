@@ -945,11 +945,13 @@ namespace QuestRecorder
             }
             if (boardRecently)
                 return Board(out how, out board);
-            // A pick-up: whatever you clicked last gave it. A hand-in only if what you clicked takes hand-ins
-            // (a quest-end marker or a dropbox): quests that finish by themselves (CZ-198 dailies) aren't
-            // handed in to the container you happened to click.
-            if (_lastClick != null && cur.Tick - _lastClickTick <= ClickWindowMs &&
-                (forPickup || _lastClick.TakesTurnIn || _lastClick.Name.IndexOf("Dropbox", StringComparison.OrdinalIgnoreCase) >= 0))
+            // A pick-up: something with a mission marker you clicked just before, or an object usable for one of your missions
+            // (the Field Generator) - never a body you looted, a mob you attacked (Dreadtooth), or a plain crate or door you
+            // clicked before an area mission came. A hand-in only if what you clicked takes hand-ins (a quest-end marker or a
+            // dropbox): quests that finish by themselves (CZ-198 dailies) aren't handed in to the container you happened to click.
+            if (_lastClick != null && cur.Tick - _lastClickTick <= ClickWindowMs && !_lastClick.Dead &&
+                (forPickup ? (_lastClick.OffersQuest || (_lastClick.Kind == ObjKind.Placeable && _lastClick.UsableForQuest))
+                           : (_lastClick.TakesTurnIn || _lastClick.Name.IndexOf("Dropbox", StringComparison.OrdinalIgnoreCase) >= 0)))
             {
                 how = How.Clicked;
                 return _lastClick;

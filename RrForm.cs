@@ -423,10 +423,15 @@ namespace QuestRecorder
                         return;
                     ReplayBuilder.CreditName = RrSettings.Instance.CreditName;
                     ReplayBuilder.WalkSpacing = RrSettings.Instance.WalkPointMeters;
-                    string path = RecordingLoader.MakeProfile(dlg.FileName, AppDomain.CurrentDomain.BaseDirectory, RrSettings.Instance.ProfileFolder);
+                    string[] problems;
+                    string path = RecordingLoader.MakeProfile(dlg.FileName, AppDomain.CurrentDomain.BaseDirectory, RrSettings.Instance.ProfileFolder, out problems);
                     RrLog.Info("Made a profile from {0}: {1}", Path.GetFileName(dlg.FileName), path);
-                    MessageBox.Show(this, "Profile made from your recording:\r\n\r\n" + path + "\r\n\r\nLoad it in BuddyCron to run it.", "Quest Recorder",
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    if (problems.Length > 0)
+                        MessageBox.Show(this, "Profile made but NOT finished: " + string.Join(", ", problems) + "\r\n\r\n" + path + "\r\n\r\nSend the recording to LethToxic.", "Quest Recorder",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    else
+                        MessageBox.Show(this, "Profile made from your recording:\r\n\r\n" + path + "\r\n\r\nLoad it in BuddyCron to run it.", "Quest Recorder",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
             }
             catch (Exception ex)
@@ -500,26 +505,36 @@ namespace QuestRecorder
         private void ShowSummary()
         {
             string profile = RecordingSession.LiveProfile;
+            string[] problems = RecordingSession.LiveProblems ?? new string[0];
             if (string.IsNullOrEmpty(profile) || !File.Exists(profile))
+            {
+                if (problems.Length > 0)
+                    MessageBox.Show(this, "The profile is NOT finished: " + string.Join(", ", problems) + "\r\n\r\nSend the recording to LethToxic.", "Quest Recorder",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
+            }
+            string notFinished = problems.Length > 0 ? "NOT FINISHED (" + string.Join(", ", problems) + ") - " : string.Empty;
             string[] trace = RecordingSession.LiveTrace ?? new string[0];
             var missed = new System.Collections.Generic.List<string>();
+            var unsure = new System.Collections.Generic.List<string>(); // steps the recorder isn't sure about (yellow)
             foreach (string line in trace)
             {
-                if (line.IndexOf("!!", StringComparison.Ordinal) < 0)
-                    continue;
                 int dot = line.IndexOf(". ", StringComparison.Ordinal);
                 int arrow = line.IndexOf("  ->  ", StringComparison.Ordinal);
+                if (dot >= 0 && arrow > dot && line.IndexOf("  ->  ?? ", StringComparison.Ordinal) == arrow)
+                    unsure.Add(line.Substring(dot + 2, arrow - dot - 2).Trim());
+                if (line.IndexOf("!!", StringComparison.Ordinal) < 0)
+                    continue;
                 missed.Add(dot >= 0 && arrow > dot ? line.Substring(dot + 2, arrow - dot - 2).Trim() : line.Trim());
             }
             int caught = trace.Length - missed.Count;
             // the review list: every step in plain words - untick, reorder, "do by hand", save
             try
             {
-                string head = missed.Count == 0
+                string head = notFinished + (missed.Count == 0 && notFinished.Length == 0
                     ? "Nice - " + caught + " step(s) caught, nothing missed. Your profile: " + Path.GetFileName(profile)
-                    : caught + " step(s) caught, " + missed.Count + " with no proof (yellow). Your profile: " + Path.GetFileName(profile);
-                var review = new ReviewForm(profile, head);
+                    : caught + " step(s) caught, " + missed.Count + " with no proof (yellow). Your profile: " + Path.GetFileName(profile));
+                var review = new ReviewForm(profile, head, unsure);
                 review.Show(this);
                 return;
             }
@@ -528,6 +543,12 @@ namespace QuestRecorder
                 RrLog.Debug("Review list: {0}", ex.Message); // fall back to the old summary below
             }
             string where = "\r\n\r\nYour profile: " + profile;
+            if (notFinished.Length > 0)
+            {
+                MessageBox.Show(this, notFinished + caught + " step(s) caught, " + missed.Count + " missed." + where + "\r\n\r\nSend the recording to LethToxic.",
+                    "Quest Recorder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
             if (missed.Count == 0)
             {
                 if (MessageBox.Show(this, "Nice - " + caught + " step(s) caught, nothing missed." + where + "\r\n\r\nLoad it in BuddyCron with Load Profile. Show you the file?",

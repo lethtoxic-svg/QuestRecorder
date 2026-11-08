@@ -477,14 +477,14 @@ namespace QuestRecorder
         public static string PickUp(string questName, ulong quest, string giver, bool giverIsObject, float x, float y, float z)
         {
             return "<If Condition=\"(not HasQuest(" + Q(quest) + ")) and (not IsQuestComplete(" + Q(quest) + "))\"><PickUpQuest QuestName=\"" + Esc(questName) + "\" QuestId=\"" + Q(quest) + "\"" +
-                   (giverIsObject ? " SearchRadius=\"20\" UseRange=\"20\"" : string.Empty) + " GiverName=\"" + Esc(giver) + "\" XYZ=\"" + X(x, y, z) + "\" /></If>";
+                   (giverIsObject ? " SearchRadius=\"0.001\" UseRange=\"20\"" : string.Empty) + " GiverName=\"" + Esc(giver) + "\" XYZ=\"" + X(x, y, z) + "\" /></If>";
         }
 
         /// <summary>Hand a quest in to an NPC or object, then take the reward.</summary>
         public static string HandIn(string questName, ulong quest, string to, bool toIsObject, float x, float y, float z)
         {
             return "<If Condition=\"" + NotYet(quest) + "\"><TurnInQuest QuestName=\"" + Esc(questName) + "\" QuestId=\"" + Q(quest) + "\"" +
-                   (toIsObject ? " SearchRadius=\"20\" UseRange=\"20\"" : string.Empty) + " TurnInName=\"" + Esc(to) + "\" XYZ=\"" + X(x, y, z) + "\" />" +
+                   (toIsObject ? " Type=\"Placeable\" SearchRadius=\"20\" UseRange=\"20\"" : string.Empty) + " TurnInName=\"" + Esc(to) + "\" XYZ=\"" + X(x, y, z) + "\" />" +
                    "<WaitTimer QuestId=\"1\" WaitTime=\"3\" /><CompleteQuest QuestId=\"" + Q(quest) + "\" /></If>";
         }
 
