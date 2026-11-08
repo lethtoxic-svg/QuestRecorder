@@ -1,6 +1,5 @@
-1.2
-QuestRecorder-1.1b.zip
-- Profiles copy what you did, in your order: mission items where you stood, on who, from how close, every use.
-- Scanner: eggs, bones and the mobs your missions need, also the ones you walk past. Collect steps take any of them nearby.
-- Rewards get taken, quick travel no longer makes walk points, special-bar abilities, disguises and defend steps are recorded.
-- Reads the game combat log for item uses with no cast bar (turn on Enable Combat Logging in the game).
+1.2a
+main
+- Weeklies get picked up again on your 2nd and 3rd run of the week (the game calls a weekly "complete" after the first one).
+- "Do this part by hand, then press Continue" pop-ups now have a working Continue button.
+- Mission items the combat log names by their cast bar text are matched too.

@@ -45,7 +45,12 @@ namespace QuestBehaviors
         [XmlAttribute("Tries")]
         public int Tries { get; set; } = 3;
 
-        public override bool IsDone => _gaveUp || IsQuestComplete || HasQuest;
+        /// <summary>A weekly (3 times a week since 7.0): the game calls it "complete" after the first one that week, so
+        /// "complete" doesn't count as done - it's picked up whenever the giver offers it (and given up on when it doesn't).</summary>
+        [XmlAttribute("Repeatable")]
+        public bool Repeatable { get; set; }
+
+        public override bool IsDone => _gaveUp || HasQuest || (IsQuestComplete && !Repeatable);
 
         public override string StatusText => "Picking up " + QuestName + " from " + ObjectName + " (if it's offered)";
 

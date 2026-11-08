@@ -13,7 +13,7 @@ namespace QuestRecorder
     public class QuestRecorderPlugin : BotPlugin
     {
         /// <summary>The patch name, SWTOR style: 1.0, 1.1, 1.1a, 1.2.1 ...</summary>
-        internal const string Patch = "1.2";
+        internal const string Patch = "1.2a";
 
         internal static readonly Version PluginVersion = Updater.ToVersion(Patch);
 

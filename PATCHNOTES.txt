@@ -1,5 +1,12 @@
 Quest Recorder patch notes - LethToxic
 
+1.2a
+- Weeklies get picked up again on your 2nd and 3rd run of the week. The game calls a weekly "complete" after the
+  first one, and the pick-up step took that as "already done". Weekly pick-ups now take it whenever the terminal
+  offers it.
+- "Do this part by hand, then press Continue" pop-ups now have a working Continue button.
+- Mission items the combat log names by their cast bar text are matched too.
+
 1.2
 The profile now copies what you did, in your order.
 - Steps come in the order you did them, each at the exact spot you used. BuddyCron finds the way in between

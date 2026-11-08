@@ -10,10 +10,12 @@ in plain words (untick, reorder, "do by hand") - no XML.
 
 The plugin's source is this repository - BuddyCron builds it when it starts.
 
-- **Download:** click **Code > Download ZIP**, unzip it, and put the files in `BuddyCron\Plugins\QuestRecorder`.
-- **Or clone it:** `git clone https://github.com/lethtoxic-svg/QuestRecorder.git "BuddyCron\Plugins\QuestRecorder"`
+- **Best: clone it** (needs [Git](https://git-scm.com/downloads)). Run this in your BuddyCron folder:
+  `git clone https://github.com/lethtoxic-svg/QuestRecorder.git "Plugins\QuestRecorder"`
+  BuddyCron's UpdateBuddy then keeps it up to date for you.
 - **Or** drop **Install Quest Recorder.bat** in your BuddyCron folder and double-click it.
+- **Or download:** click **Code > Download ZIP**, unzip it, and put the files in `BuddyCron\Plugins\QuestRecorder`.
 
-Start BuddyCron and tick Quest Recorder. After that you get a pop-up whenever there's an update.
+Start BuddyCron and tick Quest Recorder. If you didn't clone it, you get a pop-up whenever there's an update.
 
 More info is in README.txt, and what changed is in PATCHNOTES.txt.

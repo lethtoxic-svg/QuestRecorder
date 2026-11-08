@@ -1198,7 +1198,7 @@ namespace QuestRecorder
                             var spot = new Step { Kind = "Route", Comment = e.Note.StartsWith(PauseNote, StringComparison.Ordinal) ? "Your pause here" : "Your wait here" };
                             spot.Lines.Add("<MoveTo QuestId=\"1\" Name=\"" + A(spot.Comment) + "\" XYZ=\"" + X(e.Pos) + "\" />");
                             spot.Lines.Add(e.Note.StartsWith(PauseNote, StringComparison.Ordinal)
-                                ? "<UserDialog Title=\"Quest Recorder\" Message=\"You paused here when you recorded: do this part by hand, then press Continue.\" />"
+                                ? "<UserDialog Title=\"Quest Recorder\" Message=\"You paused here when you recorded: do this part by hand, then press Continue.\" IsBotContinueAllowed=\"True\" />"
                                 : "<WaitTimer QuestId=\"1\" WaitTime=\"10\" />");
                             steps.Add(spot);
                             break;
@@ -1554,7 +1554,7 @@ namespace QuestRecorder
                             // dailies / weeklies / heroics: the giver stops offering them once done today, and BuddyCron's
                             // PickUpQuest would click it forever - PickUpIfOffered gives up after 3 tries.
                                 s.Lines.Add("<" + (repeat ? "PickUpIfOffered" : "PickUpQuest") + " QuestName=\"" + A(e.QuestName) + "\" QuestId=\"" + q + "\"" + (giver.Kind == ObjKind.Placeable ? " SearchRadius=\"20\"" : string.Empty) +
-                                            " UseRange=\"20\" GiverName=\"" + A(giver.Name) + "\" XYZ=\"" + X(gp) + "\" />");
+                                            " UseRange=\"20\" GiverName=\"" + A(giver.Name) + "\" XYZ=\"" + X(gp) + "\"" + (isWeekly && repeat ? " Repeatable=\"True\"" : string.Empty) + " />");
                         }
                         else
                         {
@@ -1808,7 +1808,7 @@ namespace QuestRecorder
                         {
                             Use at = take[take.Count - 1];
                             lines.Add("<MoveTo QuestId=\"1\" Name=\"" + A(at.Name) + "\" XYZ=\"" + X(at.Stand.IsZero ? at.Pos : at.Stand) + "\" />");
-                            lines.Add("<UserDialog Title=\"Quest Recorder\" Message=\"" + A("Do the " + at.Name + " by hand, then press Continue.") + "\" />");
+                            lines.Add("<UserDialog Title=\"Quest Recorder\" Message=\"" + A("Do the " + at.Name + " by hand, then press Continue.") + "\" IsBotContinueAllowed=\"True\" />");
                             foreach (Use u in take)
                             {
                                 consumed[UseKey(u.Id, u.Pos)] = t;
@@ -2295,7 +2295,7 @@ namespace QuestRecorder
                             Comment = "Pick up " + h.Value + " (not sure: it was already in your log when you recorded - picked up at " + System.Net.WebUtility.HtmlDecode(board) + " like your other missions)",
                             At = steps[boardIdx].At
                         };
-                        ws.Lines.Add("<PickUpIfOffered QuestName=\"" + A(h.Value) + "\" QuestId=\"" + hq + "\" SearchRadius=\"20\" UseRange=\"20\" GiverName=\"" + board + "\" XYZ=\"" + boardXyz + "\" />");
+                        ws.Lines.Add("<PickUpIfOffered QuestName=\"" + A(h.Value) + "\" QuestId=\"" + hq + "\" SearchRadius=\"20\" UseRange=\"20\" GiverName=\"" + board + "\" XYZ=\"" + boardXyz + "\" Repeatable=\"True\" />");
                         steps.Insert(++boardIdx, ws);
                     }
                 }

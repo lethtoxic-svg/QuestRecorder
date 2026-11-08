@@ -779,6 +779,7 @@ namespace QuestRecorder
         }
 
         private string _logTargetName;
+        private readonly Dictionary<string, string> _castNameItem = new Dictionary<string, string>(StringComparer.Ordinal); // cast bar text -> mission item, learned from its casts
 
         /// <summary>The combat log source is you (not a companion, not another player).</summary>
         private static bool IsMe(string src, string me, string meUtf)
@@ -802,7 +803,7 @@ namespace QuestRecorder
             if (abl.Length == 0)
                 return null;
             string item;
-            if (_questItemByName.TryGetValue(abl, out item))
+            if (_questItemByName.TryGetValue(abl, out item) || _castNameItem.TryGetValue(abl, out item))
                 return item;
             if (!abl.StartsWith("Using ", StringComparison.Ordinal))
                 return null;
@@ -1491,6 +1492,8 @@ namespace QuestRecorder
             if (item != null)
             {
                 s.QuestItemName = item;
+                if (name.Length > 0 && _castNameItem.Count < 500)
+                    _castNameItem[name] = item; // its cast bar text ("Using Detection...") - the combat log names it that way too
                 s.CastTarget = ItemTarget(me, s, item);
             }
             else if (!s.InCombat && !(_baseAbilities != null && name.Length > 0 && !_baseAbilities.Contains(name) && AbilityManager.HasAbility(name)))
