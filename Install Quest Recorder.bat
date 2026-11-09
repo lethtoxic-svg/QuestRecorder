@@ -2,7 +2,7 @@
 rem Quest Recorder - made by LethToxic.
 rem Put this file in your BuddyCron folder (next to BuddyCron.exe) and double-click it.
 rem It downloads the newest Quest Recorder from GitHub and puts it in Plugins\QuestRecorder.
-rem Your old copy is saved in PluginBackups first. Recordings and profiles are not touched.
+rem Your old copy (and any other copy in Plugins) is saved in PluginBackups first. Recordings and profiles are not touched.
 cd /d "%~dp0"
 if not exist "Plugins" (
   echo This file has to be in your BuddyCron folder - the one with the Plugins folder in it.
@@ -24,6 +24,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Expand-Archive (Join-Path $tmp 'qr.zip') (Join-Path $tmp 'files');" ^
   "$new=Get-ChildItem (Join-Path $tmp 'files') -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'QuestRecorder.cs') } | Select-Object -First 1;" ^
   "if(-not $new){ throw 'The download does not look like Quest Recorder.' }" ^
+  "Get-ChildItem 'Plugins' -Directory | Where-Object { $_.Name -ne 'QuestRecorder' -and (Test-Path (Join-Path $_.FullName 'QuestRecorder.cs')) -and (Select-String -Quiet -SimpleMatch -Pattern 'class QuestRecorderPlugin' -Path (Join-Path $_.FullName 'QuestRecorder.cs')) } | ForEach-Object { $ob='PluginBackups\'+$_.Name+' before '+$ver+' '+(Get-Date -Format 'yyyy-MM-dd HH-mm'); New-Item -ItemType Directory -Force $ob | Out-Null; Copy-Item (Join-Path $_.FullName '*') $ob -Recurse -Force; Remove-Item $_.FullName -Recurse -Force; Write-Host ('Another copy, Plugins\'+$_.Name+', saved in '+$ob+' and removed') };" ^
   "$dest='Plugins\QuestRecorder';" ^
   "if(Test-Path $dest){ $bk='PluginBackups\QuestRecorder before '+$ver+' '+(Get-Date -Format 'yyyy-MM-dd HH-mm'); New-Item -ItemType Directory -Force $bk | Out-Null; Copy-Item (Join-Path $dest '*') $bk -Recurse -Force; Remove-Item $dest -Recurse -Force; Write-Host ('Old copy saved in '+$bk) }" ^
   "New-Item -ItemType Directory -Force $dest | Out-Null;" ^

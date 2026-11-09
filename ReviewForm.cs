@@ -242,6 +242,7 @@ namespace QuestRecorder
             XmlElement ud = _doc.CreateElement("UserDialog");
             ud.SetAttribute("Title", "Quest Recorder");
             ud.SetAttribute("Message", "Do this by hand: " + what + " - then press Continue.");
+            ud.SetAttribute("IsBotContinueAllowed", "True"); // BuddyCron's Continue button is off without it
             target.AppendChild(ud);
             it.NoProof = false;
             Fill();
@@ -280,10 +281,8 @@ namespace QuestRecorder
             }
             try
             {
-                // keep a copy of what it was
-                string dir = Path.Combine(Path.GetDirectoryName(_path) ?? ".", "_fixer backups");
-                Directory.CreateDirectory(dir);
-                File.Copy(_path, Path.Combine(dir, Path.GetFileNameWithoutExtension(_path) + " (before review " + DateTime.Now.ToString("yyyy-MM-dd HH-mm-ss") + ").xml"), true);
+                // keep a copy of what it was (a file of its own: two saves in one second each keep theirs)
+                File.Copy(_path, ProfileEditor.NewBackupPath(_path, "before review"), false);
 
                 foreach (Item it in _items)
                 {

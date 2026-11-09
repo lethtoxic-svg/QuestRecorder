@@ -156,6 +156,8 @@ namespace QuestRecorder
         public readonly List<TaskInfo> Tasks = new List<TaskInfo>();
         public bool Resolved;
         public int Attempts;
+        /// <summary>Looks on which the game's step data was still for another step (those tries don't count, a few times).</summary>
+        public int Lags;
 
         public TaskInfo Task(int index)
         {
@@ -230,6 +232,8 @@ namespace QuestRecorder
         public Vec3 Stand;
         public ulong AreaId;
         public long Tick;
+        /// <summary>When its window closed (0 while it is still open).</summary>
+        public long ClosedTick;
     }
 
     internal sealed class WonkaArrival
@@ -307,6 +311,10 @@ namespace QuestRecorder
         public bool ConvoIsComlink;
         public string ConvoTypeName = string.Empty;
         public ulong OfferedQuestId;
+        /// <summary>Still talking, but the conversation's type changed since the last look: a new conversation followed at once.</summary>
+        public bool ConvoRestarted;
+        /// <summary>Another member of your group stands near you as the conversation starts (whoever wins the roll picks the replies).</summary>
+        public bool ConvoGroup;
         /// <summary>The conversation's current dialog node number (-1 when not talking or unknown).</summary>
         public long ConvoNode = -1;
         /// <summary>The node whose choice wheel is on screen now (-1 when no wheel is shown).</summary>
@@ -332,6 +340,8 @@ namespace QuestRecorder
         public bool InstantItemBag;
         /// <summary>That item left the mission items (your last one, or the game took it away when its step was done).</summary>
         public bool InstantItemGone;
+        /// <summary>What that instant item was used on (kept apart from CastTarget: a cast can start in the same look).</summary>
+        public ObjRef InstantItemTarget;
         public ObjRef CastTarget;
         /// <summary>A quest ability you used from a special / temporary bar (Macrobinoculars, Seeker Droid), or null.</summary>
         public string AbilityName;
@@ -419,6 +429,8 @@ namespace QuestRecorder
     {
         public int Seq;
         public DateTime Time;
+        /// <summary>Environment.TickCount64 when it happened (0 for events loaded from a file): not moved by a clock change.</summary>
+        public long Tick;
         public double Elapsed;
         public EvKind Kind;
 

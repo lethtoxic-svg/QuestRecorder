@@ -87,6 +87,12 @@ namespace QuestRecorder
             return v < min ? min : (v > max ? max : v);
         }
 
+        /// <summary>A folder as typed or pasted: no spaces around it and no quotes (Explorer's "Copy as path" adds them).</summary>
+        internal static string CleanPath(string value)
+        {
+            return (value ?? string.Empty).Trim().Trim('"').Trim();
+        }
+
         private bool _seenWelcome;
 
         [Browsable(false)]
@@ -180,8 +186,8 @@ namespace QuestRecorder
         [DefaultValue("")]
         public string ProfileFolder
         {
-            get { return _profileFolder; }
-            set { SetField(ref _profileFolder, value ?? string.Empty, nameof(ProfileFolder)); }
+            get { return CleanPath(_profileFolder); }
+            set { SetField(ref _profileFolder, CleanPath(value), nameof(ProfileFolder)); }
         }
 
 
@@ -195,6 +201,30 @@ namespace QuestRecorder
         {
             get { return _undoHotkey; }
             set { SetField(ref _undoHotkey, value, nameof(UndoHotkey)); }
+        }
+
+        private Keys _pauseHotkey = Keys.Control | Keys.Shift | Keys.P;
+
+        [Category("2. Markers")]
+        [DisplayName("Pause here hotkey")]
+        [Description("While recording: the profile pauses at this spot so you do that part by hand. Default Ctrl+Shift+P. None = off.")]
+        [DefaultValue(Keys.Control | Keys.Shift | Keys.P)]
+        public Keys PauseHotkey
+        {
+            get { return _pauseHotkey; }
+            set { SetField(ref _pauseHotkey, value, nameof(PauseHotkey)); }
+        }
+
+        private Keys _waitHotkey = Keys.Control | Keys.Shift | Keys.W;
+
+        [Category("2. Markers")]
+        [DisplayName("Wait here hotkey")]
+        [Description("While recording: the bot waits 10 seconds at this spot (a respawn, a door). Default Ctrl+Shift+W. None = off.")]
+        [DefaultValue(Keys.Control | Keys.Shift | Keys.W)]
+        public Keys WaitHotkey
+        {
+            get { return _waitHotkey; }
+            set { SetField(ref _waitHotkey, value, nameof(WaitHotkey)); }
         }
 
         private int _sampleMs;
@@ -304,8 +334,8 @@ namespace QuestRecorder
         [DefaultValue("")]
         public string OutputFolder
         {
-            get { return _outputFolder ?? string.Empty; }
-            set { SetField(ref _outputFolder, (value ?? string.Empty).Trim(), nameof(OutputFolder)); }
+            get { return CleanPath(_outputFolder); }
+            set { SetField(ref _outputFolder, CleanPath(value), nameof(OutputFolder)); }
         }
 
         private StandTag _standTag;

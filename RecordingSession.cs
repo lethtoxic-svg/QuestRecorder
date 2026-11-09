@@ -35,6 +35,8 @@ namespace QuestRecorder
         private bool _writeBroken;
         private bool _draftBroken;
         private DateTime _lastTime;
+        private long _startedTick;   // Environment.TickCount64 of the first look (0 = not known)
+        private double _lastElapsed;
 
         public int QuestEvents;
         public int Kills;
@@ -50,6 +52,7 @@ namespace QuestRecorder
             LiveTrace = new string[0];
             LiveActions = new string[0];
             LiveProblems = new string[0];
+            LiveProfile = string.Empty; // until this recording has a profile (never the last recording's one)
             Started = started;
             _lastTime = started;
             TxtPath = Path.Combine(folder, baseName + ".txt");
@@ -82,14 +85,35 @@ namespace QuestRecorder
             {
                 try
                 {
-                    return Path.IsPathRooted(custom) ? Path.GetFullPath(custom) : Path.GetFullPath(Path.Combine(root, custom));
+                    string full = Path.IsPathRooted(custom) ? Path.GetFullPath(custom) : Path.GetFullPath(Path.Combine(root, custom));
+                    // GetFullPath no longer throws for a bad name: only a folder that exists or can be made is used
+                    if (!Directory.Exists(full))
+                        Directory.CreateDirectory(full);
+                    return full;
                 }
                 catch (Exception ex)
                 {
-                    RrLog.Warn("The recordings folder \"{0}\" is not usable ({1}); using the default one.", custom, ex.Message);
+                    if (RrLog.Every("recordings-folder", TimeSpan.FromMinutes(10)))
+                        RrLog.Warn("The recordings folder \"{0}\" is not usable ({1}); using the default one.", custom, ex.Message);
                 }
             }
             return Path.Combine(root, "Recordings");
+        }
+
+        /// <summary>Makes the folder; false (and a warning) when it can't be made, e.g. a bad name in the settings.</summary>
+        private static bool TryMakeFolder(string folder, string what)
+        {
+            try
+            {
+                Directory.CreateDirectory(folder);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (RrLog.Every("folder:" + what, TimeSpan.FromMinutes(10)))
+                    RrLog.Warn("The {0} \"{1}\" can't be used ({2}); using the default one.", what, folder, ex.Message);
+                return false;
+            }
         }
 
         /// <summary>The folder that holds BuddyCron's Logs folder (walks up from the current log file).</summary>
@@ -153,9 +177,10 @@ namespace QuestRecorder
             }
 
             var s = new RecordingSession(folder, baseName, place, first.Time);
+            s._startedTick = first.Tick;
             s._insert = Merge.TargetPath != null;
             if (!s._insert)
-                s.TryJoin();
+                s.TryJoin(first, area);
             try
             {
                 s._txt = OpenWriter(s.TxtPath, new UTF8Encoding(false));
@@ -204,7 +229,13 @@ namespace QuestRecorder
         {
             _seq++;
             e.Seq = _seq;
-            e.Elapsed = Math.Max(0.0, (e.Time - Started).TotalSeconds);
+            // from the tick count, not the clock: summer time ending or a time sync never moves an event back or forward
+            if (e.Tick != 0 && _startedTick != 0)
+                e.Elapsed = Math.Max(0.0, (e.Tick - _startedTick) / 1000.0);
+            else
+                e.Elapsed = Math.Max(0.0, (e.Time - Started).TotalSeconds);
+            if (e.Elapsed > _lastElapsed)
+                _lastElapsed = e.Elapsed;
             if (e.Time > _lastTime)
                 _lastTime = e.Time;
             if (string.IsNullOrEmpty(e.Summary))
@@ -421,6 +452,14 @@ namespace QuestRecorder
         private void WriteDraft(bool final, TagCheckResult tags)
         {
             _draftDirty = false;
+            // The annotated draft is only a notes file, made when you ask for it: it never decides whether the profile is saved.
+            if (RrSettings.Instance.KeepDraft)
+                WriteNotesDraft(final, tags);
+            WriteProfileCopy(final);
+        }
+
+        private void WriteNotesDraft(bool final, TagCheckResult tags)
+        {
             string text;
             try
             {
@@ -440,36 +479,45 @@ namespace QuestRecorder
                 _draftBroken = true;
                 return;
             }
-            // The annotated draft was mistaken for the profile.
-            if (!RrSettings.Instance.KeepDraft)
-            {
-                WriteProfileCopy(final);
-                return;
-            }
-            string tmp = DraftPath + ".tmp";
             try
             {
-                File.WriteAllText(tmp, text, new UTF8Encoding(false));
-                try
-                {
-                    File.Move(tmp, DraftPath, true);
-                }
-                catch (IOException)
-                {
-                    // the target is open somewhere: copy over it instead
-                    File.Copy(tmp, DraftPath, true);
-                    File.Delete(tmp);
-                }
-                catch (UnauthorizedAccessException)
-                {
-                    File.Copy(tmp, DraftPath, true);
-                    File.Delete(tmp);
-                }
+                WriteWhole(DraftPath, text);
             }
             catch (Exception ex)
             {
                 if (final || RrLog.Every("draft-write", TimeSpan.FromMinutes(10)))
                     RrLog.Warn("Writing the draft {0} failed: {1}", DraftPath, ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Writes the whole file or leaves the old one: into a .tmp next to it first, then over it. A kill or a full disk
+        /// halfway never leaves a cut or empty file behind.
+        /// </summary>
+        internal static void WriteWhole(string path, string text)
+        {
+            string tmp = path + ".tmp";
+            try
+            {
+                File.WriteAllText(tmp, text, new UTF8Encoding(false));
+                try
+                {
+                    File.Move(tmp, path, true);
+                }
+                catch (IOException)
+                {
+                    // the target is open somewhere: copy over it instead
+                    File.Copy(tmp, path, true);
+                    File.Delete(tmp);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    File.Copy(tmp, path, true);
+                    File.Delete(tmp);
+                }
+            }
+            catch
+            {
                 try
                 {
                     if (File.Exists(tmp))
@@ -479,8 +527,8 @@ namespace QuestRecorder
                 {
                     // ignore
                 }
+                throw;
             }
-            WriteProfileCopy(final);
         }
 
         // ------------------------------------------------------------------ ready-to-load profile copy
@@ -488,8 +536,89 @@ namespace QuestRecorder
         /// <summary>What keeps the last profile from running on plain BuddyCron (empty = it's finished).</summary>
         public static volatile string[] LiveProblems = new string[0];
 
+        /// <summary>Forgets the last recording's tracker, actions and profile (a new recording is starting).</summary>
+        internal static void ClearLive()
+        {
+            LiveTrace = new string[0];
+            LiveActions = new string[0];
+            LiveProblems = new string[0];
+            LiveProfile = string.Empty;
+        }
+
         private string _profilePath;
         private bool _profileAnnounced;
+        private bool _lastBuildFailed;
+        // what this recording last saved in the profile, to see when someone else saved it since (null = nothing yet)
+        private string _lastWritten;
+        private long _writtenLength;
+        private long _writtenTicks;
+
+        private void Remember(string text)
+        {
+            _lastWritten = text;
+            try
+            {
+                var fi = new FileInfo(_profilePath);
+                _writtenLength = fi.Length;
+                _writtenTicks = fi.LastWriteTimeUtc.Ticks;
+            }
+            catch
+            {
+                _writtenLength = -1;
+                _writtenTicks = 0;
+            }
+        }
+
+        /// <summary>True when the profile was saved by someone else (the control panel, the review list, an editor)
+        /// since this recording last wrote it.</summary>
+        private bool ChangedSinceWritten()
+        {
+            if (_lastWritten == null || _profilePath == null || _profilePath.Length == 0 || !File.Exists(_profilePath))
+                return false;
+            string now;
+            try
+            {
+                var fi = new FileInfo(_profilePath);
+                if (fi.Length == _writtenLength && fi.LastWriteTimeUtc.Ticks == _writtenTicks)
+                    return false;
+                now = File.ReadAllText(_profilePath);
+            }
+            catch
+            {
+                return false; // can't read it: the write after this fails the same way, nothing is lost
+            }
+            if (string.Equals(now, _lastWritten, StringComparison.Ordinal))
+            {
+                Remember(_lastWritten); // only touched (a copy, a sync tool): still ours
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Someone saved the profile while this recording was going on: it stays exactly as they saved it, and the
+        /// recording goes on in a copy next to it (writing over it would throw their fix away).
+        /// </summary>
+        private void LeaveChangedProfile()
+        {
+            string kept = _profilePath;
+            string dir = Path.GetDirectoryName(kept) ?? string.Empty;
+            string stem = System.Text.RegularExpressions.Regex.Replace(Path.GetFileNameWithoutExtension(kept), @" \(recorder copy(?: \d+)?\)$", string.Empty);
+            string next = null;
+            for (int n = 1; n < 100 && next == null; n++)
+            {
+                string p = Path.Combine(dir, stem + (n == 1 ? " (recorder copy)" : " (recorder copy " + n.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")") + ".xml");
+                if (!File.Exists(p))
+                    next = p;
+            }
+            if (next == null)
+                next = Path.Combine(dir, stem + " (recorder copy " + DateTime.Now.ToString("yyyy-MM-dd HH-mm-ss", System.Globalization.CultureInfo.InvariantCulture) + ").xml");
+            _profilePath = next;
+            _lastWritten = null;
+            LiveProfile = next;
+            RrLog.Warn("{0} was changed while recording, so it stays as it was saved. This recording goes on in {1}.", Path.GetFileName(kept), Path.GetFileName(next));
+            GameToast.Show("Quest Recorder: your profile was changed while recording - it stays as saved. The recording goes on in " + Path.GetFileName(next) + ".", 12000);
+        }
 
         /// <summary>The profile, saved where players keep their profiles so it can be loaded straight away.</summary>
         private void WriteProfileCopy(bool final)
@@ -503,6 +632,8 @@ namespace QuestRecorder
                 }
                 if (_profilePath.Length == 0)
                     return;
+                if (ChangedSinceWritten())
+                    LeaveChangedProfile();
                 // The ready-to-load profile is a REPLAY of the recording.
                 string replay;
                 List<string> problems;
@@ -517,6 +648,7 @@ namespace QuestRecorder
                 catch (Exception ex)
                 {
                     // never the draft in its place: the last profile stays, marked not finished
+                    _lastBuildFailed = true;
                     var failed = new List<string> { "the profile couldn't be built (" + ex.Message + ")" };
                     LiveProblems = failed.ToArray();
                     LiveProfile = _profilePath; // the problems go with this profile (a profile made from an old recording may have been shown)
@@ -524,8 +656,12 @@ namespace QuestRecorder
                         RrLog.Warn("This profile is NOT finished: couldn't build it ({0}). Send the recording to LethToxic.", ex.Message);
                     try
                     {
-                        if (File.Exists(_profilePath))
-                            File.WriteAllText(_profilePath, ReplayBuilder.MarkNotFinished(File.ReadAllText(_profilePath), failed), new UTF8Encoding(false));
+                        if (_lastWritten != null && File.Exists(_profilePath))
+                        {
+                            string marked = ReplayBuilder.MarkNotFinished(_lastWritten, failed);
+                            WriteWhole(_profilePath, marked);
+                            Remember(marked);
+                        }
                     }
                     catch (Exception mex)
                     {
@@ -533,7 +669,9 @@ namespace QuestRecorder
                     }
                     return;
                 }
-                File.WriteAllText(_profilePath, replay, new UTF8Encoding(false));
+                WriteWhole(_profilePath, replay);
+                Remember(replay);
+                _lastBuildFailed = false;
                 // Load check: the profile must run on plain BuddyCron (the profile itself says so when it isn't finished)
                 LiveProblems = problems.ToArray();
                 LiveProfile = _profilePath; // the problems go with this profile (a profile made from an old recording may have been shown)
@@ -542,7 +680,8 @@ namespace QuestRecorder
                 try
                 {
                     // every interaction you made, where, and what your quest log did right after
-                    File.WriteAllLines(Path.Combine(Folder, BaseName + " (what you did).txt"), ReplayBuilder.Interactions(_events), new UTF8Encoding(false));
+                    List<string> did = ReplayBuilder.Interactions(_events);
+                    WriteWhole(Path.Combine(Folder, BaseName + " (what you did).txt"), did.Count > 0 ? string.Join("\r\n", did.ToArray()) + "\r\n" : string.Empty);
                 }
                 catch (Exception ex)
                 {
@@ -573,7 +712,11 @@ namespace QuestRecorder
             string folder = null;
             string chosen = RrSettings.Instance.ProfileFolder ?? string.Empty;
             if (chosen.Trim().Length > 0)
+            {
                 folder = Path.IsPathRooted(chosen) ? chosen : Path.Combine(baseDir, chosen);
+                if (!TryMakeFolder(folder, "profile folder"))
+                    folder = null; // a bad folder in the settings: the profile still gets saved, in the usual place
+            }
             if (folder == null && Place.Length > 0)
                 folder = FindPlaceFolder(baseDir, Place);
             if (folder == null)
@@ -619,13 +762,36 @@ namespace QuestRecorder
         /// <summary>Footer, close the files, final draft. Never throws.</summary>
         public void Finish(string why, IList<string> stats, bool checkTags)
         {
+            // where this recording's profile is (the next recording that carries this one on writes there too)
+            string profileLine = null;
+            if (!_insert)
+            {
+                try
+                {
+                    if (_profilePath == null)
+                    {
+                        _profilePath = ProfileCopyPath();
+                        LiveProfile = _profilePath;
+                    }
+                    else if (ChangedSinceWritten())
+                    {
+                        LeaveChangedProfile();
+                    }
+                    if (_profilePath.Length > 0)
+                        profileLine = ShortPath(_profilePath);
+                }
+                catch (Exception ex)
+                {
+                    RrLog.Debug("Finding the profile for the footer: {0}", ex.Message);
+                }
+            }
             try
             {
                 if (!_writeBroken && _txt != null)
                 {
                     _txt.WriteLine(new string('-', 100));
                     _txt.WriteLine("Stopped     " + Fmt.Stamp(DateTime.Now) + (string.IsNullOrEmpty(why) ? string.Empty : " (" + why + ")") +
-                                   ", recorded " + Fmt.Duration((_lastTime - Started).TotalSeconds));
+                                   ", recorded " + Fmt.Duration(_lastElapsed));
                     _txt.WriteLine(Fmt.Format("Events      {0} (quest updates {1}, kills {2}, markers {3}, warnings {4})", _seq,
                         QuestEvents, Kills, Markers, Warnings));
                     if (stats != null)
@@ -635,6 +801,8 @@ namespace QuestRecorder
                     }
                     if (RrSettings.Instance.KeepDraft)
                         _txt.WriteLine("Draft       " + DraftPath);
+                    if (profileLine != null)
+                        _txt.WriteLine(ProfileKey + profileLine);
                 }
             }
             catch (Exception ex)
@@ -645,7 +813,7 @@ namespace QuestRecorder
             CloseWriters();
 
             TagCheckResult tags = TagCheck.Cached;
-            if (checkTags && tags == null)
+            if (checkTags && tags == null && RrSettings.Instance.KeepDraft)
             {
                 try
                 {
@@ -657,11 +825,177 @@ namespace QuestRecorder
                 }
             }
             WriteDraft(true, tags);
-            if (_insert && _profilePath != null)
-                Merge.Finish(_profilePath);
+            if (_insert)
+            {
+                if (_profilePath != null && !_lastBuildFailed)
+                {
+                    Merge.Finish(_profilePath);
+                }
+                else
+                {
+                    // the bit couldn't be built: nothing half-made goes into your profile
+                    string target = Merge.TargetPath;
+                    Merge.TargetPath = null;
+                    if (target != null)
+                    {
+                        RrLog.Warn("The bit you recorded couldn't be built, so nothing was added to {0}. Send the recording to LethToxic.", Path.GetFileName(target));
+                        GameToast.Show("Quest Recorder: the bit you recorded couldn't be built, so nothing was added to your profile.", 10000);
+                    }
+                }
+            }
         }
 
         // ------------------------------------------------------------------ carrying on an earlier recording
+
+        private const string ProfileKey = "Profile     ";
+
+        /// <summary>The profile's path as the footer writes it: from BuddyCron's folder when it is in there.</summary>
+        private static string ShortPath(string path)
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            if (!string.IsNullOrEmpty(baseDir) && path.StartsWith(baseDir, StringComparison.OrdinalIgnoreCase) && path.Length > baseDir.Length)
+                return path.Substring(baseDir.Length).TrimStart('\\', '/');
+            return path;
+        }
+
+        /// <summary>The profile a recording saved to (the "Profile" line of its .txt footer), or null for older recordings.</summary>
+        internal static string FooterProfile(string txt)
+        {
+            if (!File.Exists(txt))
+                return null;
+            string found = null;
+            string tail;
+            using (var fs = new FileStream(txt, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                // the footer is the last few lines: read only the end of a long timeline
+                if (fs.Length > 65536)
+                    fs.Seek(-65536, SeekOrigin.End);
+                using (var r = new StreamReader(fs, Encoding.UTF8))
+                    tail = r.ReadToEnd();
+            }
+            foreach (string line in tail.Split('\n'))
+            {
+                string l = line.TrimEnd('\r');
+                if (l.StartsWith(ProfileKey, StringComparison.Ordinal))
+                    found = l.Substring(ProfileKey.Length).Trim();
+            }
+            if (string.IsNullOrEmpty(found))
+                return null;
+            return Path.IsPathRooted(found) ? found : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, found);
+        }
+
+        /// <summary>A line of a recording's .txt header ("Continues   X" gives X for "Continues"), or empty.</summary>
+        internal static string HeaderValue(string txt, string key)
+        {
+            if (!File.Exists(txt))
+                return string.Empty;
+            // shared: the recording going on now is still writing its own .txt
+            using (var fs = new FileStream(txt, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var r = new StreamReader(fs, Encoding.UTF8))
+            {
+                string line;
+                while ((line = r.ReadLine()) != null)
+                {
+                    if (line.StartsWith("---", StringComparison.Ordinal))
+                        break;
+                    if (line.StartsWith(key, StringComparison.Ordinal) && line.Length > key.Length && line[key.Length] == ' ')
+                        return line.Substring(key.Length).Trim();
+                }
+            }
+            return string.Empty;
+        }
+
+        /// <summary>The recording .csv this one carried on (its "Continues" line), or null.</summary>
+        internal static string ContinuesFrom(string csv)
+        {
+            string earlier = HeaderValue(Path.ChangeExtension(csv, ".txt"), "Continues");
+            if (earlier.Length == 0)
+                return null;
+            return Path.Combine(Path.GetDirectoryName(csv) ?? string.Empty, earlier + ".csv");
+        }
+
+        /// <summary>
+        /// Every part of one carried-on recording, oldest first: the ones this one carried on and the ones that carried
+        /// this one on later. Just the one .csv when it was never carried on.
+        /// </summary>
+        internal static List<string> PartsOf(string csv, bool alsoLater)
+        {
+            var parts = new List<string> { csv };
+            string at = csv;
+            for (int depth = 0; depth < 10; depth++)
+            {
+                string earlier = ContinuesFrom(at);
+                if (earlier == null || !File.Exists(earlier) || parts.Exists(p => string.Equals(p, earlier, StringComparison.OrdinalIgnoreCase)))
+                    break;
+                parts.Insert(0, earlier);
+                at = earlier;
+            }
+            if (!alsoLater)
+                return parts;
+            try
+            {
+                string dir = Path.GetDirectoryName(csv) ?? string.Empty;
+                // a later part is a recording of the same place: "<place>-yyyy-MM-dd_HH-mm(-n)"
+                System.Text.RegularExpressions.Match pm = System.Text.RegularExpressions.Regex.Match(Path.GetFileNameWithoutExtension(csv), @"^(.*-)\d{4}-\d\d-\d\d_\d\d-\d\d(?:-\d+)?$");
+                string pattern = pm.Success ? pm.Groups[1].Value + "*.txt" : "*.txt";
+                at = csv;
+                for (int depth = 0; depth < 10; depth++)
+                {
+                    string stem = Path.GetFileNameWithoutExtension(at);
+                    string later = null;
+                    foreach (string txt in Directory.GetFiles(dir, pattern))
+                    {
+                        string c = Path.ChangeExtension(txt, ".csv");
+                        if (!File.Exists(c) || parts.Exists(p => string.Equals(p, c, StringComparison.OrdinalIgnoreCase)))
+                            continue;
+                        if (!string.Equals(HeaderValue(txt, "Continues"), stem, StringComparison.Ordinal))
+                            continue;
+                        if (later == null || string.CompareOrdinal(c, later) > 0)
+                            later = c;
+                    }
+                    if (later == null)
+                        break;
+                    parts.Add(later);
+                    at = later;
+                }
+            }
+            catch (Exception ex)
+            {
+                RrLog.Debug("Looking for recordings that carried this one on: {0}", ex.Message);
+            }
+            return parts;
+        }
+
+        /// <summary>The profile a recording saved to: its footer, else its own name, else the first part's name.</summary>
+        private static string ProfileOf(string csv)
+        {
+            string p = FooterProfile(Path.ChangeExtension(csv, ".txt"));
+            if (p != null && File.Exists(p))
+                return p;
+            p = Reports.ProfileFor(csv);
+            if (p != null && File.Exists(p))
+                return p;
+            // a recording that carried on an earlier one saved into the first part's profile
+            List<string> parts = PartsOf(csv, false);
+            if (parts.Count > 1 && !string.Equals(parts[0], csv, StringComparison.OrdinalIgnoreCase))
+            {
+                p = Reports.ProfileFor(parts[0]);
+                if (p != null && File.Exists(p))
+                    return p;
+            }
+            return null;
+        }
+
+        /// <summary>Character name from a recording's .txt ("Character   Name, level 80"), or empty.</summary>
+        private static string CharacterOf(string txt)
+        {
+            string who = HeaderValue(txt, "Character");
+            int comma = who.IndexOf(',');
+            if (comma >= 0)
+                who = who.Substring(0, comma);
+            who = who.Trim();
+            return who == "(unknown)" ? string.Empty : who;
+        }
 
         /// <summary>This recording plus the earlier one(s) it carries on, in time order.</summary>
         private List<RecEvent> AllEvents()
@@ -675,32 +1009,47 @@ namespace QuestRecorder
         }
 
         /// <summary>
-        /// Logged off halfway through a planet? If the last recording of this place is less than a day old and its
-        /// profile wasn't changed in the control panel, this one carries on in the same profile.
+        /// Logged off halfway through a planet? If the last recording of this place is less than a day old, was made by
+        /// this character, still has missions open that are in your quest log, and its profile wasn't changed since,
+        /// this one carries on in the same profile.
         /// </summary>
-        private void TryJoin()
+        private void TryJoin(Snap first, AreaInfo area)
         {
             try
             {
                 if (!RrSettings.Instance.JoinRecordings || Place.Length == 0)
                     return;
                 string prefix = Fmt.FileName(Place, "Recording") + "-";
-                string prev = null;
-                DateTime best = DateTime.MinValue;
+                var recent = new List<KeyValuePair<DateTime, string>>();
                 foreach (string f in Directory.GetFiles(Folder, prefix + "*.csv"))
                 {
                     if (Path.GetFileNameWithoutExtension(f) == BaseName)
                         continue;
                     DateTime w = File.GetLastWriteTime(f);
-                    if (w > best)
-                    {
-                        best = w;
-                        prev = f;
-                    }
+                    if (DateTime.Now - w <= TimeSpan.FromHours(24))
+                        recent.Add(new KeyValuePair<DateTime, string>(w, f));
                 }
-                if (prev == null || DateTime.Now - best > TimeSpan.FromHours(24))
+                recent.Sort((a, b) => b.Key.CompareTo(a.Key)); // newest first
+                // this character's last recording of this place: another character's (an alt, the other faction) is never
+                // carried on, one profile never holds two characters' missions
+                string prev = null;
+                bool other = false;
+                for (int i = 0; i < recent.Count && i < 20 && prev == null; i++)
+                {
+                    string who = CharacterOf(Path.ChangeExtension(recent[i].Value, ".txt"));
+                    if (who.Length > 0 && first.PlayerName.Length > 0 && !string.Equals(who, first.PlayerName, StringComparison.Ordinal))
+                        other = true;
+                    else
+                        prev = recent[i].Value;
+                }
+                if (prev == null)
+                {
+                    if (other)
+                        RrLog.Info("Your last {0} recording was made with another character, so this recording starts a new profile.", Place);
                     return;
-                string profile = Reports.ProfileFor(prev);
+                }
+                string prevTxt = Path.ChangeExtension(prev, ".txt");
+                string profile = ProfileOf(prev);
                 if (profile == null || !File.Exists(profile))
                     return;
                 string fixes = Path.Combine(Path.GetDirectoryName(profile), "_fixer backups");
@@ -711,28 +1060,100 @@ namespace QuestRecorder
                     RrLog.Info("Your last {0} profile was saved from the review list or changed, so this recording starts a new one.", Place);
                     return;
                 }
+                // saved after that recording stopped (an editor, Make profile): it's yours too. The recorder's own last
+                // write comes seconds after the .txt footer.
+                if (File.Exists(prevTxt) && File.GetLastWriteTimeUtc(profile) > File.GetLastWriteTimeUtc(prevTxt).AddMinutes(2))
+                {
+                    RrLog.Info("Your last {0} profile was changed after that recording, so this recording starts a new one.", Place);
+                    return;
+                }
                 var events = new List<RecEvent>();
                 LoadChain(prev, events, 0);
                 if (events.Count == 0)
                     return;
-                // every quest you picked up there was finished: that run is complete, start a new profile
+                // every quest you picked up there was finished, dropped or left the log: that run is complete, start a new
+                // profile. A weekly stays open for days, so it never keeps a run going by itself (its tag in any client
+                // language), and neither do the game's own bookkeeping quests (companion conversations, [DNT] ...).
                 var open = new HashSet<ulong>();
+                bool ended = false;
                 foreach (RecEvent e in events)
                 {
-                    if (e.Kind == EvKind.QuestAdded && !e.QuestHidden)
+                    if (e.Kind == EvKind.QuestAdded && !e.QuestHidden && !ReplayBuilder.IsWeekly(e.QuestName) && !ReplayBuilder.IsSystemQuest(e))
+                    {
                         open.Add(e.QuestId);
-                    else if (e.Kind == EvKind.QuestCompleted)
+                    }
+                    else if (e.Kind == EvKind.QuestCompleted || e.Kind == EvKind.QuestAbandoned || e.Kind == EvKind.QuestRemoved)
+                    {
                         open.Remove(e.QuestId);
+                        ended = true;
+                    }
                 }
-                if (open.Count == 0 && events.Exists(x => x.Kind == EvKind.QuestCompleted))
+                if (open.Count == 0 && ended)
                 {
                     RrLog.Info("Your last {0} recording was finished, so this recording starts a new profile.", Place);
                     return;
                 }
+                // the missions it left open must still be in your quest log (done since, dropped, or not this character's)
+                if (open.Count > 0 && first.QuestsAvailable && first.Quests != null)
+                {
+                    bool inLog = false;
+                    foreach (QSnap q in first.Quests)
+                    {
+                        if (open.Contains(q.QuestId))
+                        {
+                            inLog = true;
+                            break;
+                        }
+                    }
+                    if (!inLog)
+                    {
+                        RrLog.Info("The missions your last {0} recording left open aren't in your quest log, so this recording starts a new profile.", Place);
+                        return;
+                    }
+                }
+                // carrying on means going on where you were: where that run made quest progress or stopped
+                // (a start on the fleet or your ship never carries on a planet run that never went there)
+                string here = area != null ? area.Label ?? string.Empty : string.Empty;
+                ulong hereId = area != null ? area.Id : 0;
+                if (here.Length > 0 || hereId != 0)
+                {
+                    var areas = new HashSet<string>(StringComparer.Ordinal);
+                    var areaIds = new HashSet<ulong>();
+                    for (int i = 0; i < events.Count; i++)
+                    {
+                        RecEvent e = events[i];
+                        bool progress = !e.QuestHidden &&
+                                        (e.Kind == EvKind.QuestAdded || e.Kind == EvKind.QuestTask || e.Kind == EvKind.QuestStep || e.Kind == EvKind.QuestCompleted);
+                        if (!progress && i < events.Count - 1)
+                            continue;
+                        if (!string.IsNullOrEmpty(e.AreaName))
+                            areas.Add(e.AreaName);
+                        if (e.AreaId != 0)
+                            areaIds.Add(e.AreaId);
+                    }
+                    if ((areas.Count > 0 || areaIds.Count > 0) && !areas.Contains(here) && !areaIds.Contains(hereId))
+                    {
+                        RrLog.Info("Your last {0} recording was done somewhere else, so this recording starts a new profile.", Place);
+                        return;
+                    }
+                }
+                double newest = double.MinValue;
                 foreach (RecEvent e in events)
+                {
                     e.Elapsed = e.Time != default(DateTime) ? (e.Time - Started).TotalSeconds : e.Elapsed - 1000000; // before this recording: negative, still in order
+                    if (e.Elapsed > newest)
+                        newest = e.Elapsed;
+                }
+                if (newest >= 0)
+                {
+                    // the clock went back since then (summer time ended): those events still come before this recording
+                    foreach (RecEvent e in events)
+                        e.Elapsed -= newest + 1.0;
+                }
+                string text = File.ReadAllText(profile);
                 _joinEvents = events;
                 _profilePath = profile;
+                Remember(text); // a change saved from now on is seen, and kept
                 LiveProfile = profile;
                 Continues = Path.GetFileNameWithoutExtension(prev);
                 RrLog.Info("Carrying on your {0} profile from earlier: {1}", Place, Path.GetFileName(profile));
@@ -742,29 +1163,20 @@ namespace QuestRecorder
             {
                 RrLog.Debug("Couldn't carry on the last recording: {0}", ex.Message);
                 _joinEvents = null;
+                _profilePath = null;
+                _lastWritten = null;
+                Continues = string.Empty;
             }
         }
 
         /// <summary>Loads a recording and, first, the ones it carried on (the "Continues" line in its .txt).</summary>
-        private static void LoadChain(string csv, List<RecEvent> into, int depth)
+        internal static void LoadChain(string csv, List<RecEvent> into, int depth)
         {
             if (depth > 10 || !File.Exists(csv))
                 return;
-            string txt = Path.ChangeExtension(csv, ".txt");
-            if (File.Exists(txt))
-            {
-                foreach (string line in File.ReadLines(txt))
-                {
-                    if (line.StartsWith("Continues", StringComparison.Ordinal))
-                    {
-                        string earlier = Path.Combine(Path.GetDirectoryName(csv), line.Substring("Continues".Length).Trim() + ".csv");
-                        LoadChain(earlier, into, depth + 1);
-                        break;
-                    }
-                    if (line.StartsWith("---", StringComparison.Ordinal))
-                        break;
-                }
-            }
+            string earlier = ContinuesFrom(csv);
+            if (earlier != null)
+                LoadChain(earlier, into, depth + 1);
             string place;
             into.AddRange(RecordingLoader.Load(csv, out place));
         }

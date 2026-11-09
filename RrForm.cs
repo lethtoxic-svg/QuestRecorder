@@ -292,6 +292,10 @@ namespace QuestRecorder
                     wait.Dispose();
                     try
                     {
+                        // nothing was recorded (your character was never in the world): no profile of this recording to
+                        // show - the last one's would look like this one's (the status line says what happened)
+                        if (!Recorder.IsRecording && Recorder.Status.BaseName.Length == 0)
+                            return;
                         ShowSummary();
                     }
                     catch (Exception ex)
@@ -351,6 +355,16 @@ namespace QuestRecorder
                 {
                     Updater.CheckInBackground();
                     await System.Threading.Tasks.Task.Delay(3000);
+                    // no answer yet (a slow connection: the check waits up to 20 s): wait for it rather than say "latest"
+                    for (int i = 0; i < 40 && !Updater.UpdateAvailable && Updater.LatestVersion.Length == 0 && Updater.Problem.Length == 0 && !Updater.IsGitClone(); i++)
+                        await System.Threading.Tasks.Task.Delay(500);
+                    if (Updater.UpdateAvailable)
+                        return; // the check that just finished shows the update pop-up itself (a second one here would ask twice)
+                    if (Updater.LatestVersion.Length == 0 && Updater.Problem.Length == 0 && !Updater.IsGitClone())
+                    {
+                        MessageBox.Show(this, "Still checking for updates - try again in a moment.", "Quest Recorder", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
                 }
                 if (!Updater.UpdateAvailable)
                 {
@@ -369,7 +383,10 @@ namespace QuestRecorder
             catch (Exception ex)
             {
                 RrLog.Exception("Updating Quest Recorder", ex);
-                MessageBox.Show(this, "The update did not work: " + ex.Message + "\r\nNothing was lost; your current version is still there.", "Quest Recorder update", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                // (when putting the old version back failed too, the message says where the backup is: then something was lost)
+                bool lost = ex.Message.IndexOf("failed too", StringComparison.Ordinal) >= 0;
+                MessageBox.Show(this, "The update did not work: " + ex.Message + (lost ? string.Empty : "\r\nNothing was lost; your current version is still there."),
+                                "Quest Recorder update", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 

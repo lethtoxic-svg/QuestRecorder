@@ -67,6 +67,12 @@ namespace QuestRecorder
         private string _lastCastName = string.Empty;
         private long _lastCastEndTick = long.MinValue / 2;
 
+        private bool _castMounted;
+        private bool _convoGroup;
+        // The quest log the next looks compare against was taken at the start, after the bot or after a character change:
+        // if the game had no quest list then, the first list it gives is the starting log, not a log full of pick-ups.
+        private bool _questBaseline;
+
         private readonly HashSet<ulong> _rewardSeen = new HashSet<ulong>();
         private readonly HashSet<string> _warned = new HashSet<string>(StringComparer.Ordinal);
         private int _markers;
@@ -93,6 +99,7 @@ namespace QuestRecorder
             _lastCrumb = first.Pos;
             QueueQuestLog(first, "Quest log at the start");
             TryQuestLog();
+            _questBaseline = true;
         }
 
         public void Process(Snap prev, Snap cur, bool afterLoading, long gapMs, bool afterBot)
@@ -113,6 +120,7 @@ namespace QuestRecorder
                 _lastCrumb = cur.Pos;
                 QueueQuestLog(cur, "Quest log of " + Name(cur.PlayerName));
                 TryQuestLog();
+                _questBaseline = true;
                 return;
             }
 
@@ -127,9 +135,16 @@ namespace QuestRecorder
                 _lastCrumb = cur.Pos;
                 QueueQuestLog(cur, "Quest log after the bot ran");
                 TryQuestLog();
+                _questBaseline = true;
                 return;
             }
 
+            // A conversation or mission board that closes in this very look: a quest that lands in the log (or leaves it)
+            // in the same look was still given / taken there (Quests runs before Endings, which writes the end events).
+            if (!cur.InConvo && prev.InConvo)
+                _convoEndTick = cur.Tick;
+            if (!cur.BoardOpen && prev.BoardOpen)
+                _boardCloseTick = cur.Tick;
             TryQuestLog();
             TargetPicked(cur);
             Clicks(cur);
@@ -178,7 +193,7 @@ namespace QuestRecorder
             if (_castSpec != 0 && last != null)
                 EndCast(last);
             if (_wheel != null && last != null)
-                ResolveWheel(last);
+                ResolveWheel(last, !last.InConvo);
             RecEvent e = New(EvKind.Stop, last);
             e.Note = why ?? string.Empty;
             if (_wheels > 0)
@@ -349,7 +364,7 @@ namespace QuestRecorder
                     ie.Note = "bag item";
                 else if (cur.InstantItemGone)
                     ie.Note = "item gone";
-                ie.Target = cur.CastTarget;
+                ie.Target = cur.InstantItemTarget;
                 Emit(ie);
             }
             bool newCast = cur.CastSpec != 0 && (!prev.IsCasting || prev.CastSpec != cur.CastSpec);
@@ -363,6 +378,7 @@ namespace QuestRecorder
                 _castPos = cur.Pos;
                 _castArea = cur.AreaId;
                 _castInCombat = prev.InCombat || cur.InCombat;
+                _castMounted = cur.IsMounted;
                 _castIsQuestItem = cur.QuestItemName != null;
                 _castTarget = cur.QuestItemName == null ? cur.CastTarget : null;
                 if (!_castIsQuestItem && _castTarget != null && _castTarget.Kind == ObjKind.Placeable)
@@ -392,6 +408,9 @@ namespace QuestRecorder
             long ms = cur.Tick - _castStartTick;
             _lastCastName = _castName;
             _lastCastEndTick = cur.Tick;
+            // a cast that ends with you on your mount summoned it: it was never a use of the object nearby
+            if (cur.IsMounted && !_castMounted && _castTarget != null && _castTarget.Kind == ObjKind.Placeable)
+                _castTarget = null;
             // Out-of-combat casts, plus casts on an object when a fight broke out during them.
             bool onObject = _castTarget != null && _castTarget.Kind == ObjKind.Placeable;
             if (!_castIsQuestItem && ms >= 300 && (onObject || (!_castInCombat && !cur.InCombat)))
@@ -432,12 +451,16 @@ namespace QuestRecorder
                 Emit(e);
                 moved = true;
             }
+            // dead before, alive now: a revive at a medical center (its loading screen or area change is no door)
+            bool revived = prev.IsDead && !cur.IsDead;
             if (afterLoading)
             {
                 RecEvent e = New(EvKind.Loading, cur);
                 e.DurationMs = gapMs;
                 SetFrom(e, prev);
                 e.Note = areaChanged ? "into another area" : "same area";
+                if (revived)
+                    e.Note = How.Revived + " (medical center?), " + e.Note;
                 if (cur.WonkaArrival != null)
                     e.AddDetail("after the " + cur.WonkaArrival.From.Wonka.DisplayName + " ride");
                 else if (cur.Tick - _lastCastEndTick < 30000 && _lastCastName.Length > 0)
@@ -451,10 +474,25 @@ namespace QuestRecorder
             {
                 RecEvent e = New(EvKind.AreaChange, cur);
                 SetFrom(e, prev);
+                if (revived)
+                    e.Note = How.Revived + " (medical center?)";
                 Emit(e);
                 moved = true;
             }
-            if (!moved && !cur.IsInTaxi && !prev.IsInTaxi && dist * MetresPerUnit >= Cfg.JumpMeters && dist / dt > 25.0)
+            if (afterLoading || areaChanged)
+            {
+                // what you clicked before a loading screen or in another area is no giver, partner or hand-in here
+                // (a click in this same look stays)
+                if (_lastClick != null && _lastClickTick != cur.Tick)
+                    _lastClick = null;
+            }
+            // (dist is in game units, 10 m each: 25 units/s is 250 m/s, so on its own that missed every hop under ~100 m.
+            // Out of combat, a move further than you could walk or ride in that time, and faster than 40 m/s, is a hop too:
+            // a phase door or a short teleport. In a fight leaps, charges and knockbacks move you fast, so only the old test.)
+            float metres = dist * MetresPerUnit;
+            bool hop = dist / dt > 25.0 ||
+                       (!prev.InCombat && !cur.InCombat && metres - 20.0 * dt >= Cfg.JumpMeters && metres / dt > 40.0);
+            if (!moved && !cur.IsInTaxi && !prev.IsInTaxi && metres >= Cfg.JumpMeters && hop)
             {
                 RecEvent e = New(EvKind.Jump, cur);
                 SetFrom(e, prev);
@@ -519,12 +557,29 @@ namespace QuestRecorder
 
         private void ConversationStart(Snap prev, Snap cur)
         {
-            if (!cur.InConvo || prev.InConvo)
+            if (!cur.InConvo)
                 return;
+            if (prev.InConvo)
+            {
+                if (!cur.ConvoRestarted)
+                    return;
+                // one conversation ended and the next began with no look in between (a holocall right after a talk):
+                // close the first one, so what the second one gives or takes goes to the second one
+                if (_wheel != null)
+                    ResolveWheel(cur, true);
+                RecEvent end = New(EvKind.ConvoEnd, cur);
+                end.Target = _convoPartner;
+                end.DurationMs = cur.Tick - _convoStartTick;
+                if (_convoComlink)
+                    end.Note = How.HolocomCall;
+                Emit(end);
+                _convoEndTick = cur.Tick;
+            }
             _convoPartner = cur.ConvoPartner;
             _convoComlink = cur.ConvoIsComlink;
             _offered = cur.OfferedQuestId;
             _convoStartTick = cur.Tick;
+            _convoGroup = cur.ConvoGroup;
             RecEvent e = New(EvKind.ConvoStart, cur);
             e.Target = _convoPartner;
             e.Option = cur.ConvoTypeName;
@@ -543,7 +598,7 @@ namespace QuestRecorder
         private void ReplyWheel(Snap cur)
         {
             if (_wheel != null && (!cur.InConvo || (cur.ConvoNode >= 0 && cur.ConvoNode != _wheelNode)))
-                ResolveWheel(cur);
+                ResolveWheel(cur, !cur.InConvo);
             if (cur.Replies != null && cur.Replies.Count > 0 && cur.ReplyNode != _wheelNode)
             {
                 _wheel = cur.Replies;
@@ -563,7 +618,8 @@ namespace QuestRecorder
             return wheel.Count > 0 ? wheel[0] : null;
         }
 
-        private void ResolveWheel(Snap cur)
+        /// <param name="over">The conversation ended (or another one began) right after this wheel: the pick wasn't seen.</param>
+        private void ResolveWheel(Snap cur, bool over)
         {
             List<ReplyOpt> wheel = _wheel;
             Snap at = _wheelSnap ?? cur;
@@ -573,7 +629,7 @@ namespace QuestRecorder
             _wheels++;
 
             ReplyOpt picked = null;
-            if (cur.InConvo)
+            if (!over)
             {
                 foreach (ReplyOpt o in wheel)
                     if (o.Node == cur.ConvoNode)
@@ -587,16 +643,22 @@ namespace QuestRecorder
             e.Choices = new List<string>();
             foreach (ReplyOpt o in wheel)
                 e.Choices.Add(o.ToString());
+            if (picked != null && _convoGroup)
+            {
+                // in a group conversation the reply of whoever won the roll is taken, not always yours
+                e.AddDetail("group conversation: the reply taken (" + picked.ToString() + ") may be another player's, so it is not counted as your pick");
+                picked = null;
+            }
+            else if (picked == null)
+                e.AddDetail(!over
+                    ? Fmt.Format("the conversation went on to node {0}, which is none of the replies' nodes (the reply line was skipped too fast to see)", cur.ConvoNode)
+                    : "the conversation ended right after this wheel, so the pick could not be seen");
             e.Option = picked != null ? picked.ToString() : "?";
             e.OptionGuessed = picked == null;
             e.Note = "dark auto-pick: " + (dark != null ? dark.ToString() : "?") + ", light auto-pick: " + (light != null ? light.ToString() : "?");
             if (wheel.Count == 1)
                 e.AddDetail("only one reply on this wheel: any auto-pick takes it");
-            if (picked == null)
-                e.AddDetail(cur.InConvo
-                    ? Fmt.Format("the conversation went on to node {0}, which is none of the replies' nodes (the reply line was skipped too fast to see)", cur.ConvoNode)
-                    : "the conversation ended right after this wheel, so the pick could not be seen");
-            else if (dark != null && picked.Option != dark.Option)
+            if (picked != null && dark != null && picked.Option != dark.Option)
             {
                 e.CheckFailed = true;
                 _wheelsDiffering++;
@@ -692,7 +754,7 @@ namespace QuestRecorder
                     RecEvent e = New(EvKind.Kill, cur);
                     e.Target = k.Mob;
                     if (k.TappedByOther)
-                        e.Note = "tagged by another player (no credit for you)";
+                        e.Note = "tagged by another player (the count can still be shared with you)";
                     Emit(e);
                 }
             }
@@ -704,6 +766,17 @@ namespace QuestRecorder
         {
             if (!cur.QuestsAvailable)
                 return;
+            if (_questBaseline)
+            {
+                _questBaseline = false;
+                if (!prev.QuestsAvailable && prev.Quests.Count == 0)
+                {
+                    // the game gave no quest list on the look this recording (or the bot gap, or the new character)
+                    // started from - dead, or still loading: this list is what you already had, not that many pick-ups
+                    QueueQuestLog(cur, _questLogTitle);
+                    return;
+                }
+            }
             var prevById = new Dictionary<ulong, QSnap>();
             foreach (QSnap q in prev.Quests)
                 prevById[q.QuestId] = q;
@@ -1078,6 +1151,7 @@ namespace QuestRecorder
             if (s != null)
             {
                 e.Time = s.Time;
+                e.Tick = s.Tick;
                 e.Pos = s.Pos;
                 e.Heading = s.Heading;
                 e.AreaId = s.AreaId;
@@ -1086,6 +1160,7 @@ namespace QuestRecorder
             else
             {
                 e.Time = DateTime.Now;
+                e.Tick = Environment.TickCount64;
             }
             return e;
         }

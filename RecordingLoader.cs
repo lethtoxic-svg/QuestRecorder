@@ -111,11 +111,13 @@ namespace QuestRecorder
                     e.Time = when;
                 e.Pos = new Vec3(F(c("x")), F(c("y")), F(c("z")));
                 e.Heading = F(c("heading_deg"));
+                e.AreaId = U(c("area_id"));
                 e.AreaName = c("area_name");
                 if (place.Length == 0 && e.AreaName.Length > 0)
                     place = e.AreaName;
                 e.QuestId = U(c("quest_id"));
                 e.QuestName = c("quest_name");
+                e.QuestFqn = c("quest_fqn"); // the quest's internal name (the same in every client language)
                 string hid = c("quest_hidden");
                 e.QuestHidden = hid == "True" || hid == "true" || hid == "yes";
                 e.Branch = U(c("branch"));
@@ -183,6 +185,8 @@ namespace QuestRecorder
                 {
                     e.HasFrom = true;
                     e.FromPos = new Vec3(F(c("before_x")), F(c("before_y")), F(c("before_z")));
+                    e.FromArea = U(c("before_area_id")); // the area you came from (a door into another area)
+                    e.FromAreaName = c("before_area_name");
                 }
                 if (c("stand_x").Length > 0)
                 {
@@ -190,6 +194,26 @@ namespace QuestRecorder
                     e.Stand = new Vec3(F(c("stand_x")), F(c("stand_y")), F(c("stand_z")));
                 }
                 events.Add(e);
+            }
+
+            // elapsed_s has one decimal, the time column the milliseconds: the time between two rows gives the exact
+            // spacing (as the live recorder had it), kept within elapsed_s's rounding so a clock change never moves a row
+            DateTime lastTime = default(DateTime);
+            double lastElapsed = 0;
+            foreach (RecEvent e in events)
+            {
+                if (e.Time == default(DateTime))
+                {
+                    lastTime = default(DateTime);
+                    continue;
+                }
+                if (lastTime != default(DateTime))
+                {
+                    double t = lastElapsed + (e.Time - lastTime).TotalSeconds;
+                    e.Elapsed = Math.Max(e.Elapsed - 0.05, Math.Min(e.Elapsed + 0.05, t));
+                }
+                lastTime = e.Time;
+                lastElapsed = e.Elapsed;
             }
 
             // Elevator floors are only in the timeline (.txt) next to the .csv: "elevator on floor 1, floors: A | B"
@@ -249,20 +273,16 @@ namespace QuestRecorder
             return MakeProfile(csvPath, baseDir, profileFolderSetting, out problems);
         }
 
-        /// <summary>Builds the ready profile from a recording .csv with the plugin's own builder; problems = what keeps it
-        /// from running on plain BuddyCron (empty = finished).</summary>
-        public static string MakeProfile(string csvPath, string baseDir, string profileFolderSetting, out string[] problemsOut)
+        /// <summary>
+        /// "Place-yyyy-MM-dd_HH-mm(-n)": the place, when the recording started, and " n" for a second one started in the
+        /// same minute. False when the name isn't like that (a renamed file).
+        /// </summary>
+        private static bool ParseStem(string baseName, out string place, out DateTime started, out string extra)
         {
-            problemsOut = new string[0];
-            string place;
-            List<RecEvent> events = Load(csvPath, out place);
-            if (events.Count == 0)
-                throw new InvalidDataException("No events in " + Path.GetFileName(csvPath));
-            string baseName = Path.GetFileNameWithoutExtension(csvPath);
-            // when the recording started: from the file name (Place-yyyy-MM-dd_HH-mm), else the file time
-            DateTime started = File.GetLastWriteTime(csvPath);
+            place = string.Empty;
+            started = default(DateTime);
+            extra = string.Empty;
             string stemName = baseName;
-            string extra = string.Empty;
             int lastDash = baseName.LastIndexOf('-');
             int tail;
             if (lastDash > 0 && baseName.Length - lastDash <= 3 && int.TryParse(baseName.Substring(lastDash + 1), out tail) && baseName.Length - 16 - (baseName.Length - lastDash) > 0)
@@ -278,18 +298,101 @@ namespace QuestRecorder
             }
             int dash = stemName.Length - 16;
             DateTime parsed;
-            if (dash > 0 && DateTime.TryParseExact(stemName.Substring(dash), "yyyy-MM-dd_HH-mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+            if (dash > 1 && stemName[dash - 1] == '-' &&
+                DateTime.TryParseExact(stemName.Substring(dash), "yyyy-MM-dd_HH-mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+            {
                 started = parsed;
+                place = stemName.Substring(0, dash - 1);
+                return true;
+            }
+            extra = string.Empty;
+            return false;
+        }
+
+        /// <summary>Builds the ready profile from a recording .csv with the plugin's own builder; problems = what keeps it
+        /// from running on plain BuddyCron (empty = finished).</summary>
+        public static string MakeProfile(string csvPath, string baseDir, string profileFolderSetting, out string[] problemsOut)
+        {
+            problemsOut = new string[0];
+            // A recording that carried on an earlier one (or was carried on later) made one profile from all its parts:
+            // the remake does the same, timed from the last part as the live recorder was.
+            List<string> parts = RecordingSession.PartsOf(csvPath, true);
+            string last = parts[parts.Count - 1];
+            string root = parts[0];
+            string place;
+            List<RecEvent> events = Load(last, out place);
+            if (events.Count == 0)
+                throw new InvalidDataException("No events in " + Path.GetFileName(last));
+            if (parts.Count > 1)
+            {
+                DateTime lastStart = default(DateTime);
+                foreach (RecEvent e in events)
+                {
+                    if (e.Time != default(DateTime))
+                    {
+                        lastStart = e.Time.AddSeconds(-e.Elapsed);
+                        break;
+                    }
+                }
+                var earlier = new List<RecEvent>();
+                for (int i = 0; i < parts.Count - 1; i++)
+                {
+                    string ignored;
+                    earlier.AddRange(Load(parts[i], out ignored));
+                }
+                double newest = double.MinValue;
+                foreach (RecEvent e in earlier)
+                {
+                    e.Elapsed = e.Time != default(DateTime) && lastStart != default(DateTime) ? (e.Time - lastStart).TotalSeconds : e.Elapsed - 1000000;
+                    if (e.Elapsed > newest)
+                        newest = e.Elapsed;
+                }
+                if (newest >= 0)
+                {
+                    // the clock went back between the parts (summer time ended): the earlier parts still come first
+                    foreach (RecEvent e in earlier)
+                        e.Elapsed -= newest + 1.0;
+                }
+                earlier.AddRange(events);
+                events = earlier;
+                RrLog.Info("{0} is one of {1} recordings that carry each other on: the profile is made from all of them.",
+                    Path.GetFileName(csvPath), parts.Count);
+            }
+            // named like the live recorder named it: after the first part (that is the file it kept writing)
+            string baseName = Path.GetFileNameWithoutExtension(root);
+            DateTime started;
+            string extra;
+            string stemPlace;
+            if (ParseStem(baseName, out stemPlace, out started, out extra))
+            {
+                if (stemPlace.Length > 0)
+                    place = stemPlace; // the place the live recorder filed it under (the planet), not the first area's name
+            }
+            else
+            {
+                started = File.GetLastWriteTime(root);
+            }
             if (place.Length == 0)
-                place = dash > 1 ? stemName.Substring(0, dash - 1) : "Recording";
+                place = "Recording";
 
             var safe = new StringBuilder();
             foreach (char ch in place)
                 safe.Append(Array.IndexOf(Path.GetInvalidFileNameChars(), ch) >= 0 ? '-' : ch);
             string folder = null;
-            string chosen = profileFolderSetting ?? string.Empty;
-            if (chosen.Trim().Length > 0)
+            string chosen = RrSettings.CleanPath(profileFolderSetting);
+            if (chosen.Length > 0)
+            {
                 folder = Path.IsPathRooted(chosen) ? chosen : Path.Combine(baseDir, chosen);
+                try
+                {
+                    Directory.CreateDirectory(folder);
+                }
+                catch (Exception ex)
+                {
+                    RrLog.Warn("The profile folder \"{0}\" can't be used ({1}); using the default one.", folder, ex.Message);
+                    folder = null;
+                }
+            }
             if (folder == null)
                 folder = RecordingSession.FindPlaceFolder(baseDir, place);
             if (folder == null)
@@ -297,14 +400,46 @@ namespace QuestRecorder
             Directory.CreateDirectory(folder);
             string fileName = safe + " - Recorded " + started.ToString("yyyy-MM-dd HH-mm", CultureInfo.InvariantCulture) + extra + ".xml";
             string path = Path.Combine(folder, fileName);
+            try
+            {
+                // the profile the live recorder saved this recording in (its .txt footer says): the remake replaces that one
+                string saved = RecordingSession.FooterProfile(Path.ChangeExtension(last, ".txt"));
+                if (saved != null && saved.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) && Directory.Exists(Path.GetDirectoryName(saved)))
+                {
+                    path = saved;
+                    folder = Path.GetDirectoryName(saved);
+                    fileName = Path.GetFileName(saved);
+                }
+            }
+            catch (Exception ex)
+            {
+                RrLog.Debug("Reading where the profile was saved: {0}", ex.Message);
+            }
             string name = place + " - Recorded " + started.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
             List<string> problems;
-            string text = ReplayBuilder.Build(events, name, fileName, baseName, out problems);
+            string text = ReplayBuilder.Build(events, name, fileName, Path.GetFileNameWithoutExtension(last), out problems);
             problemsOut = problems.ToArray();
-            RecordingSession.LiveProblems = problemsOut;
-            File.WriteAllText(path, text, new UTF8Encoding(false));
-            RecordingSession.LiveTrace = ReplayBuilder.Trace(events).ToArray(); // show it in the task tracker
-            RecordingSession.LiveProfile = path;
+            if (File.Exists(path))
+            {
+                // the profile you have (maybe fixed in the control panel or the review list) is kept: Undo in the control
+                // panel puts it back
+                string old = File.ReadAllText(path);
+                if (!string.Equals(old, text, StringComparison.Ordinal))
+                {
+                    // a new file every time (to the millisecond, numbered if taken): a second remake never overwrites the first backup
+                    string kept = ProfileEditor.NewBackupPath(path, "before fix remake");
+                    File.Copy(path, kept, false);
+                    RrLog.Info("Your earlier {0} is kept in {1} (Undo in the control panel puts it back).", fileName, kept);
+                }
+            }
+            RecordingSession.WriteWhole(path, text);
+            if (!Recorder.IsRecording)
+            {
+                // show it in the task tracker (never while a recording is going on: the tracker and the review list are that recording's)
+                RecordingSession.LiveProblems = problemsOut;
+                RecordingSession.LiveTrace = ReplayBuilder.Trace(events).ToArray();
+                RecordingSession.LiveProfile = path;
+            }
             return path;
         }
     }

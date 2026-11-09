@@ -264,10 +264,93 @@ namespace QuestRecorder
             return null;
         }
 
+        /// <summary>
+        /// The quest step a profile step is for (its condition, else its StepId), so a step added in front of it waits for
+        /// the same one, not for where you are in the quest now. Branch 0 = the step says no branch.
+        /// </summary>
+        private static bool StepOf(ProfileEditor.StepView s, ulong quest, out ulong branch, out ulong step)
+        {
+            branch = 0;
+            step = 0;
+            if (s == null || s.Node == null)
+                return false;
+            string xml = s.Node.OuterXml;
+            string q = System.Text.RegularExpressions.Regex.Escape(Fmt.Hex(quest));
+            var ic = System.Text.RegularExpressions.RegexOptions.IgnoreCase;
+            System.Text.RegularExpressions.Match m = System.Text.RegularExpressions.Regex.Match(xml, @"IsBranchStepComplete\(\s*" + q + @"\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", ic);
+            if (m.Success && ulong.TryParse(m.Groups[1].Value, out branch) && ulong.TryParse(m.Groups[2].Value, out step))
+                return true;
+            m = System.Text.RegularExpressions.Regex.Match(xml, @"(?:IsStepComplete|IsTaskComplete|IsTaskValueGreaterThan)\(\s*" + q + @"\s*,\s*(\d+)", ic);
+            branch = 0;
+            if (m.Success && ulong.TryParse(m.Groups[1].Value, out step))
+                return true;
+            foreach (System.Xml.XmlNode n in s.Node.SelectNodes("descendant-or-self::*[@StepId]"))
+            {
+                var el = (System.Xml.XmlElement)n;
+                if (!string.Equals(el.GetAttribute("QuestId"), Fmt.Hex(quest), StringComparison.OrdinalIgnoreCase) || !ulong.TryParse(el.GetAttribute("StepId"), out step))
+                    continue;
+                if (!ulong.TryParse(el.GetAttribute("BranchId"), out branch))
+                    branch = 0;
+                return true;
+            }
+            step = 0;
+            return false;
+        }
+
+        /// <summary>The open profile is the one the recorder is writing right now (it writes it again as you play).</summary>
+        private bool BeingRecorded()
+        {
+            if (_ed == null || !Recorder.IsRecording)
+                return false;
+            string live = RecordingSession.LiveProfile;
+            if (string.IsNullOrEmpty(live))
+                return false;
+            try
+            {
+                return string.Equals(Path.GetFullPath(live), Path.GetFullPath(_ed.Path), StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private const string BeingRecordedText = "This profile is being recorded right now: the recorder writes it again as you play, so a change made now would be lost. " +
+                                                 "Stop recording first, then fix it here.";
+
+        /// <summary>A profile is open and nothing else is writing it right now.</summary>
+        private bool CanChange()
+        {
+            if (!Ready())
+                return false;
+            if (!BeingRecorded())
+                return true;
+            Say(BeingRecordedText);
+            return false;
+        }
+
+        /// <summary>Reads the profile again from the file (what's in it now), keeping the picked line.</summary>
+        private void Reload(int select)
+        {
+            try
+            {
+                if (_ed == null)
+                    return;
+                _ed = ProfileEditor.Open(_ed.Path);
+                ShowSteps(select);
+            }
+            catch (Exception ex)
+            {
+                Say("Could not read the profile again: " + ex.Message);
+            }
+        }
+
+        private const string ChangedWhileAsking = "The profile was saved somewhere else while that question was open, so nothing was changed. The list shows the newest version: pick the step again.";
+
         /// <summary>One big button: picks the action, the quest step and the details by itself, then adds the step.</summary>
         private void QuickAdd(Act a)
         {
-            if (!Ready())
+            if (!CanChange())
                 return;
             if (Selected() == null && _steps.SelectedIndex < 0)
             {
@@ -289,11 +372,22 @@ namespace QuestRecorder
             _quest.SelectedIndex = 0;
             if (q != null)
             {
+                QuestChoice chosen = null;
                 for (int i = 0; i < _quest.Items.Count; i++)
                 {
                     var c = _quest.Items[i] as QuestChoice;
                     if (c != null && c.Id == q.Id)
+                    {
                         _quest.SelectedIndex = i;
+                        chosen = c;
+                    }
+                }
+                // until the picked step's own quest step is done (you may be further on in the quest by now)
+                ulong b, st;
+                if (chosen != null && StepOf(Selected(), q.Id, out b, out st))
+                {
+                    chosen.Branch = b;
+                    chosen.Step = st;
                 }
             }
             if (a == Wait)
@@ -394,7 +488,7 @@ namespace QuestRecorder
 
         private void OnRemove(object sender, EventArgs e)
         {
-            if (!Ready())
+            if (!CanChange())
                 return;
             ProfileEditor.StepView s = Selected();
             if (s == null)
@@ -402,8 +496,14 @@ namespace QuestRecorder
                 Say("Pick the step to remove.");
                 return;
             }
+            ProfileEditor ed = _ed;
             if (MessageBox.Show(this, "Remove this step?\r\n\r\n" + s.Text, "Profile Control Panel", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
                 return;
+            if (!ReferenceEquals(ed, _ed))
+            {
+                Say(ChangedWhileAsking); // the list was read again meanwhile: that step belongs to the old copy
+                return;
+            }
             int at = _steps.SelectedIndex;
             _ed.Remove(s);
             SaveAndShow(at, "Step removed.");
@@ -411,7 +511,7 @@ namespace QuestRecorder
 
         private void OnMove(int dir)
         {
-            if (!Ready())
+            if (!CanChange())
                 return;
             ProfileEditor.StepView s = Selected();
             if (s == null)
@@ -426,7 +526,7 @@ namespace QuestRecorder
 
         private void OnUndo(object sender, EventArgs e)
         {
-            if (!Ready())
+            if (!CanChange())
                 return;
             try
             {
@@ -450,6 +550,20 @@ namespace QuestRecorder
         {
             try
             {
+                if (BeingRecorded())
+                {
+                    Reload(select); // the change stays out (the recorder would write over it)
+                    Say(BeingRecordedText);
+                    return;
+                }
+                if (_ed.ChangedOnDisk())
+                {
+                    // the recorder, Record from here or the review list saved it after this list read it: saving this
+                    // copy would throw their steps away
+                    Reload(select);
+                    Say(ProfileEditor.ChangedOnDiskText + " Nothing was changed, so nothing is lost: the list now shows the newest version. Make your change again.");
+                    return;
+                }
                 _ed.Save();
                 string path = _ed.Path;
                 _ed = ProfileEditor.Open(path); // re-read what was written
@@ -458,6 +572,7 @@ namespace QuestRecorder
             }
             catch (Exception ex)
             {
+                Reload(select); // the change that couldn't be saved doesn't stay in the list (every later save would fail too)
                 Say("Saving failed: " + ex.Message);
             }
         }
@@ -476,11 +591,11 @@ namespace QuestRecorder
                     {
                         _steps.SelectedIndex = i;
                         _steps.TopIndex = Math.Max(0, i - 3);
-                        Say("This is the step from the tracker. Replace it, or add what's missing before it.");
+                        Say(BeingRecorded() ? BeingRecordedText : "This is the step from the tracker. Replace it, or add what's missing before it.");
                         return;
                     }
                 }
-                Say("Opened the profile, but couldn't find that exact step - pick it from the list.");
+                Say(BeingRecorded() ? BeingRecordedText : "Opened the profile, but couldn't find that exact step - pick it from the list.");
             }
             catch (Exception ex)
             {
@@ -488,7 +603,7 @@ namespace QuestRecorder
             }
         }
 
-        /// <summary>Record just the missing bit: what you play next goes into this profile before the picked step.</summary>
+        /// <summary>Record just the missing bit: what you play next goes into this profile after the picked step.</summary>
         private void OnRecordFromHere(object sender, EventArgs e)
         {
             if (!Ready())
@@ -499,24 +614,44 @@ namespace QuestRecorder
                 Say("Tick Quest Recorder in BuddyCron's plugin list first.");
                 return;
             }
+            string target = _ed.Path;
             ProfileEditor.StepView at = Selected();
             if (MessageBox.Show(this, "Record just the bit the bot got wrong?\r\n\r\nPlay only that part, then press Stop recording in the Quest Recorder window. " +
-                                      "What you did goes into this profile " + (at != null ? "before:\r\n" + at.Text : "at the end") + ".",
+                                      "What you did goes into this profile " + (at != null ? "after:\r\n" + at.Text : "at the end") + ".",
                     "Record from here", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK)
                 return;
             try
             {
-                Merge.Begin(_ed.Path, at != null ? at.Node.OuterXml : null, at != null && at.Comment != null ? at.Comment.Value.Trim() : null);
-                if (Recorder.IsRecording)
-                    Recorder.StopAndWait(4000, "starting Record from here", false);
-                string msg = plugin.StartRecording();
-                if (!Recorder.IsRecording)
+                // the recording going on now ends first (a bit being recorded goes into its own profile, with its own target)
+                if (Recorder.IsRecording && !Recorder.StopAndWait(4000, "starting Record from here", false))
                 {
+                    Say("The last recording is still saving its files. Press Record from here again in a moment.");
+                    return;
+                }
+                Merge.Begin(target, at != null ? at.Node.OuterXml : null, at != null && at.Comment != null ? at.Comment.Value.Trim() : null);
+                Recorder before = Recorder.Current;
+                string msg = plugin.StartRecording();
+                Recorder now = Recorder.Current;
+                if (now == null || ReferenceEquals(now, before))
+                {
+                    // nothing new is recording ("still saving", "already recording"): the bit can't go anywhere
                     Merge.TargetPath = null;
                     Say("Couldn't start recording: " + msg);
                     return;
                 }
-                Say("Recording just this bit - play the missing part, then press Stop recording. It goes in by itself.");
+                Merge.BindTo(now);
+                bool bot;
+                try
+                {
+                    bot = Recorder.BotOwnsGame();
+                }
+                catch
+                {
+                    bot = false;
+                }
+                Say(bot
+                    ? "Recording just this bit, but the bot is running: the recorder waits until you stop the bot. Then play the missing part and press Stop recording."
+                    : "Recording just this bit - play the missing part, then press Stop recording. It goes in after the step you picked by itself.");
             }
             catch (Exception ex)
             {
@@ -527,7 +662,7 @@ namespace QuestRecorder
 
         private void OnReplace(object sender, EventArgs e)
         {
-            if (!Ready())
+            if (!CanChange())
                 return;
             ProfileEditor.StepView old = Selected();
             if (old == null)
@@ -535,25 +670,36 @@ namespace QuestRecorder
                 Say("Pick the step to replace.");
                 return;
             }
+            ProfileEditor ed = _ed;
             try
             {
                 GameView g = ReadGame(false);
                 _last = g;
-                string xml, what, problem;
-                if (!Build(g, true, out xml, out what, out problem) || xml == null)
+                string xml, header, what, label, problem;
+                if (!Build(g, true, out xml, out header, out what, out label, out problem) || xml == null)
                 {
                     Say(problem ?? "Something is missing.");
                     return;
                 }
                 if (MessageBox.Show(this, "Replace this step:\r\n\r\n" + old.Text + "\r\n\r\nwith: the bot will " + what, "Profile Control Panel", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
                     return;
+                if (!ReferenceEquals(ed, _ed))
+                {
+                    Say(ChangedWhileAsking); // the list was read again meanwhile: that step belongs to the old copy
+                    return;
+                }
                 int at = _steps.SelectedIndex;
-                _ed.Add(xml, "Changed with the control panel: " + what, old);
+                if (header != null)
+                    _ed.AddToHeader("GrindAreas", header);
+                // the step keeps its own label (the task tracker finds it by it)
+                _ed.Add(xml, old.Comment != null ? old.Comment.Value.Trim() : label, old);
                 _ed.Remove(old);
                 SaveAndShow(at, "Replaced: the bot will " + what);
             }
             catch (Exception ex)
             {
+                if (ReferenceEquals(ed, _ed))
+                    Reload(_steps.SelectedIndex); // nothing half-done stays in the list
                 Say("Could not replace it: " + ex.Message);
             }
         }
@@ -688,6 +834,13 @@ namespace QuestRecorder
             {
                 if (!Visible)
                     return;
+                // saved somewhere else (the recorder, Record from here, the review list): show what's in the file now.
+                // Every change here is saved straight away, so there is nothing of ours to lose.
+                if (_ed != null && _ed.ChangedOnDisk() && File.Exists(_ed.Path))
+                {
+                    Reload(_steps.SelectedIndex);
+                    Say(BeingRecorded() ? BeingRecordedText : "The profile was saved somewhere else (the recorder, Record from here or the review list): the list shows the newest version.");
+                }
                 _last = ReadGame(false);
                 if (!_last.InGame)
                     _game.Text = "Not in the game (or BuddyCron is not attached).";
@@ -842,8 +995,8 @@ namespace QuestRecorder
         {
             try
             {
-                string xml, what, problem;
-                Build(_last, false, out xml, out what, out problem);
+                string xml, header, what, label, problem;
+                Build(_last, false, out xml, out header, out what, out label, out problem);
                 _preview.ForeColor = problem != null ? Color.Firebrick : SystemColors.ControlText;
                 _preview.Text = problem ?? what;
             }
@@ -854,11 +1007,17 @@ namespace QuestRecorder
             }
         }
 
-        /// <summary>Builds the step for the chosen action. Returns false with a reason when something is missing.</summary>
-        private bool Build(GameView g, bool forReal, out string xml, out string what, out string problem)
+        /// <summary>
+        /// Builds the step for the chosen action: its XML, what goes in the profile's header with it (a fight's GrindArea,
+        /// else null), what the bot will do in words, and the step's short label. Returns false with a reason when
+        /// something is missing.
+        /// </summary>
+        private bool Build(GameView g, bool forReal, out string xml, out string header, out string what, out string label, out string problem)
         {
             xml = null;
+            header = null;
             what = null;
+            label = null;
             problem = null;
             Act a = Current();
             if (a == null || a.Header)
@@ -890,70 +1049,88 @@ namespace QuestRecorder
                 return false;
             }
             float tx = g.TargetPos.X, ty = g.TargetPos.Y, tz = g.TargetPos.Z, mx = g.Me.X, my = g.Me.Y, mz = g.Me.Z;
+            // the label: a short quest-step name, like the recorder's own ("Pick up X", "Quest: Click Y")
+            string of = q.Id != 0 ? q.Name + ": " : string.Empty;
             if (a == PickUp)
             {
-                xml = ProfileEditor.PickUp(q.Name, q.Id, g.TargetName, g.TargetIsObject, tx, ty, tz);
+                xml = ProfileEditor.PickUp(q.Name, q.Id, g.TargetName, g.TargetIsObject, tx, ty, tz, mx, my, mz);
                 what = "pick up \"" + q.Name + "\" from " + g.TargetName + " (skipped if you already have it or did it).";
+                label = "Pick up " + q.Name;
             }
             else if (a == HandIn)
             {
                 xml = ProfileEditor.HandIn(q.Name, q.Id, g.TargetName, g.TargetIsObject, tx, ty, tz);
                 what = "hand in \"" + q.Name + "\" to " + g.TargetName + " and take the reward.";
+                label = "Hand in " + q.Name;
             }
             else if (a == Reward)
             {
                 xml = ProfileEditor.Reward(q.Id);
                 what = "wait for the reward window of \"" + q.Name + "\" and accept it.";
+                label = "Reward: " + q.Name;
             }
             else if (a == Holo)
             {
                 xml = ProfileEditor.Holocom(q.Name, q.Id);
                 what = "answer the holocom call for \"" + q.Name + "\".";
+                label = "Holocom: " + q.Name;
             }
             else if (a == Use)
             {
-                xml = ProfileEditor.ClickObject(g.TargetName, tx, ty, tz, q.Id, q.Branch, q.Step);
+                xml = ProfileEditor.ClickObject(g.TargetName, tx, ty, tz, mx, my, mz, q.Id, q.Branch, q.Step);
                 what = "use " + g.TargetName + until + ".";
+                label = of + "Click " + g.TargetName;
             }
             else if (a == Once)
             {
-                xml = ProfileEditor.ClickObject(g.TargetName, tx, ty, tz, 0, 0, 0);
-                what = "click " + g.TargetName + " once.";
+                xml = ProfileEditor.ClickObject(g.TargetName, tx, ty, tz, mx, my, mz, 0, 0, 0);
+                what = "walk up to " + g.TargetName + " and click it once.";
+                label = "Click " + g.TargetName;
             }
             else if (a == Talk)
             {
                 xml = ProfileEditor.TalkTo(g.TargetName, tx, ty, tz, q.Id, q.Branch, q.Step);
                 what = "talk to " + g.TargetName + until + ".";
+                label = of + "Talk to " + g.TargetName;
             }
             else if (a == Fight)
             {
-                xml = ProfileEditor.Fight(g.TargetName, tx, ty, tz, q.Id, q.Branch, q.Step);
+                // the fight's area goes in the header under a name of its own (Grind finds it by GrindRef)
+                string area = _ed != null ? _ed.UniqueHeaderName("GrindAreas", g.TargetName) : g.TargetName;
+                header = ProfileEditor.FightArea(area, g.TargetName, tx, ty, tz);
+                xml = ProfileEditor.Fight(area, q.Id, q.Branch, q.Step);
                 what = "fight " + g.TargetName + " mobs around here" + until + ".";
+                label = of + "Fight " + g.TargetName;
             }
             else if (a == ItemHere)
             {
                 xml = ProfileEditor.UseMissionItem(detail, mx, my, mz, q.Id, q.Branch, q.Step);
                 what = "use " + detail + " where you are standing" + until + ".";
+                label = of + "Use " + detail;
             }
             else if (a == ItemOn)
             {
                 xml = ProfileEditor.UseItemOn(detail, g.TargetName, mx, my, mz, q.Id, q.Branch, q.Step);
                 what = "use " + detail + " on " + g.TargetName + " around here" + until + ".";
+                label = of + "Use " + detail + " on " + g.TargetName;
             }
             else if (a == Walk && detail == WalkNoFight)
             {
                 xml = ProfileEditor.WalkNoFight(mx, my, mz, q.Id, q.Branch, q.Step);
                 what = "walk to where you are standing without stopping to fight" + until + ".";
+                label = of + "Walk point";
             }
             else if (a == Walk)
             {
                 xml = ProfileEditor.WalkHere(mx, my, mz, q.Id, q.Branch, q.Step);
                 what = "walk to where you are standing" + until + ".";
+                label = of + "Walk point";
             }
             else if (a == Planet)
             {
                 xml = ProfileEditor.FlyTo(detail);
                 what = "fly to " + detail + ".";
+                label = "Fly to " + detail;
             }
             else if (a == Wait)
             {
@@ -965,16 +1142,19 @@ namespace QuestRecorder
                 }
                 xml = ProfileEditor.Wait(sec);
                 what = "wait " + sec + " seconds.";
+                label = "Wait " + sec + " s";
             }
             else if (a == Msg)
             {
                 xml = ProfileEditor.Message(detail);
                 what = "pause and show \"" + detail + "\" until the player presses Continue.";
+                label = "Pause";
             }
             else if (a == Stop)
             {
                 xml = ProfileEditor.StopBot(detail);
                 what = "show \"" + detail + "\" and stop the bot.";
+                label = "End";
             }
             else if (a == LoadAct)
             {
@@ -989,6 +1169,7 @@ namespace QuestRecorder
                     }
                     xml = ProfileEditor.LoadOther(path);
                     what = "switch to " + path + ".";
+                    label = "Load " + Path.GetFileNameWithoutExtension(path);
                 }
             }
             else
@@ -1009,34 +1190,49 @@ namespace QuestRecorder
                     dlg.InitialDirectory = Path.GetDirectoryName(_ed.Path);
                 if (dlg.ShowDialog(this) != DialogResult.OK)
                     return null;
-                // same folder: just the file name, so the pair of profiles can be moved together
+                // same folder: just the file name, so the pair of profiles can be moved together (what hand-made profiles do)
                 if (_ed != null && string.Equals(Path.GetDirectoryName(dlg.FileName), Path.GetDirectoryName(_ed.Path), StringComparison.OrdinalIgnoreCase))
                     return Path.GetFileName(dlg.FileName);
+                if (RelativeLoadPaths && _ed != null)
+                    return Path.GetRelativePath(Path.GetDirectoryName(_ed.Path), dlg.FileName);
+                MessageBox.Show(this, "That profile is in another folder, so this step holds its full path on this PC:\r\n\r\n" + dlg.FileName +
+                                      "\r\n\r\nIt works here, but not on another PC (and the path shows your Windows user name). " +
+                                      "To share the two, put both profiles in the same folder and add this step again.",
+                    "Profile Control Panel", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return dlg.FileName;
             }
         }
 
+        /// <summary>
+        /// Off: a profile in another folder is written with its full path. On: as a path from this profile's folder
+        /// ("..\\Other\\X.xml"). Hand-made profiles only use a file name next to the profile, so it isn't known yet that
+        /// BuddyCron's LoadProfile reads a path from the profile's folder - turn on once checked on the PC.
+        /// </summary>
+        public static bool RelativeLoadPaths = false;
+
         private void OnAdd(object sender, EventArgs e)
         {
-            if (!Ready())
+            if (!CanChange())
                 return;
             try
             {
                 GameView g = ReadGame(false);
                 _last = g;
-                string xml, what, problem;
-                if (!Build(g, true, out xml, out what, out problem) || xml == null)
+                string xml, header, what, label, problem;
+                if (!Build(g, true, out xml, out header, out what, out label, out problem) || xml == null)
                 {
                     Say(problem ?? "Something is missing.");
                     return;
                 }
-                var q = _quest.SelectedItem as QuestChoice ?? new QuestChoice();
                 int at = _steps.SelectedIndex;
-                _ed.Add(xml, "Added with the control panel: " + what + (q.Id != 0 && what.IndexOf(q.Name, StringComparison.Ordinal) < 0 ? " (" + q.Name + ")" : string.Empty), Selected());
+                if (header != null)
+                    _ed.AddToHeader("GrindAreas", header);
+                _ed.Add(xml, label, Selected());
                 SaveAndShow(at, "Added: the bot will " + what);
             }
             catch (Exception ex)
             {
+                Reload(_steps.SelectedIndex); // nothing half-added stays in the list
                 Say("Could not add it: " + ex.Message);
             }
         }

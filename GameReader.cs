@@ -84,6 +84,8 @@ namespace QuestRecorder
             public long LastListedTick;
             public bool Checked;
             public bool WasDead;
+            /// <summary>Only ever seen as your target out of a fight (never attacking you or your companion).</summary>
+            public bool OnlyTargeted;
         }
 
         /// <summary>Read problems collected during the last look (logged by the recorder after the lock).</summary>
@@ -140,8 +142,10 @@ namespace QuestRecorder
             return q.ToString("X16") + ":" + b.ToString() + ":" + s.ToString();
         }
 
-        /// <summary>Forget everything tied to the character (another character logged in).</summary>
-        public void ResetCharacter()
+        /// <summary>Forget everything tied to the character (another character logged in, or the bot takes over).</summary>
+        /// <param name="keepAbilityBaseline">The bot starts on this same character: keep the abilities you had when the
+        /// recording began, so a quest ability you got before or during the bot run is still new afterwards.</param>
+        public void ResetCharacter(bool keepAbilityBaseline)
         {
             _tracked.Clear();
             _lastClick = null;
@@ -165,17 +169,37 @@ namespace QuestRecorder
             _goneQueue.Clear();
             _wasQuestItem.Clear();
             _castItemName = null;
-            _baseAbilities = null;
+            if (!keepAbilityBaseline)
+            {
+                _baseAbilities = null;
+                _questAbilities.Clear();
+                _mountCasts.Clear();
+            }
+            _abilityCastSeen.Clear();
+            _curCastName = null;
             _abilityName.Clear();
             _abilityFails = 0;
             _abilityOff = false;
             _abilityCd.Clear();
             _abilityUsedAt.Clear();
             _equipped = null;
-            _logItemName = null;
+            _logItemsSeen.Clear();
+            SkipCombatLog();
             _instName = null;
             _questEmptyReads = 0;
             _bagEmptyReads = 0;
+            _questLogEmptyReads = 0;
+            _questNoListSince = NeverRead;
+        }
+
+        /// <summary>Read the game's combat log from its end again: nothing written while the bot played or while the
+        /// recorder was paused is taken as a use of yours now.</summary>
+        public void SkipCombatLog()
+        {
+            _logPath = null;
+            _logRest = string.Empty;
+            _logQueue.Clear();
+            _logTargetName = null;
         }
 
         // item uses: the item whose cast was recorded (its end isn't a second use), items that left the bags waiting to be
@@ -186,6 +210,10 @@ namespace QuestRecorder
         private readonly HashSet<string> _wasQuestItem = new HashSet<string>(StringComparer.Ordinal);
         private int _questEmptyReads;
         private int _bagEmptyReads;
+        private int _questLogEmptyReads; // empty reads of the quest log in a row
+        private long _questNoListSince = NeverRead; // first empty read while no list was taken yet
+        private const long QuestEmptySettleMs = 8000;
+        private int _newTitles; // titles of quests that just appeared, read this look outside the budget
 
         // ------------------------------------------------------------------ per-look budget
 
@@ -213,6 +241,7 @@ namespace QuestRecorder
         {
             _optionalItems = 0;
             _engineItems = 0;
+            _newTitles = 0;
             _readSw.Restart();
             var s = new Snap();
             s.Time = DateTime.Now;
@@ -221,7 +250,7 @@ namespace QuestRecorder
             if (prev != null && prev.PlayerId != s.PlayerId)
             {
                 // Another character: a fresh baseline.
-                ResetCharacter();
+                ResetCharacter(false);
                 prev = null;
             }
 
@@ -261,6 +290,9 @@ namespace QuestRecorder
                 _propOwners.Clear();
                 Part("area", () => EnsureArea(s.AreaId));
             }
+            // what you clicked before a loading screen or in another area: never what you talk to, use or open here
+            if (afterLoading || prev == null || prev.AreaId != s.AreaId)
+                _lastClick = null;
 
             Part("quests", () => ReadQuests(me, prev, cfg, s));
             if (!s.QuestsAvailable && prev != null && s.Quests.Count == 0)
@@ -352,10 +384,15 @@ namespace QuestRecorder
                 // A quest that appeared since the last look (not the quest log found at the first look).
                 bool isNew = prev != null && !known;
 
-                // Title: always for a quest that just appeared, otherwise a few per look.
+                // Title: always for a quest that just appeared, otherwise a few per look. The first try for a new quest
+                // runs even when this look's budget is spent (a few per look): its pick-up is written now, and a
+                // [DAILY] / [WEEKLY] tag in the title decides how the profile picks it up.
                 QuestInfo qi = Quest(q.QuestId);
-                if (!qi.Resolved && qi.Attempts < 3 && CanSpend(isNew))
+                bool mustTitle = isNew && qi.Attempts == 0 && _newTitles < 4;
+                if (!qi.Resolved && qi.Attempts < 3 && (mustTitle || CanSpend(isNew)))
                 {
+                    if (mustTitle)
+                        _newTitles++;
                     Spend(isNew, 1);
                     qi.Attempts++;
                     ResolveQuest(st, qi);
@@ -418,8 +455,24 @@ namespace QuestRecorder
                 }
             }
 
-            if (list.Count == 0 && prev != null && prev.Quests.Count >= 3)
-                return; // a whole quest log never empties in one look: not loaded yet (Read keeps the last list)
+            // Not loaded yet (Read keeps the last list): a log of 3 or more quests never empties in one look, one of 1-2
+            // quests only on the second empty read in a row (a loading screen gives one), and an empty first read (the
+            // start, after the bot, a new character) is no starting point.
+            if (list.Count == 0 && (prev == null ||
+                                    (prev.Quests.Count > 0 && (prev.Quests.Count >= 3 || !ConfirmEmpty(0, prev.Quests.Count, ref _questLogEmptyReads)))))
+                return;
+            // no list yet since the start, a login or the bot: a log still loading can read empty for several looks, a
+            // really empty one stays empty - "empty" counts only once it has stayed so for a few seconds
+            if (list.Count == 0 && !prev.QuestsAvailable && prev.Quests.Count == 0)
+            {
+                if (_questNoListSince == NeverRead)
+                    _questNoListSince = s.Tick;
+                if (s.Tick - _questNoListSince < QuestEmptySettleMs)
+                    return;
+            }
+            _questNoListSince = NeverRead;
+            if (list.Count > 0)
+                _questLogEmptyReads = 0;
 
             // The scanner only looks for what your missions still need right now: the mob / object types the game counts
             // for the current step of each mission in your log, and only tasks that aren't full yet. A finished mission or
@@ -522,7 +575,15 @@ namespace QuestRecorder
         {
             QuestStepDefinition sd = st.StepDefinition;
             if (sd == null || sd.StepId != si.Step || st.BranchId != si.Branch)
+            {
+                // the game's step data hasn't caught up with the new step yet: this try doesn't count (a few times)
+                if (si.Lags < 10)
+                {
+                    si.Lags++;
+                    si.Attempts--;
+                }
                 return;
+            }
             IReadOnlyList<QuestTaskDefinition> tasks = sd.Tasks;
             QuestDefinition def = readText && !_textDisabled ? st.Definition : null;
             si.Tasks.Clear();
@@ -637,8 +698,10 @@ namespace QuestRecorder
                 cmd = string.Empty;
             }
             bool use = IsUseCommand(cmd);
-            // the interact key works on what you have targeted, not what's under the mouse
-            if (use && (id == 0 || id == s.PlayerId) && s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId)
+            // the interact key works on what you have targeted, not what's under the mouse (your companion too: the key
+            // starts a talk with it, like a right-click on it)
+            bool interactKey = cmd.IndexOf("Interact", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (use && (id == 0 || id == s.PlayerId) && s.TargetId != 0 && s.TargetId != s.PlayerId && (s.TargetId != s.CompanionId || interactKey))
                 id = s.TargetId;
             if (id == 0 || id == s.PlayerId)
                 return;
@@ -651,6 +714,8 @@ namespace QuestRecorder
             ObjRef r = Describe(o, use ? "you clicked it" : "under the mouse");
             if (r == null || r.Kind == ObjKind.Player)
                 return;
+            if (s.CompanionId != 0 && r.NodeId == s.CompanionId)
+                r.Toughness = "companion"; // what the profile builder looks for (it never talks to or fights your own companion)
             if (!use)
             {
                 // Not a right-click "use": never a cause in the draft, only noted once so the name can be checked.
@@ -674,8 +739,11 @@ namespace QuestRecorder
         private long _logScanTick = NeverRead;
         private long _logReadTick = NeverRead;
         private string _logRest = string.Empty;
-        private string _logItemName;
-        private long _logItemSeen;
+        // where each log file was left (another game client's log, or an old one touched again, can be the newest for a while)
+        private readonly Dictionary<string, long> _logLeftAt = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        private DateTime _logOpenedUtc = DateTime.MinValue; // when the first log of this run of reading was opened
+        // every mission item the log reported in the last few seconds (name -> look): its cooldown or stack change is that use
+        private readonly Dictionary<string, long> _logItemsSeen = new Dictionary<string, long>(StringComparer.Ordinal);
         private string _instName;
         private long _instSeen;
 
@@ -687,6 +755,25 @@ namespace QuestRecorder
         /// recorder already saw (cast, cooldown, item gone) isn't counted twice.
         /// </summary>
         private void ReadCombatLog(Snap s)
+        {
+            try
+            {
+                ReadCombatLogLines(s);
+            }
+            finally
+            {
+                // one use per look: the rest of a batch waits for the next looks, none is lost
+                if (_logQueue.Count > 0 && s.LogItemName == null)
+                {
+                    LogUse u = _logQueue[0];
+                    _logQueue.RemoveAt(0);
+                    s.LogItemName = u.Item;
+                    s.LogItemTarget = u.OnName != null ? LogTarget(u.OnName, s) : null;
+                }
+            }
+        }
+
+        private void ReadCombatLogLines(Snap s)
         {
             if (s.Tick - _logReadTick < 500)
                 return;
@@ -705,10 +792,33 @@ namespace QuestRecorder
                     return;
                 if (newest.FullName != _logPath)
                 {
+                    // the first log of this recording (or after the bot): only what happens from now on; a log the game
+                    // started since (you logged in again) is read from its start, so its first lines aren't lost; a log
+                    // already read goes on where it was left, and an older log that was only touched again from its end
+                    bool first = _logPath == null;
+                    long pos;
+                    if (first)
+                    {
+                        _logLeftAt.Clear();
+                        _logOpenedUtc = DateTime.UtcNow;
+                        pos = newest.Length;
+                    }
+                    else
+                    {
+                        _logLeftAt[_logPath] = _logPos;
+                        long left;
+                        if (_logLeftAt.TryGetValue(newest.FullName, out left))
+                            pos = left;
+                        else if (newest.CreationTimeUtc >= _logOpenedUtc)
+                            pos = 0;
+                        else
+                            pos = newest.Length;
+                    }
                     _logPath = newest.FullName;
-                    _logPos = newest.Length; // only what happens from now on
+                    _logPos = pos;
                     _logRest = string.Empty;
-                    return;
+                    if (first)
+                        return;
                 }
             }
             string text;
@@ -736,23 +846,40 @@ namespace QuestRecorder
             {
                 string line = lines[i].TrimEnd('\r');
                 // [time] [source] [target] [ability {id}] [Event {id}: what {id}]
+                // (the event names are in the game's language: the {id} numbers are the same in every language)
                 List<string> f = LogFields(line);
                 if (f.Count < 5 || !IsMe(f[1], me, meUtf))
                     continue;
                 // who you have targeted (the game logs it as TargetSet): who an item with no target of its own went on
-                if (f[4].IndexOf("TargetSet", StringComparison.Ordinal) >= 0)
+                if (f[4].IndexOf("{836045448953668}", StringComparison.Ordinal) >= 0 || f[4].IndexOf("TargetSet", StringComparison.Ordinal) >= 0)
                 {
                     _logTargetName = f[2].Length > 0 && f[2] != "=" && !f[2].StartsWith("@", StringComparison.Ordinal) ? LogName(f[2]) : null;
                     continue;
                 }
-                if (f[4].IndexOf("AbilityActivate", StringComparison.Ordinal) < 0)
+                if (f[4].IndexOf("{836045448953669}", StringComparison.Ordinal) >= 0 || f[4].IndexOf("TargetCleared", StringComparison.Ordinal) >= 0)
+                {
+                    _logTargetName = null; // no target any more: a later item with no target of its own went on nobody
+                    continue;
+                }
+                if (f[4].IndexOf("{836045448945479}", StringComparison.Ordinal) < 0 && f[4].IndexOf("AbilityActivate", StringComparison.Ordinal) < 0)
                     continue;
                 string abl = LogName(f[3]);
                 string item = LogItem(abl);
                 if (item == null)
+                {
+                    string utf = FromUtf8(abl); // a UTF-8 log read as Latin-1 ("GerÃ¤t" is "Gerät")
+                    if (utf != null)
+                        item = LogItem(utf);
+                }
+                if (item == null)
                     continue; // not one of your mission items
-                if (s.QuestItemName == item || s.InstantItemName == item || IsSameCast(item, s) || (_instName == item && s.Tick - _instSeen < 4000))
+                if (s.QuestItemName == item || s.InstantItemName == item || (_castItemName != null && item == _castItemName && s.Tick - _castItemSeen < 4000) ||
+                    (_instName == item && s.Tick - _instSeen < 4000))
                     continue; // already recorded from its cast / cooldown / leaving your bags
+                // one use can log its activation twice: the same item within a second of the log's own clock is one use
+                long at = LogMs(f[0]);
+                if (item == _logLastItem && at >= 0 && _logLastMs >= 0 && Math.Abs(at - _logLastMs) < 1000)
+                    continue;
                 // the activation line says [=]: who it went on is on the effect line right after (Radiation Sensor ->
                 // "Tagged" on the Imperial Soldier), or else your target (Serum Injector -> the Hyperbeast)
                 string stamp = f[0];
@@ -770,11 +897,58 @@ namespace QuestRecorder
                 }
                 if (onName == null)
                     onName = _logTargetName;
-                s.LogItemName = item;
-                s.LogItemTarget = onName != null ? LogTarget(onName, s) : null;
-                _logItemName = item;
-                _logItemSeen = s.Tick;
-                return; // one per look
+                _logLastItem = item;
+                _logLastMs = at;
+                // (marked as reported now: its cooldown or stack change in the next looks is the same use - each item of
+                // the batch, not only the last one)
+                if (_logItemsSeen.Count > 20)
+                    _logItemsSeen.Clear();
+                _logItemsSeen[item] = s.Tick;
+                if (_logQueue.Count < 10)
+                    _logQueue.Add(new LogUse { Item = item, OnName = onName });
+            }
+        }
+
+        /// <summary>A mission item use read from the combat log, waiting for its look (who it went on as the log said then).</summary>
+        private sealed class LogUse
+        {
+            public string Item;
+            public string OnName;
+        }
+
+        private readonly List<LogUse> _logQueue = new List<LogUse>();
+        private string _logLastItem;
+        private long _logLastMs = -1;
+
+        /// <summary>"22:15:03.123" -> milliseconds of the day, or -1.</summary>
+        private static long LogMs(string stamp)
+        {
+            TimeSpan t;
+            if (!TimeSpan.TryParse(stamp, System.Globalization.CultureInfo.InvariantCulture, out t))
+                return -1;
+            return (long)t.TotalMilliseconds;
+        }
+
+        /// <summary>The same text read as UTF-8 (the log is read as Latin-1), or null when it is plain ASCII or not UTF-8.</summary>
+        private static string FromUtf8(string latin)
+        {
+            bool wide = false;
+            foreach (char c in latin)
+                if (c > 127)
+                {
+                    wide = true;
+                    break;
+                }
+            if (!wide)
+                return null;
+            try
+            {
+                string u = System.Text.Encoding.UTF8.GetString(System.Text.Encoding.Latin1.GetBytes(latin));
+                return u == latin || u.IndexOf('\uFFFD') >= 0 ? null : u;
+            }
+            catch
+            {
+                return null;
             }
         }
 
@@ -805,20 +979,63 @@ namespace QuestRecorder
             string item;
             if (_questItemByName.TryGetValue(abl, out item) || _castNameItem.TryGetValue(abl, out item))
                 return item;
-            if (!abl.StartsWith("Using ", StringComparison.Ordinal))
-                return null;
-            string bare = abl.Substring(6).TrimEnd('.', ' ');
-            if (bare.Length < 3)
-                return null;
+            return ItemFromCastText(abl, true);
+        }
+
+        // this game's words before an item's name on its cast bar ("Using " in English; another language's are learned
+        // from a cast the game did tie to its item, like "Using Detection...")
+        private readonly HashSet<string> _castPrefixes = new HashSet<string>(StringComparer.Ordinal);
+
+        /// <summary>
+        /// The one mission item a cast-bar text names: "Using Serum..." is the "Serum Injector" (after the words for
+        /// "Using", the item's name or its first word(s)). <paramref name="english"/>: "Using " counts; other words only
+        /// once learned, and only on a text that ends in "..." the way those casts do. Two items fit: no guess.
+        /// </summary>
+        private string ItemFromCastText(string text, bool english)
+        {
+            string t = text.TrimEnd('.', ' ', '\u2026');
+            bool dots = t.Length < text.TrimEnd(' ').Length;
             string found = null;
-            foreach (string v in _questItemByName.Values)
-                if (v == bare || v.StartsWith(bare + " ", StringComparison.OrdinalIgnoreCase))
+            for (int i = t.IndexOf(' '); i >= 0 && i + 1 < t.Length; i = t.IndexOf(' ', i + 1))
+            {
+                string head = t.Substring(0, i + 1);
+                if (!((english && head == "Using ") || (dots && _castPrefixes.Contains(head))))
+                    continue;
+                string bare = t.Substring(i + 1);
+                if (bare.Length < 3)
+                    return null;
+                foreach (string v in _questItemByName.Values)
+                    if (v == bare || v.StartsWith(bare + " ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (found != null && found != v)
+                            return null; // two items fit: don't guess
+                        found = v;
+                    }
+                return found;
+            }
+            return null;
+        }
+
+        /// <summary>A cast the game tied to its mission item, with the text "words item-name...": those words are what
+        /// this game writes before an item's name (any language).</summary>
+        private void LearnCastPrefix(string text, string item)
+        {
+            string t = text.TrimEnd('.', ' ', '\u2026');
+            if (t.Length == text.TrimEnd(' ').Length || _castPrefixes.Count >= 5)
+                return; // only the "...": a cast named like its item ("Activate Detection Droid") teaches nothing
+            for (int i = t.IndexOf(' '); i >= 0 && i + 1 < t.Length; i = t.IndexOf(' ', i + 1))
+            {
+                string bare = t.Substring(i + 1);
+                if (bare.Length < 3)
+                    return;
+                if (bare == item || item.StartsWith(bare + " ", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (found != null && found != v)
-                        return null; // two items fit: don't guess
-                    found = v;
+                    string head = t.Substring(0, i + 1);
+                    if (head.Length <= 30)
+                        _castPrefixes.Add(head);
+                    return;
                 }
-            return found;
+            }
         }
 
         /// <summary>The [..] fields of a combat log line.</summary>
@@ -861,6 +1078,7 @@ namespace QuestRecorder
             string name = LogName(field);
             if (name.Length == 0)
                 return null;
+            string nameUtf = FromUtf8(name); // (a UTF-8 log read as Latin-1)
             try
             {
                 HeroCharacter best = null;
@@ -870,7 +1088,7 @@ namespace QuestRecorder
                     if (c == null || !c.IsValid || c is HeroPlayer)
                         continue;
                     string n = NameOf(c);
-                    if (n != name)
+                    if (n != name && (nameUtf == null || n != nameUtf))
                         continue;
                     float d = V(c.Location).DistanceTo(s.Pos);
                     if (d < bestD)
@@ -890,6 +1108,13 @@ namespace QuestRecorder
         // ------------------------------------------------------------------ quest abilities, equipped items
 
         private HashSet<string> _baseAbilities; // your abilities when the recording began (your class kit)
+        private ulong _baseAbilitiesPlayer; // whose kit that is
+        private readonly HashSet<string> _questAbilities = new HashSet<string>(StringComparer.Ordinal); // ones you got since
+        private readonly Dictionary<string, long> _abilityCastSeen = new Dictionary<string, long>(StringComparer.Ordinal); // last look casting it
+        private readonly HashSet<string> _mountCasts = new HashSet<string>(StringComparer.Ordinal); // casts that put you on your mount
+        private string _curCastName; // the cast going on now (null when not casting)
+        private long _curCastStart;
+        private long _countedCastStart = NeverRead; // the cast start already counted as a quest-ability use
         private readonly Dictionary<string, float> _abilityCd = new Dictionary<string, float>(StringComparer.Ordinal);
         private readonly Dictionary<string, long> _abilityUsedAt = new Dictionary<string, long>(StringComparer.Ordinal);
         private long _abilityTick = NeverRead;
@@ -905,6 +1130,28 @@ namespace QuestRecorder
         /// </summary>
         private void ReadQuestAbilities(Snap s)
         {
+            if (_baseAbilities != null && s.PlayerId != _baseAbilitiesPlayer)
+            {
+                _baseAbilities = null; // another character (the bot can switch too): its own kit
+                _questAbilities.Clear();
+            }
+            // A quest ability being cast out of combat (a scan, a dig): counted once per cast, on the look it started -
+            // the once-a-second check below lands on that look only now and then, and a channel with no cooldown was missed.
+            if (s.IsCasting && !s.InCombat && !string.IsNullOrEmpty(_curCastName) && _questAbilities.Contains(_curCastName))
+            {
+                _abilityCastSeen[_curCastName] = s.Tick;
+                if (_countedCastStart != _curCastStart)
+                {
+                    _countedCastStart = _curCastStart;
+                    if (s.QuestItemName == null && !_questItemByName.ContainsKey(_curCastName))
+                    {
+                        _abilityUsedAt[_curCastName] = s.Tick;
+                        s.AbilityName = _curCastName;
+                        s.AbilityTarget = AbilityTarget(s);
+                        return; // one per look
+                    }
+                }
+            }
             if (_abilityOff || s.Tick - _abilityTick < 1000)
                 return;
             _abilityTick = s.Tick;
@@ -955,12 +1202,15 @@ namespace QuestRecorder
             if (_baseAbilities == null)
             {
                 _baseAbilities = new HashSet<string>(names, StringComparer.Ordinal);
+                _baseAbilitiesPlayer = s.PlayerId;
                 return;
             }
             foreach (string n in names)
             {
                 if (_baseAbilities.Contains(n) || _questItemByName.ContainsKey(n))
                     continue; // your class kit, or a mission item (recorded as an item)
+                if (_questAbilities.Count < 200)
+                    _questAbilities.Add(n);
                 float cd;
                 try
                 {
@@ -975,9 +1225,14 @@ namespace QuestRecorder
                 _abilityCd[n] = cd;
                 bool cast = s.IsCasting && s.CastName == n;
                 bool cooled = known && cd > 1.6f && cd > before + 1f;
+                long seen;
+                if (cooled && _abilityCastSeen.TryGetValue(n, out seen) && s.Tick - seen < 3000)
+                    cooled = false; // the cooldown of a cast already counted, starting as that cast ends
                 long last;
                 if ((cast || cooled) && (!_abilityUsedAt.TryGetValue(n, out last) || s.Tick - last > 4000))
                 {
+                    if (cast)
+                        _countedCastStart = _curCastStart;
                     _abilityUsedAt[n] = s.Tick;
                     s.AbilityName = n;
                     s.AbilityTarget = AbilityTarget(s);
@@ -1171,18 +1426,34 @@ namespace QuestRecorder
         {
             if (!s.InConvo)
                 return;
-            if (prev != null && prev.InConvo)
-                return; // only on the look where the conversation started
+            // the type on every look of a conversation (one value): it tells a holocall that follows a talk at once
             HeroCnvOracle cnv = ExtraNodeManager.ConvoOracle;
             if (cnv != null)
             {
-                cnvConversationType ct = cnv.ConversationType;
-                s.ConvoTypeName = ct.ToString();
-                s.ConvoIsComlink = ct == cnvConversationType.Comlink;
+                try
+                {
+                    cnvConversationType ct = cnv.ConversationType;
+                    s.ConvoTypeName = ct.ToString();
+                    s.ConvoIsComlink = ct == cnvConversationType.Comlink;
+                }
+                catch
+                {
+                    s.ConvoTypeName = string.Empty; // not readable this look
+                }
             }
+            if (prev != null && prev.InConvo)
+            {
+                // only on the look where the conversation started - or where a holocall took over from a talk (or the
+                // other way round) with no look in between: that's a new conversation with someone else
+                if (prev.ConvoTypeName.Length == 0 || s.ConvoTypeName.Length == 0 || prev.ConvoIsComlink == s.ConvoIsComlink)
+                    return;
+                s.ConvoRestarted = true;
+            }
+            s.ConvoGroup = GroupNear(me, s);
             if (s.ConvoIsComlink)
                 return; // a holocom call has nobody standing next to you
-            s.ConvoPartner = GuessPartner(s, Math.Max(2, cfg.PartnerRadius / 10));
+            // the talk-partner range is set in metres; positions are in game units of 10 m
+            s.ConvoPartner = GuessPartner(s, Math.Max(0.3f, cfg.PartnerRadius / 10f));
             if (s.ConvoPartner != null && s.ConvoPartner.OffersQuest && s.ConvoPartner.NodeId != 0)
             {
                 try
@@ -1194,6 +1465,29 @@ namespace QuestRecorder
                     s.OfferedQuestId = 0;
                 }
             }
+        }
+
+        /// <summary>Another member of your group stands near you: a group conversation, where the roll winner's reply is taken.</summary>
+        private bool GroupNear(HeroLocalPlayer me, Snap s)
+        {
+            try
+            {
+                ulong group = me.GroupId;
+                if (group == 0)
+                    return false;
+                foreach (HeroPlayer p in HeroObjectManager.Players)
+                {
+                    if (p == null || p.NodeId == s.PlayerId || p.GroupId != group)
+                        continue;
+                    if (V(p.Location).DistanceTo(s.Pos) <= 4f)
+                        return true; // within ~40 m
+                }
+            }
+            catch
+            {
+                // can't tell: as if alone
+            }
+            return false;
         }
 
         /// <summary>Conversation choice wheels.</summary>
@@ -1208,7 +1502,7 @@ namespace QuestRecorder
             if (!cnv.IsWaitingForChoice || !cnv.ChoicesShown || s.ConvoNode < 0)
                 return;
             s.ReplyNode = s.ConvoNode;
-            if (prev != null && prev.InConvo && prev.ReplyNode == s.ReplyNode)
+            if (prev != null && prev.InConvo && prev.ReplyNode == s.ReplyNode && !s.ConvoRestarted)
                 return; // the same wheel is still up: read once
             if (!CanSpend(true))
             {
@@ -1235,7 +1529,8 @@ namespace QuestRecorder
         }
 
         /// <summary>BuddyCron has no "who am I talking to".</summary>
-        private ObjRef GuessPartner(Snap s, int radius)
+        /// <param name="partnerRadius">The talk-partner range for a quest NPC you didn't click or select (game units).</param>
+        private ObjRef GuessPartner(Snap s, float partnerRadius)
         {
             ObjRef click = RecentClick(s, 6000, "you clicked it");
             ObjRef clicked = null, fresh = null;
@@ -1243,6 +1538,8 @@ namespace QuestRecorder
             {
                 fresh = Describe(HeroObjectManager.GetByNodeId(click.NodeId), click.How); // re-read so the marker is the one shown now
                 clicked = fresh ?? click;
+                if (s.CompanionId != 0 && clicked.NodeId == s.CompanionId)
+                    clicked.Toughness = "companion"; // the re-read drops ReadClick's mark
             }
             // an NPC you clicked (not a body you looted): you talk to it
             if (clicked != null && clicked.Kind == ObjKind.Npc && !clicked.Dead)
@@ -1250,6 +1547,28 @@ namespace QuestRecorder
             // an object that gives or takes missions (a marker on it, a mission terminal): it talks to you
             if (clicked != null && clicked.Kind == ObjKind.Placeable && (clicked.OffersQuest || clicked.TakesTurnIn || click.OffersQuest || click.TakesTurnIn))
                 return clicked;
+            // your companion, selected and showing a marker (a companion conversation or mission): you talk to it. One you
+            // only have selected by chance (after healing it) doesn't count - a cut scene would always land on it.
+            if (s.CompanionId != 0 && s.TargetId == s.CompanionId)
+            {
+                try
+                {
+                    HeroObject co = HeroObjectManager.GetByNodeId(s.CompanionId);
+                    if (co != null && co.IsValid && co.QuestIndication != cnvQuestIndication.None)
+                    {
+                        ObjRef c = Describe(co, "your companion (selected, with a marker)");
+                        if (c != null && c.Kind == ObjKind.Npc)
+                        {
+                            c.Toughness = "companion";
+                            return c;
+                        }
+                    }
+                }
+                catch
+                {
+                    // can't read it: go on as before
+                }
+            }
             ObjRef target = null;
             if (s.TargetId != 0 && s.TargetId != s.PlayerId && s.TargetId != s.CompanionId)
             {
@@ -1257,7 +1576,7 @@ namespace QuestRecorder
                 if (t != null && (t.Kind == ObjKind.Npc || t.Kind == ObjKind.Placeable) && !t.Dead && (!t.HasPos || t.Pos.DistanceTo(s.Pos) <= 2f))
                     target = t;
             }
-            List<KeyValuePair<float, HeroObject>> near = Nearby(s, radius);
+            List<KeyValuePair<float, HeroObject>> near = Nearby(s, Math.Max(2f, partnerRadius)); // 20 m
             if (clicked != null && clicked.Kind == ObjKind.Placeable)
             {
                 // a plain object you clicked (a case, a console), then a conversation. The object talks only while it still shows
@@ -1290,14 +1609,47 @@ namespace QuestRecorder
             }
             if (target != null && target.Kind == ObjKind.Npc)
                 return target;
+            // the nearest NPC with a quest marker within the talk-partner range (the setting, 8 m unless changed), else the
+            // only one within 20 m; several further off and none close: none of them is a safe guess
+            float pr2 = partnerRadius * partnerRadius;
+            HeroObject lone = null;
+            int further = 0;
             foreach (KeyValuePair<float, HeroObject> kv in near)
             {
                 if (!(kv.Value is HeroNPC) || kv.Value.QuestIndication == cnvQuestIndication.None)
                     continue;
-                ObjRef n = Describe(kv.Value, "nearest NPC with a quest marker (guess)");
+                if (kv.Key <= pr2)
+                {
+                    ObjRef n = Describe(kv.Value, "nearest NPC with a quest marker (guess)");
+                    if (n != null && !n.Dead)
+                        return n;
+                    continue;
+                }
+                if (kv.Key > 4f)
+                    break;
+                bool dead;
+                try
+                {
+                    dead = ((HeroNPC)kv.Value).IsDead;
+                }
+                catch
+                {
+                    dead = false;
+                }
+                if (dead)
+                    continue;
+                further++;
+                if (lone == null)
+                    lone = kv.Value;
+            }
+            if (further == 1)
+            {
+                ObjRef n = Describe(lone, "the only NPC with a quest marker near you (guess)");
                 if (n != null && !n.Dead)
                     return n;
             }
+            else if (further > 1)
+                return null;
             if (target != null)
                 return target; // an object you had selected
             foreach (KeyValuePair<float, HeroObject> kv in near)
@@ -1328,6 +1680,9 @@ namespace QuestRecorder
         {
             if (prev == null || prev.Interaction == s.Interaction || prev.PlayerId != s.PlayerId)
                 return;
+            // an elevator window that closed: the ride comes right after it, or you walked off (ReadMovement)
+            if ((chrInteractionType)prev.Interaction == chrInteractionType.Wonkavator && _wonka != null && _wonka.ClosedTick == 0)
+                _wonka.ClosedTick = s.Tick;
             var it = (chrInteractionType)s.Interaction;
             switch (it)
             {
@@ -1402,8 +1757,15 @@ namespace QuestRecorder
                 foreach (ulong id in attackers)
                     Track(id, now, s);
             }
-            if (s.InCombat && s.TargetId != 0)
+            // your target in a fight - and a live NPC you have selected before the fight, so one you kill with your opener
+            // (dead on the first look it would be tracked) still counts
+            if (s.TargetId != 0 && s.InCombat)
                 Track(s.TargetId, now, s);
+            else if (s.TargetId != 0 && !s.InConvo && LiveNpc(s.TargetId))
+                TrackTarget(s.TargetId, now, s);
+            // whoever your companion fights (a tank companion holds them, they never hit you)
+            if (TrackCompanionFights && s.CompanionId != 0)
+                TrackCompanion(s, now);
 
             if (s.InCombat && (prev == null || !prev.InCombat) && attackers != null)
             {
@@ -1441,6 +1803,12 @@ namespace QuestRecorder
                         (drop ?? (drop = new List<ulong>())).Add(kv.Key);
                     continue;
                 }
+                if (dead && !t.WasDead && t.OnlyTargeted && !s.InCombat && (s.InConvo || (prev != null && prev.InConvo)))
+                {
+                    // an NPC you had selected that died in a conversation (a scene, a choice), not in a fight: no kill
+                    (drop ?? (drop = new List<ulong>())).Add(kv.Key);
+                    continue;
+                }
                 if (dead && !t.WasDead)
                 {
                     ObjRef mob = DescribeMob(c, "killed");
@@ -1473,7 +1841,86 @@ namespace QuestRecorder
             }
         }
 
+        private static bool LiveNpc(ulong id)
+        {
+            try
+            {
+                var npc = HeroObjectManager.GetByNodeId(id) as HeroNPC;
+                return npc != null && npc.IsValid && !npc.IsDead;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Your companion's fight: its attackers and its target. BuddyCron documents AttackerIds and TargetId for every
+        // character, but the recorder only ever read them on you, so they are read by name here (a BuddyCron without them
+        // still loads the plugin; then nothing changes). False = only your own attackers and target are tracked.
+        // Off until it is checked in game that a companion's AttackerIds / TargetId read like yours.
+        private static readonly bool TrackCompanionFights = false;
+        private static Type _compType;
+        private static System.Reflection.PropertyInfo _compAttackers;
+        private static System.Reflection.PropertyInfo _compTarget;
+
+        private void TrackCompanion(Snap s, long now)
+        {
+            try
+            {
+                HeroObject comp = HeroObjectManager.GetByNodeId(s.CompanionId);
+                if (comp == null || !comp.IsValid)
+                    return;
+                Type t = comp.GetType();
+                if (t != _compType)
+                {
+                    _compAttackers = null;
+                    _compTarget = null;
+                    _compType = t;
+                    _compAttackers = t.GetProperty("AttackerIds", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
+                    _compTarget = t.GetProperty("TargetId", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
+                }
+                var ids = _compAttackers != null ? _compAttackers.GetValue(comp) as IEnumerable<ulong> : null;
+                if (ids != null)
+                {
+                    int n = 0;
+                    foreach (ulong id in ids)
+                    {
+                        if (++n > 20)
+                            break;
+                        Track(id, now, s);
+                    }
+                }
+                if (_compTarget != null)
+                {
+                    object v = _compTarget.GetValue(comp);
+                    if (v != null)
+                        Track(Convert.ToUInt64(v), now, s);
+                }
+            }
+            catch
+            {
+                // the companion can't be read this look
+            }
+        }
+
         private void Track(ulong id, long now, Snap s)
+        {
+            if (id == 0 || id == s.PlayerId || id == s.CompanionId)
+                return;
+            TrackedMob t;
+            if (_tracked.TryGetValue(id, out t))
+            {
+                t.LastListedTick = now;
+                t.OnlyTargeted = false; // it fights you or your companion now
+                return;
+            }
+            if (_tracked.Count >= MaxTracked)
+                return;
+            _tracked[id] = new TrackedMob { LastListedTick = now };
+        }
+
+        /// <summary>Your target out of a fight: tracked so a kill with your opener counts (marked, see ReadCombat).</summary>
+        private void TrackTarget(ulong id, long now, Snap s)
         {
             if (id == 0 || id == s.PlayerId || id == s.CompanionId)
                 return;
@@ -1485,7 +1932,7 @@ namespace QuestRecorder
             }
             if (_tracked.Count >= MaxTracked)
                 return;
-            _tracked[id] = new TrackedMob { LastListedTick = now };
+            _tracked[id] = new TrackedMob { LastListedTick = now, OnlyTargeted = true };
         }
 
         private ObjRef DescribeMob(HeroCharacter c, string how)
@@ -1525,7 +1972,10 @@ namespace QuestRecorder
         private void ReadCast(HeroLocalPlayer me, Snap prev, Snap s)
         {
             if (s.CastSpec == 0)
+            {
+                _curCastName = null;
                 return;
+            }
             if (prev != null && prev.IsCasting && prev.CastSpec == s.CastSpec)
                 return; // the same cast is still going
             string name;
@@ -1537,6 +1987,8 @@ namespace QuestRecorder
                     _abilityNames[s.CastSpec] = name;
             }
             s.CastName = name;
+            _curCastName = name; // (the cast's name stays known on its later looks: a channelled quest ability)
+            _curCastStart = s.Tick;
 
             bool stale = s.Tick - _questItemsTick > (s.InCombat ? 20000 : 2000);
             if (!_questItemAbilities.ContainsKey(s.CastSpec) && stale)
@@ -1551,6 +2003,8 @@ namespace QuestRecorder
                 string bare = name.StartsWith("Using ", StringComparison.Ordinal) ? name.Substring(6).TrimEnd('.', ' ') : name;
                 if (_questItemByName.TryGetValue(name, out item) || _questItemByName.TryGetValue(bare, out item))
                     _questItemAbilities[s.CastSpec] = item;
+                else if ((item = ItemFromCastText(name, false)) != null)
+                    _questItemAbilities[s.CastSpec] = item; // the same, in the game's language (its words learned from another cast)
                 else if (!s.InCombat && _unmatchedLogged.Add(name))
                     RrLog.Debug("Cast \"{0}\" is not one of your mission items: {1}", name, _questItemList);
             }
@@ -1559,15 +2013,37 @@ namespace QuestRecorder
                 s.QuestItemName = item;
                 if (name.Length > 0 && _castNameItem.Count < 500)
                     _castNameItem[name] = item; // its cast bar text ("Using Detection...") - the combat log names it that way too
+                if (name.Length > 0 && name != item)
+                    LearnCastPrefix(name, item);
                 s.CastTarget = ItemTarget(me, s, item);
             }
-            else if (!s.InCombat && !(_baseAbilities != null && name.Length > 0 && !_baseAbilities.Contains(name) && AbilityManager.HasAbility(name)))
+            else if (!s.InCombat)
             {
+                bool known = name.Length > 0 && KnowsAbility(name);
                 // Clicking a quest object usually starts a channel.
                 // (not a quest ability from a special bar: that's recorded as its own use, not a use of an object nearby)
-                // one of your own abilities (Recuperate, a mount, a class skill): on an object only when you clicked it right before
-                bool own = _baseAbilities != null && name.Length > 0 && _baseAbilities.Contains(name);
-                s.CastTarget = CastObject(s, own);
+                if (!(_baseAbilities != null && name.Length > 0 && !_baseAbilities.Contains(name) && known))
+                {
+                    // one of your own abilities (Recuperate, a class skill - any ability you know while your kit isn't read
+                    // yet), your mount being summoned, or looting a body: on an object only when you clicked it right before
+                    bool own = name.Length > 0 && ((_baseAbilities != null ? _baseAbilities.Contains(name) : known) || _mountCasts.Contains(name));
+                    ObjRef body = RecentClick(s, 3000, "you clicked it");
+                    bool loot = name == "Loot" || name == "Looting" || (body != null && body.Kind == ObjKind.Npc && body.Dead);
+                    s.CastTarget = CastObject(s, own || loot);
+                }
+            }
+        }
+
+        /// <summary>BuddyCron's "you have this ability" (false when it can't say).</summary>
+        private static bool KnowsAbility(string name)
+        {
+            try
+            {
+                return AbilityManager.HasAbility(name);
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -1760,7 +2236,7 @@ namespace QuestRecorder
                 bool plot = _questItemByName.ContainsKey(gone) || _bagPlot.Contains(gone) || _bagPlotBefore.Contains(gone) || _wasQuestItem.Contains(gone);
                 s.InstantItemBag = !plot; // a stim: kept only when a quest moves right after
                 s.InstantItemGone = plot; // a mission item: the builder checks what made it go
-                s.CastTarget = GoneTarget(s); // your target then, if it's an NPC right next to you
+                s.InstantItemTarget = GoneTarget(s); // your target then, if it's an NPC right next to you
             }
         }
 
@@ -1831,8 +2307,9 @@ namespace QuestRecorder
         /// <summary>The item whose cast was just recorded, still casting or ended under 4 s ago: the same use.</summary>
         private bool IsSameCast(string name, Snap s)
         {
+            long logged;
             return (_castItemName != null && name == _castItemName && s.Tick - _castItemSeen < 4000) ||
-                   (_logItemName != null && name == _logItemName && s.Tick - _logItemSeen < 4000); // (or the combat log already reported it)
+                   (name != null && _logItemsSeen.TryGetValue(name, out logged) && s.Tick - logged < 4000); // (or the combat log already reported it)
         }
 
         /// <summary>Your target when an item left your bags, if it's an NPC within about 30 m (who you used it on).</summary>
@@ -1880,7 +2357,7 @@ namespace QuestRecorder
             s.InstantItemGone = plot && usedUp && !cooldownStarted;
             var me2 = Core.Me;
             if (me2 != null)
-                s.CastTarget = ItemTarget(me2, s, name); // what the item works on, not just whoever you had targeted
+                s.InstantItemTarget = ItemTarget(me2, s, name); // what the item works on, not just whoever you had targeted
         }
 
         /// <summary>Quest items in your bags: plot items you can right-click (not medpacs, gear or other stuff).</summary>
@@ -1994,10 +2471,16 @@ namespace QuestRecorder
 
         // ------------------------------------------------------------------ movement: mounts, taxis, elevators, ship
 
+        private ulong _shipGalaxyArea; // the last galaxy-map area read (not 0) since you came into this area
+
         private void ReadMovement(HeroLocalPlayer me, Snap prev, bool afterLoading, Snap s)
         {
             if (s.IsMounted && (prev == null || !prev.IsMounted))
             {
+                // the cast going on just before put you on your mount: that cast is never a use of an object nearby
+                string mc;
+                if (prev != null && prev.CastSpec != 0 && _abilityNames.TryGetValue(prev.CastSpec, out mc) && mc.Length > 0 && _mountCasts.Count < 50)
+                    _mountCasts.Add(mc);
                 long mid = me.ActiveMountId;
                 s.MountName = mid != 0 ? Fmt.OneLine(MountManager.MountName(mid)) : string.Empty;
             }
@@ -2023,12 +2506,20 @@ namespace QuestRecorder
                 }
             }
 
-            // Ship: the galaxy-map area changes while the area (the ship interior) stays the same.
-            if (prev != null && prev.PlayerId == s.PlayerId && prev.AreaId == s.AreaId &&
-                prev.GalaxyAreaId != s.GalaxyAreaId && s.GalaxyAreaId != 0)
+            // Ship: the galaxy-map area changes while the area (the ship interior) stays the same. Compared with the last
+            // galaxy-map area read in this same area, so a first read after a loading screen or a relog (0 before) is no flight.
+            if (prev == null || prev.PlayerId != s.PlayerId || prev.AreaId != s.AreaId)
             {
-                GalaxyMapDestination d = GalaxyMap.FindDestination(s.GalaxyAreaId);
-                s.ShipDest = d != null ? Fmt.OneLine(d.Name) : string.Empty;
+                _shipGalaxyArea = s.GalaxyAreaId;
+            }
+            else if (s.GalaxyAreaId != 0)
+            {
+                if (_shipGalaxyArea != 0 && _shipGalaxyArea != s.GalaxyAreaId)
+                {
+                    GalaxyMapDestination d = GalaxyMap.FindDestination(s.GalaxyAreaId);
+                    s.ShipDest = d != null ? Fmt.OneLine(d.Name) : string.Empty;
+                }
+                _shipGalaxyArea = s.GalaxyAreaId;
             }
 
             // Elevator / shuttle door: after its window opened, the next quick position change is the ride.
@@ -2063,6 +2554,15 @@ namespace QuestRecorder
                     {
                         s.WonkaArrival = ResolveWonkaArrival(s);
                         _wonka = null;
+                    }
+                    else if (_wonka.ClosedTick != 0)
+                    {
+                        // its window closed and no ride came: you walked off on that floor, or 30 s went by (counted to
+                        // the look before this one, so a loading screen that starts right after the close is still the ride)
+                        float dx = s.Pos.X - _wonka.Stand.X, dz = s.Pos.Z - _wonka.Stand.Z;
+                        bool walkedOff = dx * dx + dz * dz > 1f && Math.Abs(s.Pos.Y - _wonka.Stand.Y) < 0.5f;
+                        if (walkedOff || prev.Tick - _wonka.ClosedTick > 30000)
+                            _wonka = null;
                     }
                 }
             }

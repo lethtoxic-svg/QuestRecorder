@@ -183,6 +183,9 @@ namespace QuestRecorder
         internal string StartRecording()
         {
             string msg;
+            // a new recording: the tracker, the review list and the control panel never show the last one's profile
+            if (!Recorder.IsRecording)
+                RecordingSession.ClearLive();
             if (!Recorder.Start(out msg))
                 return msg;
             ApplyHotkey();
@@ -301,19 +304,61 @@ namespace QuestRecorder
         private const string WaitHotkeyName = "Quest Recorder wait here";
         private bool _spotKeysRegistered;
 
-        /// <summary>Ctrl+Shift+P: the profile pauses here for you. Ctrl+Shift+W: the bot waits here 10 s (a respawn, a door).</summary>
+        /// <summary>Pause here (default Ctrl+Shift+P): the profile pauses here for you. Wait here (default Ctrl+Shift+W):
+        /// the bot waits here 10 s (a respawn, a door). Each from the settings, each on its own (one taken by another
+        /// program never stops the other).</summary>
         private void ApplySpotHotkeys()
         {
+            Keys pause = Keys.Control | Keys.Shift | Keys.P;
+            Keys wait = Keys.Control | Keys.Shift | Keys.W;
             try
             {
-                HotkeyManager.Register(PauseHotkeyName, Keys.P, ModifierKeys.Control | ModifierKeys.Shift, hk => Spot(ReplayBuilder.PauseNote, "Pause added here - the bot will stop here for you."));
-                HotkeyManager.Register(WaitHotkeyName, Keys.W, ModifierKeys.Control | ModifierKeys.Shift, hk => Spot(ReplayBuilder.WaitNote, "Wait added here - the bot will wait here 10 seconds."));
+                pause = RrSettings.Instance.PauseHotkey;
+                wait = RrSettings.Instance.WaitHotkey;
+            }
+            catch
+            {
+                // the defaults
+            }
+            var said = new System.Collections.Generic.List<string>();
+            if (RegisterSpot(PauseHotkeyName, pause, () => Spot(ReplayBuilder.PauseNote, "Pause added here - the bot will stop here for you.")))
+                said.Add(KeyText(pause) + " = pause here (you do it by hand)");
+            if (RegisterSpot(WaitHotkeyName, wait, () => Spot(ReplayBuilder.WaitNote, "Wait added here - the bot will wait here 10 seconds.")))
+                said.Add(KeyText(wait) + " = wait here 10 s");
+            if (said.Count > 0 && _undoRegistered)
+                said.Add(KeyText(RrSettings.Instance.UndoHotkey) + " = ignore your last action");
+            if (said.Count > 0)
+                RrLog.Info("{0}.", string.Join(", ", said.ToArray()));
+        }
+
+        private bool RegisterSpot(string name, Keys combo, Action pressed)
+        {
+            Keys key = combo & Keys.KeyCode;
+            Keys mods = combo & Keys.Modifiers;
+            if (combo == Keys.None || key == Keys.None)
+                return false;
+            if (mods == Keys.None)
+            {
+                RrLog.Warn("Hotkey {0} ignored: use Ctrl, Alt or Shift together with a key.", combo);
+                return false;
+            }
+            ModifierKeys modifiers = ModifierKeys.None;
+            if ((mods & Keys.Control) == Keys.Control)
+                modifiers |= ModifierKeys.Control;
+            if ((mods & Keys.Shift) == Keys.Shift)
+                modifiers |= ModifierKeys.Shift;
+            if ((mods & Keys.Alt) == Keys.Alt)
+                modifiers |= ModifierKeys.Alt;
+            try
+            {
+                HotkeyManager.Register(name, key, modifiers, hk => pressed());
                 _spotKeysRegistered = true;
-                RrLog.Info("Ctrl+Shift+P = pause here (you do it by hand), Ctrl+Shift+W = wait here 10 s, Ctrl+Shift+Z = ignore your last action.");
+                return true;
             }
             catch (Exception ex)
             {
-                RrLog.Exception("Registering the pause / wait hotkeys", ex);
+                RrLog.Warn("{0}: {1} can't be used ({2}). Pick another key in the settings.", name, KeyText(combo), ex.Message);
+                return false;
             }
         }
 

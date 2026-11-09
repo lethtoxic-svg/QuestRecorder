@@ -26,6 +26,73 @@ Quest Recorder patch notes - LethToxic
 - If anything in a profile can't run on plain BuddyCron, the profile is named "(not finished)", says so when it starts, and
   the Quest Recorder window says so too.
 - Recording starts only when you press Start recording. It no longer starts by itself when BuddyCron opens.
+- A pick-up or hand-in no longer gets an extra talk step in front of it.
+- A mission that ends in a holocom call: the bot answers the call. A step that moved during a long story talk or call is
+  done with that talk or call.
+- A boss that talks once beaten: the fight finishes the step, not a talk to the boss.
+- Missions you dropped from your log are left out of the profile, and so are the game's own helper quests (companion
+  conversations, [DNT] ...).
+- A mission whose reward window came up as it left your log is handed in as usual.
+- A mission that came right after you used an item or in a holocom call: the bot waits a few seconds longer for it, and
+  the Quest Recorder window says when you may have to do that part by hand.
+- A mission whose title the game read a moment late is still picked up as a daily or weekly.
+- Mission items kept in your bags are found too. Item names with an apostrophe no longer break the profile.
+- Mission items used in a row: each use walks to its own spot and only takes an NPC close to where you used it. An item
+  is never used on yourself when its NPC isn't there, an instant item is pressed once, and binoculars or scanners are no
+  longer pressed again and again. After a fight or a death the row goes on where it was.
+- A mission item you used right before a boss fight is used first, then the fight.
+- Clicks for one task are no longer mixed with another task's clicks, and each count keeps to its own branch of the mission.
+- One kill that counts for two tasks: the fight goes on until both are done and hunts both kinds of mobs.
+- A count made by clicking several objects with the same name clicks each one once; only the last one waits for the count.
+- A step where you only waited (for an NPC, a door, a timer): the bot waits there too, at most a little longer than you
+  did, and goes on as soon as the step moves.
+- Another mission's count that ticked during a fight but wasn't moved by it gets its own step.
+- Daily, weekly and heroic missions are recognised in the German and French clients too. Heroic Transport and other items
+  that move you are recognised in any client language.
+- Missions from a mission board or terminal are taken only when the board lists them for you. If it doesn't (a weekly
+  or daily you already did, or one not open to that character), the bot moves straight on instead of trying forever.
+- A weekly already in your log is taken from the mission board you took it from. A weekly's "complete N missions" count no
+  longer takes the last click or talk of the mission that just ended.
+- Flying your ship to another planet and going through your ship's exit or another area's door are in the profile (check
+  the flight in the Quest Recorder window).
+- Dynamic encounters: the bot walks to where they start, like missions the game hands you by itself.
+- A mission that starts right after a kill is not given by the object you clicked before the fight.
+- Talking to your own companion is never a talk, pick-up or hand-in step.
+- A revive at a medical center is no longer taken for a door, a shuttle or a mission item.
+- Kills of your target are counted. A kill another player tagged first counts when your mission count moved with it.
+- Non-English clients: mission items you used are matched from the cast bar and the combat log.
+- Starting the bot no longer makes your own abilities look like quest abilities. Each cast of a quest ability counts.
+- A quest log the game reads back empty for a moment no longer looks like every mission was dropped and picked up again.
+- A holocom call that turns into a face-to-face talk (or the other way) is two conversations.
+- In a group conversation, a reply another player won the roll for is not taken as yours.
+- What you clicked before a loading screen is never matched to something after it.
+- Quick teleports are seen even when the game was slow. An elevator window you closed without riding is not a ride.
+- Logging in another character ends the recording and starts a new one for that character.
+- Summer time ending or a clock correction no longer moves the times in a recording.
+- If you change the profile while it records, your file is kept as you saved it and the recording goes on in
+  "<name> (recorder copy).xml".
+- Carrying on a recording works from the 3rd part on, only for the same character, only when the missions it left open are
+  still in your log, and only where that run was. A weekly alone never carries a run on, and a profile you changed after
+  the recording starts a new one.
+- Make profile uses every part of a carried-on recording, and keeps your old profile in "_fixer backups" first.
+- Files are written so a crash halfway leaves the old file as it was. A problem with the notes draft never stops the
+  profile from being saved.
+- Profile and recording folder settings with quotes or spaces around them work. A folder that can't be made falls back to
+  the default one.
+- The pause and wait hotkeys can be changed in the settings (Ctrl+Shift+P and Ctrl+Shift+W by default).
+- Updates: your old version is backed up first and put back if the update fails halfway. Quest Recorder's folder is found
+  even when it isn't called QuestRecorder. A slow check says "still checking" instead of "you have the latest".
+- The installer saves and removes other copies of Quest Recorder in Plugins (like QuestRecorder-main), so BuddyCron loads
+  only one.
+- Record from here: the new bit goes in after the step you picked, with its fights and code, never after the profile's end.
+  An unfinished bit isn't added.
+- Control panel: fights get their own fight area, reward steps run while the reward waits, a weekly pick-up runs whenever
+  it isn't in your log, and "Click once" walks there first. Steps you add get short labels.
+- Control panel: it never saves over a profile that changed on disk (it loads it again), and makes no changes to the
+  profile that is being recorded.
+- "Do by hand" pop-ups from the review list and the control panel have a working Continue button.
+- Send report: your character names and Windows user name are hidden without changing other words, it works on the
+  recording going on now, and the profile of a carried-on recording is in it.
 
 1.3
 - Profiles you record now run on plain BuddyCron: anyone can load and run them without Quest Recorder installed.

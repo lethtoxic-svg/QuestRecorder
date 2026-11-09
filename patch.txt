@@ -5,9 +5,19 @@ main
 - Profile comments and fight names are short step labels only.
 - Walking out through a door runs while you are still inside (Black Hole Glow).
 - Objects are clicked from where you stood. Pick-ups from objects are pinned to that exact object.
+- Missions from a mission board are taken only when the board lists them for you, otherwise the bot moves straight on.
 - A task's last count is kept when the mission finished on it (Section X Research Stations 3/3).
 - Staged bonus missions wait for the stage before them. The Field Generator is walked up to and clicked before its boss fight.
 - An object that starts waves is clicked once, not again and again (End of Torvix).
 - PvP missions are left out of profiles.
 - A profile with anything plain BuddyCron can't run is named "(not finished)" and says so when it starts.
 - Recording starts only when you press Start recording. It no longer starts by itself when BuddyCron opens.
+- Mission items used in a row walk to each spot and only take an NPC near it, never yourself.
+- Missions you dropped and the game's own helper quests are left out of profiles.
+- Daily, weekly and heroic missions are recognised in the German and French clients too.
+- A step where you only waited: the bot waits there too. One kill for two tasks: the fight goes on until both are done.
+- Talking to your companion and a revive at a medical center are never steps.
+- A kill another player tagged counts when your mission count moved with it.
+- If you change the profile while it records, your file is kept and the recording goes on in a "(recorder copy)".
+- Carrying on a recording: only the same character, and only while its missions are still in your log.
+- Updates back up your old version first and put it back if they fail. The installer removes other copies in Plugins.
