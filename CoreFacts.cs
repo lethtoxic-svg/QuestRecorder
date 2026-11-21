@@ -170,6 +170,26 @@ namespace QuestRecorder
         /// <summary>Your companions' node ids (from the combat log): never a mission's NPC.</summary>
         public readonly HashSet<ulong> Companions = new HashSet<ulong>();
 
+        /// <summary>
+        /// The mission the game ended this one with: it took this one out of your log (not done, not given up) in the same
+        /// moment that mission completed. A heroic's bonus does that (Tatooine's Crash Cleanup went at 5 of 12 when Black Box
+        /// was done, A Shot at Bloodgouge with Blood and Sand). 0 when the game didn't.
+        /// </summary>
+        public ulong EndedWith(ulong q)
+        {
+            if (q == 0 || Tracks.Exists(t => t.Quest == q && t.Kind == TrackKind.Completed))
+                return 0;
+            foreach (Track t in Tracks)
+            {
+                if (t.Quest != q || t.Kind != TrackKind.Removed || t.Ev == null || t.Ev.Kind != EvKind.QuestRemoved)
+                    continue;
+                foreach (Track o in Tracks)
+                    if (o.Kind == TrackKind.Completed && o.Quest != q && Math.Abs(o.At - t.At) <= 0.6)
+                        return o.Quest;
+            }
+            return 0;
+        }
+
         private readonly HashSet<string> _castPrefixes = new HashSet<string>(StringComparer.Ordinal) { "Using " };
         private readonly HashSet<string> _mounts = new HashSet<string>(StringComparer.Ordinal);
         private readonly List<KeyValuePair<double, LogEnt>> _myTarget = new List<KeyValuePair<double, LogEnt>>();
@@ -212,7 +232,7 @@ namespace QuestRecorder
             // a click on the NPC an item went on (to pick it, or a click right after that opened nothing) is not a talk
             foreach (Fact u in c.Facts.FindAll(x => x.Kind == FactKind.Item && x.Target != null && !x.LogOnly))
                 c.DropClickOn(u);
-            c.Facts.Sort((a, b) => a.At.CompareTo(b.At));
+            Fmt.StableSort(c.Facts, (a, b) => a.At.CompareTo(b.At));
             c.CollectTracks();
             return c;
         }
@@ -733,6 +753,25 @@ namespace QuestRecorder
         /// </summary>
         private void FindHops()
         {
+            // when you were moved: a row seen just after a loading screen was moved when the screen came up (the Fleet's
+            // Heroic Transport: pressed, a 5 s cast, then 5.5 s of loading)
+            var moveAt = new double[Events.Count];
+            var loadLook = new HashSet<int>();
+            for (int k = 0; k < Events.Count; k++)
+            {
+                moveAt[k] = AtOf[k];
+                if (Events[k].Kind == EvKind.Loading || Events[k].Kind == EvKind.AreaChange)
+                    loadLook.Add(LookOf[k]);
+            }
+            for (int k = 0; k < Events.Count; k++)
+            {
+                if (Events[k].Kind != EvKind.Loading || Events[k].DurationMs <= 0)
+                    continue;
+                double began = AtOf[k] - Events[k].DurationMs / 1000.0;
+                for (int j = 0; j < Events.Count; j++)
+                    if (LookOf[j] == LookOf[k])
+                        moveAt[j] = Math.Min(moveAt[j], began);
+            }
             for (int i = 0; i < Events.Count; i++)
             {
                 RecEvent e = Events[i];
@@ -743,12 +782,12 @@ namespace QuestRecorder
                 if (e.Pos.IsZero)
                     continue;
                 int land = -1;
-                for (int k = i + 1; k < Events.Count && AtOf[k] - AtOf[i] <= 9; k++)
+                for (int k = i + 1; k < Events.Count && moveAt[k] - AtOf[i] <= 9; k++)
                 {
                     RecEvent r = Events[k];
-                    if (r.Kind == EvKind.Jump || r.Kind == EvKind.AreaChange || r.Kind == EvKind.Loading)
+                    if (r.Kind == EvKind.Jump || r.Kind == EvKind.AreaChange || r.Kind == EvKind.Loading || loadLook.Contains(LookOf[k]))
                     {
-                        if (AtOf[k] - AtOf[i] >= 3)
+                        if (moveAt[k] - AtOf[i] >= 3)
                             land = k;
                         break;
                     }
@@ -769,10 +808,17 @@ namespace QuestRecorder
                 f.LandArea = Events[land].AreaId;
                 if (Events[land].Kind != EvKind.Jump)
                     f.Notes.Add("no jump row: the move after it is read as the landing");
+                // the log's own press of it: the hop's (never a mission item use of its own as well)
+                LogLine act = MatchAct(string.Empty, f.Item, AtOf[i] - 8, AtOf[i]);
+                if (act != null)
+                {
+                    f.LogAbility = act.AbilityId;
+                    f.Cast = act.Ability;
+                }
                 _hopRows.Add(i);
-                for (int k = i + 1; k < land; k++)
-                    if (Events[k].Kind == EvKind.QuestItem)
-                        _hopRows.Add(k); // a row while the transport's cast ran
+                for (int k = i + 1; k < Events.Count && (k <= land || LookOf[k] == LookOf[land]); k++)
+                    if (Events[k].Kind == EvKind.QuestItem && (k < land || Events[k].Option == f.Item))
+                        _hopRows.Add(k); // a row while the transport's cast ran, or the same item seen again as you landed
                 Facts.Add(f);
             }
         }
@@ -914,6 +960,8 @@ namespace QuestRecorder
             string item = e.Option;
             if (item.Length == 0)
                 return;
+            if (e.Note.IndexOf("item gone", StringComparison.OrdinalIgnoreCase) >= 0 && Facts.Exists(h => h.Kind == FactKind.Hop && h.Item == item))
+                return; // a transport the game took from your bags (its mission moved on): not a use of it
             double t = AtOf[i];
             bool logHere = HasLog && LogCovers(t);
             foreach (Fact g in Facts)

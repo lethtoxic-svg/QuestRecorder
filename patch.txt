@@ -1,5 +1,5 @@
-1.4
+1.4a
 main
-- Profiles are written with BuddyCron's own steps, like a hand-made profile, from the game's own mission ids and the combat log.
-- Turn on Combat Logging in the game's Preferences before you record.
-- Fixes for pick-ups, mission items, talks, fights, lifts and hand-ins: see PATCHNOTES.txt.
+- Each step runs only on the map you did it on, and transports that share a name (Korriban) land the bot at the right mission.
+- Tatooine: the Prison Labor transport is found, Call Down the Thunder is tied to the right mission, and Black Box's reward comes after the ambush.
+- Bonus missions the game ends with their heroic are done as far as you did them, and Korriban's slugs are one fight. See PATCHNOTES.txt.

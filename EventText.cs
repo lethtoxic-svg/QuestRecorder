@@ -100,6 +100,8 @@ namespace QuestRecorder
                 case EvKind.QuestItem:
                     if (e.Note == "equipped")
                         return "Put on \"" + e.Option + "\"";
+                    if (e.Note == "item gone")
+                        return "Quest item \"" + e.Option + "\" left your bags (used up, or the game took it)";
                     return (e.Note == "ability" ? "Used quest ability \"" : "Used quest item \"") + e.Option + "\"" + (e.Target != null ? " on " + Short(e.Target) : string.Empty);
                 case EvKind.Cast:
                     return "Cast \"" + (e.Option.Length > 0 ? e.Option : "?") + "\" for " + Fmt.Duration(e.DurationMs / 1000.0) + " (started out of combat)" +

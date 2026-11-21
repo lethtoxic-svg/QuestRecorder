@@ -1019,6 +1019,8 @@ namespace QuestRecorder
             public bool Raw;
             /// <summary>The new core's plain words for what the bot does (the task tracker's line).</summary>
             public string What = string.Empty;
+            /// <summary>Of missions whose transports share one name (0 = none): see <see cref="RepeatShared"/>.</summary>
+            public int Group;
         }
 
         /// <summary>A conversation and the replies you picked ("2 dark"; "?" when not seen).</summary>
@@ -1867,6 +1869,44 @@ namespace QuestRecorder
             return hook;
         }
 
+        /// <summary>
+        /// A quest item row at a loading screen or a jump, for an item used in the minute before it: the same use (its
+        /// cooldown seen again where you landed: Prison Labor's came back 15 s after the press), not a second press.
+        /// </summary>
+        private static bool SameUseLanded(IList<RecEvent> events, int i)
+        {
+            RecEvent e = events[i];
+            bool landing = false;
+            for (int j = i - 1; j >= 0 && e.Elapsed - events[j].Elapsed <= 1 && !landing; j--)
+                landing = events[j].Kind == EvKind.Loading || events[j].Kind == EvKind.AreaChange || events[j].Kind == EvKind.Jump;
+            for (int j = i + 1; j < events.Count && events[j].Elapsed - e.Elapsed <= 1 && !landing; j++)
+                landing = events[j].Kind == EvKind.Loading || events[j].Kind == EvKind.AreaChange || events[j].Kind == EvKind.Jump;
+            if (!landing)
+                return false;
+            for (int j = i - 1; j >= 0 && e.Elapsed - events[j].Elapsed <= 60; j--)
+                if (events[j].Kind == EvKind.QuestItem && events[j].Option == e.Option && events[j].Note != "item gone")
+                    return true;
+            return false;
+        }
+
+        /// <summary>
+        /// The item whose use came just before this one (within 2 s, neither on a target): items that share a cooldown
+        /// (every Heroic Transport) all show it when you press one of them, so the later rows are most likely that press.
+        /// </summary>
+        private static string SharedCooldownWith(IList<RecEvent> events, int i)
+        {
+            RecEvent e = events[i];
+            if (e.Target != null || e.Note.Length > 0)
+                return null;
+            for (int j = i - 1; j >= 0 && e.Elapsed - events[j].Elapsed <= 2; j--)
+            {
+                RecEvent d = events[j];
+                if (d.Kind == EvKind.QuestItem && d.Option.Length > 0 && d.Option != e.Option && d.Target == null && d.Note.Length == 0)
+                    return d.Option;
+            }
+            return null;
+        }
+
         /// <summary>The step names only Quest Recorder knows (a profile must have none of them).</summary>
         public static readonly string[] RecorderOnlySteps = { "PickUpIfOffered", "TalkAndReply", "UseMissionItemOnce", "ClickObject", "UseQuestAbility", "EquipItem" };
 
@@ -1920,7 +1960,18 @@ namespace QuestRecorder
                     case EvKind.InteractionOpen: what = e.Option + " window with \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
                     case EvKind.ConvoStart: what = "talked to \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
                     case EvKind.ConvoChoice: what = "reply " + (e.OptionGuessed ? "? (not seen)" : e.Option) + (e.Choices != null ? " of [" + string.Join(" | ", e.Choices.ToArray()) + "]" : string.Empty); break;
-                    case EvKind.QuestItem: what = "used item \"" + e.Option + "\"" + (e.Target != null ? " on \"" + e.Target.Name + "\"" : string.Empty); break;
+                    case EvKind.QuestItem:
+                        if (e.Note == "item gone")
+                        {
+                            what = "item \"" + e.Option + "\" left your bags (used up, or the game took it)";
+                            break;
+                        }
+                        if (SameUseLanded(events, i))
+                            continue; // the transport you had just used, seen again as you landed: not a second use
+                        string with = SharedCooldownWith(events, i);
+                        what = with != null ? "item \"" + e.Option + "\" went on cooldown with \"" + with + "\" (they share one: most likely not pressed)"
+                                            : "used item \"" + e.Option + "\"" + (e.Target != null ? " on \"" + e.Target.Name + "\"" : string.Empty);
+                        break;
                     case EvKind.ElevatorRide: what = "rode \"" + (e.Target != null ? e.Target.Name : "?") + "\" to " + (e.Option.Length > 0 ? e.Option : "?"); break;
                     case EvKind.TaxiStart: what = "took a taxi"; break;
                     case EvKind.Marker: what = e.Note == UndoNote ? "you ignored your last action" : e.Note == PauseNote ? "pause here (you do it by hand)" : e.Note == WaitNote ? "wait here 10 s" : "marker " + e.Note; break;
@@ -1949,7 +2000,7 @@ namespace QuestRecorder
                     why = "your reply wasn't seen - the bot will take its own side's reply here";
                 if (e.Kind == EvKind.Command && after.Count == 0)
                     continue; // a key over something that did nothing: not worth a line
-                list.Add((why != null ? "!! " : "OK ") + Fmt.Duration(e.Elapsed).PadRight(10) + what.PadRight(47) + X(where).PadRight(27) + "-> " +
+                list.Add((why != null ? "!! " : "OK ") + Fmt.Duration(e.Elapsed).PadRight(10) + (what + " ").PadRight(47) + (X(where) + " ").PadRight(27) + "-> " +
                          (after.Count > 0 ? string.Join("; ", after.ToArray()) : "nothing") + (why != null ? "  - " + why : string.Empty));
             }
             return list;
@@ -4743,7 +4794,10 @@ namespace QuestRecorder
             List<CoreRender.Block> core = UseCore ? CoreBefore(steps, loaded) : null;
             PlainSteps(steps);
             if (core != null)
+            {
                 CoreAfter(steps, core, convos, dark > light ? "dark" : (light > dark ? "light" : null));
+                RepeatShared(steps);
+            }
             // Missions that were already in your log when you started recording (the game never said they were added) and
             // that have steps here but no pick-up: the profile can't know where they come from. At the start, when none of
             // them is in your log, a window asks you to pick them up and goes on by itself after 2 minutes. (Only when none
@@ -4868,6 +4922,18 @@ namespace QuestRecorder
                         return sq == 0 || coreQuests.Contains(sq); // (a quest the new core has nothing for keeps its old steps)
                 }
             });
+            // a pick-up that stays: only in the area you took it in (a board's walk on another map is a walk to nowhere:
+            // Korriban's heroics walked to the Fleet's board on Korriban)
+            foreach (Step s in steps)
+            {
+                if (s.Kind != "Pickup")
+                    continue;
+                ulong area = AreaAt(c, s.At);
+                if (area == 0)
+                    continue;
+                string here = "(Core.Player.AreaId == " + Fmt.Hex(area) + ")";
+                s.Gate = string.IsNullOrEmpty(s.Gate) ? here : s.Gate + " and " + here;
+            }
             // a board pick-up the steps above have: theirs (it moves on when the board doesn't list the mission)
             blocks.RemoveAll(b => b.Step.Kind == StepKind.Pickup && b.Board && boardQuests.Contains(Fmt.Hex(b.Quest)));
             int no = 0;
@@ -4878,6 +4944,59 @@ namespace QuestRecorder
             if (LastCoverage.Length > 0 && c.Log.Count == 0)
                 LastCoverage += " No combat log was written while you recorded: turn on \"Enable Combat Logging\" in the game's Preferences (Combat Logging) for a better profile.";
             return blocks;
+        }
+
+        /// <summary>The area you were in at a moment of the recording (the last row at or before it that names one; 0 = none).</summary>
+        private static ulong AreaAt(CoreFacts c, double t)
+        {
+            ulong area = 0;
+            for (int i = 0; i < c.Events.Count; i++)
+            {
+                if (c.AtOf[i] > t + 0.5 && area != 0)
+                    break;
+                if (c.Events[i].AreaId != 0)
+                    area = c.Events[i].AreaId;
+            }
+            return area;
+        }
+
+        /// <summary>
+        /// Missions whose transports share one name (Korriban's two "Heroic Transport"s): BuddyCron's UseItem presses the
+        /// first one it finds, so the bot can land at the other mission's site first. Their steps go by the site the bot is
+        /// at, and go round once more for each other mission of that name (a round only does what is still to do).
+        /// </summary>
+        private static void RepeatShared(List<Step> steps)
+        {
+            var groups = new SortedSet<int>();
+            foreach (Step s in steps)
+                if (s.Group > 0)
+                    groups.Add(s.Group);
+            foreach (int g in groups)
+            {
+                int first = steps.FindIndex(s => s.Group == g), last = steps.FindLastIndex(s => s.Group == g);
+                List<Step> mine = steps.GetRange(first, last - first + 1).FindAll(s => s.Group == g);
+                var open = new List<string>();
+                var quests = new HashSet<ulong>();
+                foreach (Step s in mine)
+                    if (s.Quest != 0 && quests.Add(s.Quest))
+                        open.Add("(HasQuest(" + Fmt.Hex(s.Quest) + ") and not IsQuestComplete(" + Fmt.Hex(s.Quest) + "))");
+                var again = new List<Step>();
+                for (int round = 1; round < quests.Count; round++)
+                {
+                    var r = new Step { Kind = "Qr", Raw = true, At = steps[last].At, Comment = "Again: the mission the transport didn't take the bot to first" };
+                    r.Lines.Add("<If Condition=\"" + A(string.Join(" or ", open.ToArray())) + "\">");
+                    foreach (Step s in mine)
+                    {
+                        if (s.Comment.Length > 0)
+                            r.Lines.Add("\t<!-- " + Fmt.XmlComment(s.Comment) + " -->");
+                        foreach (string l in s.Lines)
+                            r.Lines.Add("\t" + l);
+                    }
+                    r.Lines.Add("</If>");
+                    again.Add(r);
+                }
+                steps.InsertRange(last + 1, again);
+            }
         }
 
         /// <summary>The quest a step of the steps above is for (its own, else the first HasQuest of its gate); 0 = none.</summary>
@@ -4903,7 +5022,7 @@ namespace QuestRecorder
             {
                 bool pickup = b.Step.Kind == StepKind.Pickup;
                 var s = new Step { Kind = pickup ? "Pickup" : "Qr", Raw = true, Gate = b.No > 0 ? b.Gate : null, Quest = pickup ? 0 : b.Quest, At = b.At,
-                                   Board = b.Board, Comment = (b.No > 0 ? b.No.ToString(CultureInfo.InvariantCulture) + ". " : string.Empty) + b.Label };
+                                   Board = b.Board, Group = b.Group, Comment = (b.No > 0 ? b.No.ToString(CultureInfo.InvariantCulture) + ". " : string.Empty) + b.Label };
                 foreach (string l in b.Run)
                     s.Lines.Add(l.TrimStart('\t'));
                 foreach (string u in b.Unsure)

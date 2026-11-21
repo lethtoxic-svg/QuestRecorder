@@ -11,6 +11,22 @@ namespace QuestRecorder
     {
         private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
+        /// <summary>Sorts in place, keeping the list's own order for equal items (List.Sort can swap them, and then two steps
+        /// of one moment come out in a different order from one recording to the next).</summary>
+        public static void StableSort<T>(System.Collections.Generic.List<T> list, Comparison<T> cmp)
+        {
+            var a = new System.Collections.Generic.KeyValuePair<int, T>[list.Count];
+            for (int i = 0; i < a.Length; i++)
+                a[i] = new System.Collections.Generic.KeyValuePair<int, T>(i, list[i]);
+            Array.Sort(a, (x, y) =>
+            {
+                int r = cmp(x.Value, y.Value);
+                return r != 0 ? r : x.Key.CompareTo(y.Key);
+            });
+            for (int i = 0; i < a.Length; i++)
+                list[i] = a[i].Value;
+        }
+
         /// <summary>A coordinate with exactly 3 decimals, never "-0.000".</summary>
         public static string F3(float v)
         {

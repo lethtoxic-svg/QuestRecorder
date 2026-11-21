@@ -1,5 +1,28 @@
 Quest Recorder patch notes - LethToxic
 
+1.4a
+- Every step runs only in the area you did it in: a mission board pick-up only on the fleet, a planet's step only on
+  that planet (the bot no longer walks to a spot of another map).
+- Missions whose transports share a name (Korriban's two "Heroic Transport"s): the bot uses the transport until it stands
+  where that mission's steps are, never does one mission's steps while it stands at the other's, and goes round once
+  more for the mission the transport didn't take it to first.
+- A transport is tied to the mission its name holds (Tatooine's Call Down the Thunder was tied to War on Spice when the
+  weekly reset took them both at once).
+- A transport from the fleet with a long loading screen is found (Tatooine's Prison Labor transport was missing, so the
+  bot never left the fleet).
+- Where a transport put you is checked with height too (Nar Shaddaa's heroics sit floor above floor).
+- A step whose kills the game counts in hidden parts is one fight with every kind you killed for it (Korriban's
+  "Slay the K'lor'slugs": all four slugs, not one fight per slug).
+- Two objects of one name at one spot (Korriban's two Red Engines): the bot takes the usable one and doesn't need to see
+  it first. A container that came back after you used it is not a second object.
+- A bonus mission the game ends when its heroic or daily is done (Tatooine's Crash Cleanup at 5 of 12, Section X's
+  Prison Break): the bot does as many as you did, not the full count, and doesn't go to the board to take it on its own
+  (Tatooine's A Shot at Bloodgouge comes with Blood and Sand).
+- A mission's reward never comes before its last step when both happened at the same moment (Tatooine's Black Box
+  ambush), and steps of the same moment keep the order you did them in.
+- "What you did" no longer lists transport presses you never made: an item the game took away says so, the transport
+  seen again as you landed isn't listed, and items that share a cooldown with the one you pressed say so.
+
 1.4
 - Profiles are made a new way: each mission step is tied to what you did for it by the game's own ids for that step and
   by the game's combat log, and each step is written with BuddyCron's own steps (pick up, fight, click, use an item,

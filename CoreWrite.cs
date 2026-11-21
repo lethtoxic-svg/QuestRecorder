@@ -24,6 +24,10 @@ namespace QuestRecorder
         [ThreadStatic] private static HashSet<string> _areaNames;
         /// <summary>Missions the recording saw on more than one branch (their steps are asked by branch).</summary>
         [ThreadStatic] private static HashSet<ulong> _branched;
+        /// <summary>Where each transport put you, with the steps you did there.</summary>
+        [ThreadStatic] private static List<Site> _sites;
+        /// <summary>What the block being made also needs to be true (null = nothing): not at another open mission's site.</summary>
+        [ThreadStatic] private static string _extra;
 
         public static string AreasXml
         {
@@ -139,7 +143,9 @@ namespace QuestRecorder
                 else if (fb != x.Branch)
                     _branched.Add(x.Quest);
             }
-            CoreRender.Stretch(steps);
+            CoreRender.Stretch(steps, c);
+            MergeHiddenKills(c, steps);
+            _sites = Sites(c, steps);
             // the clicks that opened a mission board (a board pick-up's own): never a mission step's action
             var boardClicks = new List<Fact>();
             foreach (CoreStep x in steps)
@@ -168,10 +174,21 @@ namespace QuestRecorder
                     while (last + 1 < steps.Count && steps[last + 1].Kind == StepKind.Item && steps[last + 1].Quest == s.Quest &&
                            steps[last + 1].Step == s.Step && steps[last + 1].Task < 0)
                         last++;
-                CoreRender.Block b = last > i ? Row(c, steps, i, last, names) : Make(c, steps, i, names);
+                Site held = HeldBy(s);
+                _extra = held != null ? "not (" + Busy(held) + ")" : null;
+                CoreRender.Block b;
+                try
+                {
+                    b = last > i ? Row(c, steps, i, last, names) : Make(c, steps, i, names);
+                }
+                finally
+                {
+                    _extra = null;
+                }
                 i = last;
                 if (b == null)
                     continue;
+                b.Group = GroupOf(s);
                 if (s.Kind != StepKind.Reward)
                     b.No = ++no;
                 blocks.Add(b);
@@ -187,7 +204,7 @@ namespace QuestRecorder
             b.Yellow = s.Rank >= 3;
             string text = CoreRender.TaskText(c, s);
             string on = CoreRender.TargetName(s);
-            if (s.Task < 0 && text.Length > 0 && on.Length > 0 && text.IndexOf(on, StringComparison.OrdinalIgnoreCase) < 0 &&
+            if (s.Task < 0 && !s.Merged && text.Length > 0 && on.Length > 0 && text.IndexOf(on, StringComparison.OrdinalIgnoreCase) < 0 &&
                 s.Kind != StepKind.Walk && s.Kind != StepKind.Hop && s.Kind != StepKind.Reward && s.Kind != StepKind.HandIn && s.Kind != StepKind.Pickup)
                 text += " (" + on + ")";
             string count = s.CountTo > 1 ? " (" + s.CountTo + ")" : string.Empty;
@@ -200,6 +217,9 @@ namespace QuestRecorder
                                          steps.Exists(n => n != s && n.Quest == s.Quest && n.Branch == s.Branch && n.Step == s.Step && n.Task != s.Task &&
                                                            n.Kind != StepKind.Walk && n.Kind != StepKind.Reward));
             string todo = Todo(s);
+            // (in the area you did it; a fight's While keeps only the area: a fight that runs on past a site's edge goes on)
+            string here = Here(s, todo);
+            string hereWhile = InArea(s, todo);
             var run = b.Run;
             switch (s.Kind)
             {
@@ -211,7 +231,7 @@ namespace QuestRecorder
                     if (cause == null || cause.Target == null || cause.Target.Name.Length == 0)
                     {
                         Look(b, "no giver was seen for this mission: the bot can't pick it up");
-                        b.Gate = "not HasQuest(" + H(s.Quest) + ")";
+                        b.Gate = Here(s, "not HasQuest(" + H(s.Quest) + ")");
                         return b; // nothing written: the travel builder's own pick-up (if any) is kept
                     }
                     string giver = cause.Target.Name;
@@ -220,7 +240,7 @@ namespace QuestRecorder
                     {
                         // a mission board: the board read (the plain pass turns this into BuddyCron's TakeFromBoard hook,
                         // which takes it when the board lists it and otherwise moves straight on)
-                        b.Gate = "not HasQuest(" + H(s.Quest) + ")";
+                        b.Gate = Here(s, "not HasQuest(" + H(s.Quest) + ")");
                         run.Add(If(b.Gate));
                         Stand(run, giver, cause.Me, gp);
                         run.Add("\t<PickUpQuest QuestId=\"" + H(s.Quest) + "\" QuestName=\"" + A(CoreRender.Name(s)) + "\" GiverName=\"" + A(giver) +
@@ -233,7 +253,7 @@ namespace QuestRecorder
                         // name), then BuddyCron's PickUpQuest
                         b.Talk = giver;
                         b.TalkAt = gp;
-                        b.Gate = "not HasQuest(" + H(s.Quest) + ") and not IsQuestComplete(" + H(s.Quest) + ")";
+                        b.Gate = Here(s, "not HasQuest(" + H(s.Quest) + ") and not IsQuestComplete(" + H(s.Quest) + ")");
                         run.Add(If(b.Gate));
                         Stand(run, giver, cause.Me, gp);
                         run.Add("\t<PickUpQuest QuestId=\"" + H(s.Quest) + "\" QuestName=\"" + A(CoreRender.Name(s)) + "\" GiverName=\"" + A(giver) +
@@ -247,7 +267,7 @@ namespace QuestRecorder
                 case StepKind.KillLoot:
                 {
                     b.Label = text.Length > 0 ? text + count : "Kill" + (on.Length > 0 ? " " + on : string.Empty) + count;
-                    b.Gate = todo;
+                    b.Gate = here;
                     List<string> mobs = TargetNames(s, names, true, false);
                     List<Vec3> fightSpots = new List<Vec3>(s.Spots);
                     if (s.Task < 0)
@@ -256,8 +276,8 @@ namespace QuestRecorder
                     {
                         // one fight before the step's last action: go where you fought; BuddyCron fights what is there (the next
                         // step's own tag clears what stands at its spot)
-                        b.Gate = todo;
-                        run.Add(If(todo));
+                        b.Gate = here;
+                        run.Add(If(here));
                         if (s.Spots.Count > 0)
                             run.Add("\t<MoveTo QuestId=\"" + H(s.Quest) + "\" Name=\"" + A(mobs.Count > 0 ? mobs[0] : "Where you fought") + "\" XYZ=\"" + X(s.Spots[0]) + "\" />");
                         run.Add("</If>");
@@ -265,8 +285,8 @@ namespace QuestRecorder
                         break;
                     }
                     string area = Area(b.Label, s, mobs, fightSpots);
-                    run.Add(If(todo));
-                    run.Add("\t<Grind GrindRef=\"" + A(area) + "\" While=\"" + A(todo) + "\" />");
+                    run.Add(If(here));
+                    run.Add("\t<Grind GrindRef=\"" + A(area) + "\" While=\"" + A(hereWhile) + "\" />");
                     run.Add("</If>");
                     if (mobs.Count == 0)
                         Look(b, "no name for what this step counts: the bot walks your fight spots and fights what attacks it");
@@ -277,7 +297,7 @@ namespace QuestRecorder
                 case StepKind.Use:
                 {
                     b.Label = text.Length > 0 ? text + count : (s.Kind == StepKind.Collect ? "Collect" : "Use") + (on.Length > 0 ? " " + on : string.Empty) + count;
-                    b.Gate = multi || Partial(s) ? OnTask(s) : todo;
+                    b.Gate = Here(s, multi || Partial(s) ? OnTask(s) : todo);
                     Fact first = s.Causes.Find(f => f.Kind == FactKind.UseObject && f.Target != null && f.Target.Name.Length > 0);
                     // for a click done once: the last click with a cast bar (the one the game acted on), else the last click
                     Fact did = null;
@@ -336,10 +356,10 @@ namespace QuestRecorder
                         {
                             // (counted by what you looted only)
                             string ga = Area(b.Label, s, mobs, s.Spots);
-                            run.Add(If(todo));
-                            run.Add("\t<Grind GrindRef=\"" + A(ga) + "\" While=\"" + A(todo) + "\" />");
+                            run.Add(If(here));
+                            run.Add("\t<Grind GrindRef=\"" + A(ga) + "\" While=\"" + A(hereWhile) + "\" />");
                             run.Add("</If>");
-                            b.Gate = todo;
+                            b.Gate = here;
                             b.What = "fight " + Join(mobs) + " (BuddyCron loots them)";
                             break;
                         }
@@ -370,7 +390,13 @@ namespace QuestRecorder
                         sb.Append(" TaskValue=\"").Append(U(s.CountTo - 1)).Append('"');
                     if (objects.Count == 1)
                         sb.Append(" ObjectName=\"").Append(A(objects[0])).Append('"');
-                    sb.Append(" XYZ=\"").Append(X(spots[0])).Append("\" Radius=\"").Append(one ? "10" : "30").Append("\" UseRange=\"4\" WaitTime=\"500\">");
+                    sb.Append(" XYZ=\"").Append(X(spots[0])).Append("\" Radius=\"").Append(one ? "10" : "30").Append("\" UseRange=\"4\" WaitTime=\"500\"");
+                    // two objects of that name at one spot (Korriban's Red Engine, the upper and lower machine): the game can
+                    // tie the mission to the one that isn't usable, so the bot takes the usable one of the name there
+                    bool twin = one && first != null && Twin(c, first.Target);
+                    if (twin)
+                        sb.Append(" IgnoreQuestRelation=\"True\" IgnoreLOS=\"True\"");
+                    sb.Append('>');
                     if (objects.Count > 1)
                     {
                         sb.Append("<Placeables>");
@@ -388,13 +414,14 @@ namespace QuestRecorder
                     sb.Append("</UseObject>");
                     run.Add(sb.ToString());
                     run.Add("</If>");
-                    b.What = "use " + Join(objects) + (one ? string.Empty : " at your " + spots.Count + " spots") + (mobs.Count > 0 ? ", fighting " + Join(mobs) + " there" : string.Empty);
+                    b.What = "use " + Join(objects) + (one ? string.Empty : " at your " + spots.Count + " spots") + (mobs.Count > 0 ? ", fighting " + Join(mobs) + " there" : string.Empty) +
+                             (twin ? " (the usable one of the two there)" : string.Empty);
                     break;
                 }
                 case StepKind.Talk:
                 {
                     b.Label = text.Length > 0 ? text : "Talk" + (on.Length > 0 ? " to " + on : string.Empty);
-                    b.Gate = multi ? OnTask(s) : todo;
+                    b.Gate = Here(s, multi ? OnTask(s) : todo);
                     Fact cause = s.Causes.Find(f => f.Kind == FactKind.Talk && f.Target != null && f.Target.Name.Length > 0);
                     if (cause == null)
                     {
@@ -414,7 +441,7 @@ namespace QuestRecorder
                 case StepKind.Item:
                 {
                     b.Label = text.Length > 0 ? text + count : "Use " + (s.Item.Length > 0 ? s.Item : s.Cast) + count;
-                    b.Gate = multi || Partial(s) ? OnTask(s) : todo;
+                    b.Gate = Here(s, multi || Partial(s) ? OnTask(s) : todo);
                     if (s.Item.Length == 0)
                     {
                         Look(b, "the mission item's name was not seen");
@@ -435,7 +462,7 @@ namespace QuestRecorder
                 case StepKind.Ability:
                 {
                     b.Label = text.Length > 0 ? text + count : "Use " + s.Cast + count;
-                    b.Gate = multi || Partial(s) ? OnTask(s) : todo;
+                    b.Gate = Here(s, multi || Partial(s) ? OnTask(s) : todo);
                     if (s.Cast.Length == 0)
                     {
                         Look(b, "the combat log gave no name for this ability: the bot can't use it");
@@ -455,7 +482,7 @@ namespace QuestRecorder
                 case StepKind.Walk:
                 {
                     b.Label = text.Length > 0 ? text : CoreRender.ByItself(s, text) ? "Wait for the game to move it on" : "Go on where it ticked";
-                    b.Gate = todo;
+                    b.Gate = here;
                     if (CoreRender.ByItself(s, text))
                         b.Yellow = false; // (a stage the game passes through by itself: the next step's tag waits for it)
                     else if (CoreRender.Arrived(s))
@@ -464,7 +491,7 @@ namespace QuestRecorder
                         Look(b, "nothing you did was tied to this step: the bot walks to where it ticked");
                     if (s.Spots.Count == 0)
                         return null;
-                    run.Add(If(todo));
+                    run.Add(If(here));
                     run.Add("\t<MoveTo QuestId=\"" + H(s.Quest) + "\" Name=\"Where it moved on\" XYZ=\"" + X(s.Spots[0]) + "\" />");
                     run.Add("</If>");
                     b.What = "walk to where it moved on";
@@ -483,7 +510,7 @@ namespace QuestRecorder
                 case StepKind.HandIn:
                 {
                     b.Label = "Hand in " + CoreRender.Name(s);
-                    b.Gate = Open(s.Quest);
+                    b.Gate = Here(s, Open(s.Quest));
                     Fact cause = s.Causes.Find(f => f.Target != null && f.Target.Name.Length > 0);
                     if (cause == null)
                     {
@@ -524,11 +551,11 @@ namespace QuestRecorder
                 {
                     // walk to where you stood, then a pause for you: the order is the game's own puzzle
                     b.Label = text.Length > 0 ? text : "Puzzle";
-                    b.Gate = todo;
+                    b.Gate = here;
                     b.Yellow = true;
                     Fact f = s.Causes.Count > 0 ? s.Causes[0] : null;
                     string what = f != null && f.Target != null && f.Target.Name.Length > 0 ? f.Target.Name : "the controls";
-                    run.Add(If(todo));
+                    run.Add(If(here));
                     if (f != null && !f.Me.IsZero)
                         run.Add("\t<MoveTo QuestId=\"" + H(s.Quest) + "\" Name=\"" + A(what) + "\" XYZ=\"" + X(f.Me) + "\" />");
                     run.Add("\t<UserDialog Title=\"Quest Recorder\" Message=\"" + A("Do the puzzle at " + what + " by hand, then press Continue.") +
@@ -560,7 +587,7 @@ namespace QuestRecorder
             }
             string text = CoreRender.TaskText(c, s);
             b.Label = text.Length > 0 ? text : "Use " + string.Join(", ", items.ToArray());
-            b.Gate = Todo(s);
+            b.Gate = Here(s, Todo(s));
             // another action after the row moves the step on: the row once; else the row again until the step moves on
             bool once = steps.FindIndex(to + 1, n => n.Quest == s.Quest && n.Branch == s.Branch && n.Step == s.Step && n.Task < 0 && CoreRender.Action(n.Kind)) >= 0;
             b.Run.Add(If(b.Gate));
@@ -677,7 +704,11 @@ namespace QuestRecorder
             b.What = "use " + s.Item + (npcs.Count > 0 ? " on " + Join(npcs) : " where you stood") + (fight ? " (in a fight too" + (hp > 0f && hp < 100f ? ", once its health is down to " + (int)hp + "%" : string.Empty) + ")" : string.Empty);
         }
 
-        /// <summary>A mission item that moved you (a transport): used until you are where it put you.</summary>
+        /// <summary>
+        /// A mission item that moved you (a transport): used until you are at that mission's site (where it put you and where
+        /// you did its steps there). When another mission's transport has the same name, BuddyCron's UseItem may press that
+        /// one: it is used until you are at either site, and the steps then go by the site you are at.
+        /// </summary>
         private static CoreRender.Block Hop(CoreFacts c, List<CoreStep> steps, int at, CoreRender.Block b)
         {
             CoreStep s = steps[at];
@@ -687,25 +718,29 @@ namespace QuestRecorder
             b.Label = "Use " + s.Item;
             string q = H(s.Quest);
             string have = "(any(i.Name == " + Fmt.PyStr(s.Item) + " for i in Me.QuestItems) or any(i.Name == " + Fmt.PyStr(s.Item) + " for i in Me.Backpack))";
+            Site site = _sites != null ? _sites.Find(x => x.Hop == s) : null;
             string away;
-            if (s.Landing.IsZero)
+            if (site == null)
             {
                 Look(b, "where it took you was not seen: the bot uses it while the mission is still on that step");
                 away = "True";
             }
-            else if (s.LandArea != 0 && s.Area != 0 && s.LandArea != s.Area)
-                away = "Core.Player.AreaId != " + H(s.LandArea);
             else
+                away = "not " + AtSite(site);
+            string gate = "HasQuest(" + q + ") and not IsStepComplete(" + q + ", " + U(onStep) + ") and " + away;
+            if (site != null && site.Shared)
             {
-                Vec3 from = s.Spots.Count > 0 ? s.Spots[0] : s.Landing;
-                double r = Math.Min(100.0, Math.Max(0.5, from.DistanceTo(s.Landing) / 2.0));
-                away = "((Me.Position.X - (" + Fmt.F3(s.Landing.X) + ")) ** 2 + (Me.Position.Z - (" + Fmt.F3(s.Landing.Z) + ")) ** 2) > " + (r * r).ToString("0.###", Inv);
+                string busy = Busy(site);
+                if (busy.Length > 0)
+                    gate += " and not (" + busy + ")";
+                b.Unsure.Add("another mission's transport is also called " + s.Item + ": BuddyCron uses the first one it finds, so the bot does whichever mission it lands at first, then the other");
             }
-            string gate = "HasQuest(" + q + ") and not IsStepComplete(" + q + ", " + U(onStep) + ") and " + away + " and " + have;
+            gate += " and " + have;
             // (the step it was used on is the mission's step at that time, read from the log: asked without the branch)
             Vec3 used = s.Causes.Count > 0 && !s.Causes[0].Me.IsZero ? s.Causes[0].Me : (s.Spots.Count > 0 ? s.Spots[0] : default(Vec3));
             // You went somewhere on purpose to use it (more than 5 units from where you finished the step before): the bot
-            // walks there first, without quick travel. Otherwise it is used wherever the bot stands, as you did.
+            // walks there first, without quick travel, when it is in that area. Otherwise it is used wherever the bot
+            // stands, as you did.
             double useAt = s.Causes.Count > 0 ? s.Causes[0].At : s.At;
             double prev = -1;
             foreach (CoreStep o in steps)
@@ -716,7 +751,13 @@ namespace QuestRecorder
             b.Gate = gate;
             b.Run.Add(If(gate));
             if (walk)
-                b.Run.Add("\t<MoveTo QuestId=\"1\" Name=\"Where you used " + A(s.Item) + "\" XYZ=\"" + X(used) + "\" />");
+            {
+                if (s.Area != 0)
+                    b.Run.Add("\t" + If("Core.Player.AreaId == " + H(s.Area)));
+                b.Run.Add((s.Area != 0 ? "\t\t" : "\t") + "<MoveTo QuestId=\"1\" Name=\"Where you used " + A(s.Item) + "\" XYZ=\"" + X(used) + "\" />");
+                if (s.Area != 0)
+                    b.Run.Add("\t</If>");
+            }
             // (no hotspot and a range of 10 km: BuddyCron's UseItem presses it where the bot stands, every tick until the
             // condition is false, which is once you have landed)
             b.Run.Add("\t<UseItem ItemName=\"" + A(s.Item) + "\" Condition=\"" + A(gate) + "\" Range=\"100000\" WaitTime=\"3000\" />");
@@ -739,7 +780,8 @@ namespace QuestRecorder
                 b.Gate = "(" + Open(q) + ") or " + waiting;
             b.After.Add(If("(" + Open(q) + ") or " + waiting));
             int most = (int)Math.Ceiling(Math.Max(16.0, waited * 1.5));
-            string still = Fmt.XmlAttr(Open(q) + " and not " + waiting);
+            // (not while you stand at another open mission's site: this one's reward can't be coming there)
+            string still = Fmt.XmlAttr(Open(q) + " and not " + waiting + (_extra != null ? " and " + _extra : string.Empty));
             for (int sofar = 0; sofar < most; sofar += 4)
                 b.After.Add("\t<If Condition=\"" + still + "\"><WaitTimer QuestId=\"1\" WaitTime=\"4\" /></If>");
             b.After.Add("\t<CompleteQuest QuestId=\"" + h + "\" />");
@@ -930,7 +972,7 @@ namespace QuestRecorder
         private static List<Fact> Sorted(List<Fact> facts)
         {
             var l = new List<Fact>(facts);
-            l.Sort((x, y) => x.At.CompareTo(y.At));
+            Fmt.StableSort(l, (x, y) => x.At.CompareTo(y.At));
             return l;
         }
 
@@ -1064,6 +1106,253 @@ namespace QuestRecorder
                         return true;
             }
             return false;
+        }
+
+        // ------------------------------------------------------------------ where a step is done
+
+        /// <summary>The area you did the step in: where its first action was, else where it ticked (0 = not known).</summary>
+        internal static ulong AreaOf(CoreStep s)
+        {
+            foreach (Fact f in Sorted(s.Causes))
+                if (f.Area != 0)
+                    return f.Area;
+            return s.Area;
+        }
+
+        /// <summary>The gate, only while you are in the area you did the step in (a spot of another map is a walk to nowhere).</summary>
+        private static string InArea(CoreStep s, string gate)
+        {
+            ulong a = AreaOf(s);
+            return a != 0 ? gate + " and Core.Player.AreaId == " + H(a) : gate;
+        }
+
+        /// <summary>
+        /// The gate in the area you did the step in, and (a mission whose transport shares its name with another's) not
+        /// while you stand at the other mission's site and it is still open.
+        /// </summary>
+        private static string Here(CoreStep s, string gate)
+        {
+            string g = InArea(s, gate);
+            return _extra != null ? g + " and " + _extra : g;
+        }
+
+        /// <summary>
+        /// Another object of the same name within 1 unit of it (10 m: Korriban's two Red Engines, one 0.86 above the other).
+        /// Not a respawn of it: a used container comes back as a new object at exactly the same spot (CZ-198's Kolto
+        /// Containers), with the same spawn id when the recording has one.
+        /// </summary>
+        private static bool Twin(CoreFacts c, ObjRef used)
+        {
+            if (used == null || !used.HasPos || used.Name.Length == 0)
+                return false;
+            foreach (ObjRef o in c.Nodes.Values)
+            {
+                if (o == null || o.NodeId == 0 || o.NodeId == used.NodeId || o.Name != used.Name || !o.HasPos)
+                    continue;
+                float d = o.Pos.DistanceTo(used.Pos);
+                if (d > 1f || d < 0.05f || (o.Anchor != 0 && used.Anchor != 0 && o.Anchor == used.Anchor))
+                    continue;
+                return true;
+            }
+            return false;
+        }
+
+        private static bool IsKill(CoreStep s)
+        {
+            return s.Kind == StepKind.Kill || s.Kind == StepKind.KillLoot;
+        }
+
+        /// <summary>
+        /// A step whose kills the game counts in hidden parts (waves with no line of their own on the tracker: The Hate
+        /// Machine's "Slay the K'lor'slugs"): one fight for the whole step, every kind you killed for it at every spot you
+        /// fought (the step's own fight then adds the rest you killed there while the mission was on it). Tasks with a line
+        /// of their own ("Kill 5 Troopers", "Kill 3 Droids") stay apart.
+        /// </summary>
+        private static void MergeHiddenKills(CoreFacts c, List<CoreStep> steps)
+        {
+            for (int i = 0; i < steps.Count; i++)
+            {
+                CoreStep s = steps[i];
+                if (!IsKill(s) || s.Quest == 0)
+                    continue;
+                List<CoreStep> same = steps.FindAll(n => IsKill(n) && n.Quest == s.Quest && n.Branch == s.Branch && n.Step == s.Step);
+                if (same.Count < 2 || !same.Exists(n => n.Task >= 0 && CoreRender.TaskText(c, n).Length == 0) ||
+                    same.Exists(n => n.Task >= 0 && CoreRender.TaskText(c, n).Length > 0))
+                    continue;
+                var m = new CoreStep { Kind = same.Exists(n => n.Kind == StepKind.KillLoot) ? StepKind.KillLoot : StepKind.Kill, Quest = s.Quest, QuestName = s.QuestName,
+                                       Branch = s.Branch, Step = s.Step, Task = -1, At = s.At, End = s.End, Area = s.Area, Rank = s.Rank, Came = s.Came, Merged = true };
+                foreach (CoreStep n in same)
+                {
+                    m.At = Math.Min(m.At, n.At);
+                    m.End = Math.Max(m.End, n.End);
+                    m.Rank = Math.Min(m.Rank, n.Rank);
+                    if (n.Came != double.MinValue && (m.Came == double.MinValue || n.Came < m.Came))
+                        m.Came = n.Came;
+                    m.InFight |= n.InFight;
+                    m.Loot |= n.Loot;
+                    m.DeadOnly |= n.DeadOnly;
+                    foreach (Vec3 p in n.Spots)
+                        m.AddSpot(p);
+                    foreach (Fact f in n.Causes)
+                        if (!m.Causes.Contains(f))
+                            m.Causes.Add(f);
+                    foreach (Fact f in n.Tries)
+                        if (!m.Tries.Contains(f))
+                            m.Tries.Add(f);
+                    foreach (ulong x in n.Specs)
+                        if (!m.Specs.Contains(x))
+                            m.Specs.Add(x);
+                    foreach (ulong x in n.Accepts)
+                        if (!m.Accepts.Contains(x))
+                            m.Accepts.Add(x);
+                    foreach (ulong x in n.Nodes)
+                        if (!m.Nodes.Contains(x))
+                            m.Nodes.Add(x);
+                    foreach (ulong x in n.Anchors)
+                        if (!m.Anchors.Contains(x))
+                            m.Anchors.Add(x);
+                    foreach (string u in n.Unsure)
+                        m.Doubt(u);
+                }
+                steps[i] = m;
+                foreach (CoreStep n in same)
+                    if (n != s)
+                        steps.Remove(n);
+            }
+        }
+
+        /// <summary>A mission's site: where its transport put you, and the spots of the steps you did there.</summary>
+        private sealed class Site
+        {
+            public CoreStep Hop;
+            public ulong Quest;
+            public ulong Area;
+            public readonly List<Vec3> Spots = new List<Vec3>();
+            public readonly HashSet<CoreStep> Steps = new HashSet<CoreStep>();
+            /// <summary>How near one of its spots counts as being there (units, X and Z).</summary>
+            public double R = 10;
+            /// <summary>Another mission's transport has the same name; the missions of one name share a group number.</summary>
+            public bool Shared;
+            public int Group;
+        }
+
+        /// <summary>
+        /// Every transport's site: its landing and the spots of that mission's steps after it in the landing's area (until
+        /// its next transport). A site reaches half way to the nearest other site in that area, and half way to where a
+        /// transport inside one area was pressed, 10 units (100 m) at most.
+        /// </summary>
+        private static List<Site> Sites(CoreFacts c, List<CoreStep> steps)
+        {
+            var sites = new List<Site>();
+            foreach (CoreStep h in steps)
+            {
+                if (h.Kind != StepKind.Hop || h.Quest == 0 || h.Landing.IsZero)
+                    continue;
+                var x = new Site { Hop = h, Quest = h.Quest, Area = h.LandArea != 0 ? h.LandArea : h.Area };
+                x.Spots.Add(h.Landing);
+                double until = double.MaxValue;
+                foreach (CoreStep n in steps)
+                    if (n != h && n.Kind == StepKind.Hop && n.Quest == h.Quest && n.At > h.At && n.At < until)
+                        until = n.At;
+                foreach (CoreStep n in steps)
+                {
+                    if (n == h || n.Quest != h.Quest || n.Kind == StepKind.Hop || n.Kind == StepKind.Reward || n.At < h.End - 0.5 || n.At >= until)
+                        continue;
+                    ulong na = AreaOf(n);
+                    if (na != 0 && x.Area != 0 && na != x.Area)
+                        continue;
+                    x.Steps.Add(n);
+                    foreach (Vec3 p in n.Spots)
+                        AddSpot(x.Spots, p);
+                    foreach (Fact f in n.Causes)
+                        AddSpot(x.Spots, f.Me);
+                }
+                sites.Add(x);
+            }
+            foreach (Site x in sites)
+            {
+                foreach (Site y in sites)
+                    if (y.Quest != x.Quest && y.Area == x.Area)
+                        x.R = Math.Min(x.R, Near(x.Spots, y.Spots) / 2.0);
+                // a transport pressed in the same area: never "there" where it is pressed
+                Vec3 press = x.Hop.Causes.Count > 0 ? x.Hop.Causes[0].Me : default(Vec3);
+                if (!press.IsZero && x.Hop.Area == x.Area)
+                    x.R = Math.Min(x.R, Near(x.Spots, new List<Vec3> { press }) / 2.0);
+                x.R = Math.Max(1.0, x.R);
+            }
+            // transports of one name for more than one mission
+            int group = 0;
+            foreach (Site x in sites)
+            {
+                if (x.Group != 0)
+                    continue;
+                List<Site> same = sites.FindAll(y => y.Hop.Item == x.Hop.Item);
+                if (!same.Exists(y => y.Quest != x.Quest))
+                    continue;
+                group++;
+                foreach (Site y in same)
+                {
+                    y.Shared = true;
+                    y.Group = group;
+                }
+            }
+            return sites;
+        }
+
+        /// <summary>The least distance between two lists of spots (with height: Nar Shaddaa's heroics sit floor above floor).</summary>
+        private static double Near(List<Vec3> a, List<Vec3> b)
+        {
+            double best = double.MaxValue;
+            foreach (Vec3 p in a)
+                foreach (Vec3 q in b)
+                {
+                    double dx = p.X - q.X, dy = p.Y - q.Y, dz = p.Z - q.Z;
+                    best = Math.Min(best, Math.Sqrt(dx * dx + dy * dy + dz * dz));
+                }
+            return best;
+        }
+
+        /// <summary>True while you are at the site: in its area and near one of its spots (every spot, none left out).</summary>
+        private static string AtSite(Site x)
+        {
+            var parts = new List<string>();
+            string r2 = (x.R * x.R).ToString("0.###", Inv);
+            foreach (Vec3 p in Hotspots(x.Spots, (float)(x.R / 2.0), int.MaxValue))
+                parts.Add("((Me.Position.X - (" + Fmt.F3(p.X) + ")) ** 2 + (Me.Position.Y - (" + Fmt.F3(p.Y) + ")) ** 2 + (Me.Position.Z - (" + Fmt.F3(p.Z) + ")) ** 2) < " + r2);
+            string near = "(" + string.Join(" or ", parts.ToArray()) + ")";
+            return x.Area != 0 ? "(Core.Player.AreaId == " + H(x.Area) + " and " + near + ")" : near;
+        }
+
+        /// <summary>You stand at the site of another mission of the same transport name that is still open (or empty).</summary>
+        private static string Busy(Site x)
+        {
+            var parts = new List<string>();
+            foreach (Site y in _sites)
+                if (y.Group == x.Group && y.Quest != x.Quest && x.Group != 0)
+                    parts.Add("(" + AtSite(y) + " and " + Open(y.Quest) + ")");
+            return string.Join(" or ", parts.ToArray());
+        }
+
+        /// <summary>The shared site a step is done at (its mission's reward too), or null.</summary>
+        private static Site HeldBy(CoreStep s)
+        {
+            if (_sites == null || s.Kind == StepKind.Hop)
+                return null;
+            foreach (Site x in _sites)
+                if (x.Shared && Busy(x).Length > 0 && (x.Steps.Contains(s) || (s.Kind == StepKind.Reward && s.Quest == x.Quest)))
+                    return x;
+            return null;
+        }
+
+        /// <summary>The transport group of a step's mission (its transports, its steps at the sites, its reward), or 0.</summary>
+        private static int GroupOf(CoreStep s)
+        {
+            if (_sites == null)
+                return 0;
+            foreach (Site x in _sites)
+                if (x.Shared && x.Quest == s.Quest && (x.Hop == s || x.Steps.Contains(s) || s.Kind == StepKind.Reward))
+                    return x.Group;
+            return 0;
         }
 
         /// <summary>

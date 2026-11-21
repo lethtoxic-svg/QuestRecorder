@@ -42,6 +42,8 @@ namespace QuestRecorder
             public bool Yellow;
             /// <summary>What the bot does for it, in plain words (the task tracker's line; never in the profile).</summary>
             public string What = string.Empty;
+            /// <summary>Of missions whose transports share one name (0 = none): their steps go round again, as the game picks the transport.</summary>
+            public int Group;
         }
 
         private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
@@ -77,7 +79,7 @@ namespace QuestRecorder
         /// <summary>Every step of the new core as a block, numbered in order. Steps with no mission to gate them are left out.</summary>
         public static List<Block> Blocks(CoreFacts c, List<CoreStep> steps)
         {
-            Stretch(steps);
+            Stretch(steps, c);
             var blocks = new List<Block>();
             int no = 0;
             for (int i = 0; i < steps.Count; i++)
@@ -97,9 +99,10 @@ namespace QuestRecorder
 
         /// <summary>
         /// You stopped before a task was done (19 of 20): its last step goes on to the game's full count, so the profile
-        /// finishes it. (A step that completed already runs to the full count.)
+        /// finishes it. (A step that completed already runs to the full count.) Not when the game ended that mission itself
+        /// as another one completed (a heroic's bonus): you didn't stop, so the bot does as many as you did.
         /// </summary>
-        internal static void Stretch(List<CoreStep> steps)
+        internal static void Stretch(List<CoreStep> steps, CoreFacts c = null)
         {
             var last = new Dictionary<string, CoreStep>(StringComparer.Ordinal);
             foreach (CoreStep s in steps)
@@ -108,6 +111,14 @@ namespace QuestRecorder
             foreach (CoreStep s in last.Values)
                 if (s.Max > s.CountTo && s.CountTo > 0)
                 {
+                    ulong with = c != null ? c.EndedWith(s.Quest) : 0;
+                    if (with != 0)
+                    {
+                        string by = CoreSteps.QuestName(c, with);
+                        s.Doubt("the game ended this mission when " + (by.Length > 0 ? by : "another mission") + " was done, at " + s.CountTo + " of " +
+                                s.Max + ": the bot does " + s.CountTo + ", as you did");
+                        continue;
+                    }
                     s.Doubt("you stopped at " + s.CountTo + " of " + s.Max + ": this step goes on to " + s.Max);
                     s.CountTo = s.Max;
                 }
@@ -576,9 +587,9 @@ namespace QuestRecorder
         private static void ItemTargets(CoreStep s, Def d)
         {
             var uses = new List<Fact>(s.Causes);
-            uses.Sort((x, y) => x.At.CompareTo(y.At));
+            Fmt.StableSort(uses, (x, y) => x.At.CompareTo(y.At));
             var tries = new List<Fact>(s.Tries);
-            tries.Sort((x, y) => x.At.CompareTo(y.At));
+            Fmt.StableSort(tries, (x, y) => x.At.CompareTo(y.At));
             uses.AddRange(tries);
             var spots = new List<Vec3>();
             foreach (Fact f in uses)

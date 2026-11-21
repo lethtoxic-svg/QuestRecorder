@@ -64,6 +64,8 @@ namespace QuestRecorder
         public int Rank = 1;
         /// <summary>When the quest came to this step (a step nothing was seen for; MinValue = not known).</summary>
         public double Came = double.MinValue;
+        /// <summary>The fights of a step counted in hidden parts, put together as one (its label is the step's own).</summary>
+        public bool Merged;
 
         public void AddTarget(ObjRef o, Vec3 me)
         {
@@ -170,7 +172,25 @@ namespace QuestRecorder
             foreach (ulong q in order)
                 Quest(ctx, q, byQuest[q], tracksOf[q], steps);
             Hops(c, steps);
-            steps.Sort((x, y) => x.At != y.At ? x.At.CompareTo(y.At) : x.End.CompareTo(y.End));
+            Fmt.StableSort(steps, (x, y) => x.At != y.At ? x.At.CompareTo(y.At) : x.End.CompareTo(y.End));
+            // a mission's reward (or hand-in) never before a step of that mission done at the same moment (Black Box: the
+            // ambush's last kill and the reward window came together)
+            for (int i = 0; i < steps.Count; i++)
+            {
+                CoreStep r = steps[i];
+                if (r.Kind != StepKind.Reward && r.Kind != StepKind.HandIn)
+                    continue;
+                int last = -1;
+                for (int j = i + 1; j < steps.Count && steps[j].At <= r.At + 0.01; j++)
+                    if (steps[j].Quest == r.Quest && steps[j].Kind != StepKind.Reward && steps[j].Kind != StepKind.HandIn)
+                        last = j;
+                if (last > i)
+                {
+                    steps.RemoveAt(i);
+                    steps.Insert(last, r);
+                    i--;
+                }
+            }
             return steps;
         }
 
@@ -239,7 +259,8 @@ namespace QuestRecorder
                     continue;
                 string how;
                 ulong q = HopQuest(c, f, out how);
-                var s = new CoreStep { Kind = StepKind.Hop, Quest = q, Item = f.Item, At = f.At, End = f.End, Area = f.Area, Landing = f.Landing, LandArea = f.LandArea, Rank = how == null ? 1 : 2 };
+                var s = new CoreStep { Kind = StepKind.Hop, Quest = q, Item = f.Item, At = f.At, End = f.End, Area = f.Area, Landing = f.Landing, LandArea = f.LandArea, Rank = how == null ? 1 : 2,
+                                     LogAbility = f.LogAbility, Cast = f.Cast };
                 s.QuestName = QuestName(c, q);
                 s.Causes.Add(f);
                 s.AddSpot(f.Me);
@@ -254,7 +275,7 @@ namespace QuestRecorder
         private static ulong HopQuest(CoreFacts c, Fact hop, out string how)
         {
             how = null;
-            // the game took the item away when a mission ended: that mission's transport
+            // the game took the item away when a mission ended or moved on: that mission's transport
             var ended = new List<ulong>();
             for (int i = 0; i < c.Events.Count; i++)
             {
@@ -264,35 +285,62 @@ namespace QuestRecorder
                 for (int j = 0; j < c.Events.Count; j++)
                 {
                     RecEvent d = c.Events[j];
-                    if ((d.Kind == EvKind.QuestCompleted || d.Kind == EvKind.QuestRemoved) && d.QuestId != 0 && Math.Abs(c.LookOf[j] - c.LookOf[i]) <= 1 && !ended.Contains(d.QuestId))
+                    if ((d.Kind == EvKind.QuestCompleted || d.Kind == EvKind.QuestRemoved || d.Kind == EvKind.QuestStep) && d.QuestId != 0 &&
+                        Math.Abs(c.LookOf[j] - c.LookOf[i]) <= 1 && !ended.Contains(d.QuestId))
                         ended.Add(d.QuestId);
                 }
                 break;
             }
-            ulong named = NamedQuest(c, hop.Item, ended.Count > 0 ? ended : null);
+            // the first mission you had when you pressed it that moved on after you landed (a count, a step, its end):
+            // what you went there for
+            ulong next = 0;
+            double nextAt = double.MaxValue;
+            foreach (Track t in c.Tracks)
+                if (t.Kind != TrackKind.Added && t.Kind != TrackKind.Removed && t.At > hop.End && t.At - hop.End < 600 && t.At < nextAt && HadAt(c, t.Quest, hop.At))
+                {
+                    next = t.Quest;
+                    nextAt = t.At;
+                }
+            // another transport of the same name took you somewhere else (Korriban's two "Heroic Transport"s): the item's
+            // end can be the other one's, where you landed is yours
+            bool shared = c.Facts.Exists(o => o != hop && o.Kind == FactKind.Hop && o.Item == hop.Item &&
+                                              ((o.LogAbility != 0 && hop.LogAbility != 0 && o.LogAbility != hop.LogAbility) ||
+                                               o.LandArea != hop.LandArea || o.Landing.DistanceTo(hop.Landing) > 5f));
+            // the item's own name holds the mission's ("Heroic Transport: Call Down the Thunder"): that mission, whatever else
+            // left your log as it went (the weekly reset took Call Down the Thunder and six more at once, War on Spice first)
+            ulong named = NamedQuest(c, hop.Item, null);
+            if (named == 0 && ended.Count > 1)
+                named = NamedQuest(c, hop.Item, ended);
+            if (named != 0)
+                return named;
+            if (shared && next != 0)
+            {
+                how = "tied by where it took you: the first mission that moved on after you landed (another transport has the same name)";
+                return next;
+            }
             if (ended.Count == 1)
                 return ended[0];
-            if (ended.Count > 1 && named != 0)
-                return named;
-            if (named != 0)
-            {
-                how = "tied by the item's name (no mission end took it from your bags)";
-                return named;
-            }
             if (ended.Count > 1)
             {
                 how = "more than one mission ended as the item went: the first of them";
                 return ended[0];
             }
-            // the first mission to count after you landed
-            foreach (Track t in c.Tracks)
-                if (t.Kind == TrackKind.Task && t.At > hop.End && t.At - hop.End < 600)
-                {
-                    how = "tied by time: the first mission that counted after you landed";
-                    return t.Quest;
-                }
+            if (next != 0)
+            {
+                how = "tied by time: the first mission that moved on after you landed";
+                return next;
+            }
             how = "no mission could be tied to it";
             return 0;
+        }
+
+        /// <summary>The mission was in your log at that moment (added before it, or there from the start).</summary>
+        private static bool HadAt(CoreFacts c, ulong q, double t)
+        {
+            foreach (Track tr in c.Tracks)
+                if (tr.Quest == q)
+                    return tr.Kind != TrackKind.Added || tr.At <= t + 0.5;
+            return false;
         }
 
         /// <summary>The mission whose name (without its "[DAILY]"-style tag) is in the item's name; 0 = none or more than one.</summary>
@@ -316,7 +364,7 @@ namespace QuestRecorder
             return found;
         }
 
-        private static string QuestName(CoreFacts c, ulong q)
+        internal static string QuestName(CoreFacts c, ulong q)
         {
             foreach (Track t in c.Tracks)
                 if (t.Quest == q && t.Ev != null && t.Ev.QuestName.Length > 0)
@@ -536,7 +584,11 @@ namespace QuestRecorder
                     {
                         // (the game's hidden helper missions come with their parent mission or the area: no board or NPC
                         // ever offers one, so no pick-up; their steps wait for them)
-                        CoreStep p = tracks.Exists(t => t.Ev != null && t.Ev.QuestHidden) ? null : Pickup(c, ch.Main, used);
+                        // (nor a mission the game took away the moment another one completed, that came in with that one: a
+                        // heroic's bonus comes with it, so no pick-up of its own: Tatooine's A Shot at Bloodgouge with Blood and Sand)
+                        ulong with = c.EndedWith(q);
+                        bool cameWith = with != 0 && c.Tracks.Exists(t => t.Quest == with && t.Kind == TrackKind.Added && Math.Abs(t.At - ch.At) <= 1.0);
+                        CoreStep p = cameWith || tracks.Exists(t => t.Ev != null && t.Ev.QuestHidden) ? null : Pickup(c, ch.Main, used);
                         if (p != null)
                         {
                             p.QuestName = qname;
@@ -765,7 +817,7 @@ namespace QuestRecorder
             }
             if (cause != null && !list.Contains(cause))
                 list.Add(cause);
-            list.Sort((x, y) => x.At.CompareTo(y.At));
+            Fmt.StableSort(list, (x, y) => x.At.CompareTo(y.At));
             return list;
         }
 
