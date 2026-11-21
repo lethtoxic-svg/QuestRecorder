@@ -31,10 +31,12 @@ namespace QuestRecorder
         private readonly ListView _list;
         private bool _changed;
         private bool _filling;
+        private readonly ICollection<string> _unsure; // labels of the steps the recorder isn't sure about (from the task tracker)
 
-        public ReviewForm(string profilePath, string headline)
+        public ReviewForm(string profilePath, string headline, ICollection<string> unsure)
         {
             _path = profilePath;
+            _unsure = unsure;
             _doc.PreserveWhitespace = false;
             _loadedStamp = Stamp(profilePath);
             _doc.Load(profilePath);
@@ -49,10 +51,10 @@ namespace QuestRecorder
             var top = new Label
             {
                 Dock = DockStyle.Top,
-                Height = 58,
+                Height = 76,
                 Padding = new Padding(8, 6, 8, 0),
                 Text = headline + "\r\nUntick a step to leave it out. Up / Down to move it. \"Do by hand\" = the bot walks there and waits for you. " +
-                       "Yellow = no proof: the game moved on but nothing you did was seen there (the bot will only walk there). Save when you're done.",
+                       "Yellow = needs a look: the recorder isn't sure it caught what you did for that step (the task tracker line says why). Save when you're done.",
             };
             _list = new ListView { Dock = DockStyle.Fill, View = View.Details, CheckBoxes = true, FullRowSelect = true, HideSelection = false, MultiSelect = false };
             _list.Columns.Add("Step", 430);
@@ -101,12 +103,23 @@ namespace QuestRecorder
                     var el = (XmlElement)n;
                     // yellow: nothing you did was seen for it, or the recorder marked it "not sure" (the game doesn't
                     // count what it would do)
-                    bool unsure = pending != null && pending.Value.IndexOf("(not sure", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool unsure = pending != null && (pending.Value.IndexOf("(not sure", StringComparison.OrdinalIgnoreCase) >= 0 || IsUnsure(pending.Value.Trim()));
                     _items.Add(new Item { Comment = pending, Element = el, NoProof = unsure || NoProof(el) });
                     pending = null;
                 }
             }
             Fill();
+        }
+
+        /// <summary>The recorder marked this step's label "not sure" in the task tracker.</summary>
+        private bool IsUnsure(string label)
+        {
+            if (_unsure == null)
+                return false;
+            foreach (string u in _unsure)
+                if (label == u || label == Fmt.XmlComment(u))
+                    return true;
+            return false;
         }
 
         /// <summary>A step whose only action is walking to where the game moved on: nothing you did was seen.</summary>
@@ -229,6 +242,7 @@ namespace QuestRecorder
             XmlElement ud = _doc.CreateElement("UserDialog");
             ud.SetAttribute("Title", "Quest Recorder");
             ud.SetAttribute("Message", "Do this by hand: " + what + " - then press Continue.");
+            ud.SetAttribute("IsBotContinueAllowed", "True"); // BuddyCron's Continue button is off without it
             target.AppendChild(ud);
             it.NoProof = false;
             Fill();
@@ -267,10 +281,8 @@ namespace QuestRecorder
             }
             try
             {
-                // keep a copy of what it was
-                string dir = Path.Combine(Path.GetDirectoryName(_path) ?? ".", "_fixer backups");
-                Directory.CreateDirectory(dir);
-                File.Copy(_path, Path.Combine(dir, Path.GetFileNameWithoutExtension(_path) + " (before review " + DateTime.Now.ToString("yyyy-MM-dd HH-mm-ss") + ").xml"), true);
+                // keep a copy of what it was (a file of its own: two saves in one second each keep theirs)
+                File.Copy(_path, ProfileEditor.NewBackupPath(_path, "before review"), false);
 
                 foreach (Item it in _items)
                 {

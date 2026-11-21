@@ -202,6 +202,10 @@ namespace QuestRecorder
         private readonly Dictionary<ulong, string> _questFqns = new Dictionary<ulong, string>();
 
         private readonly List<Act> _recentKills = new List<Act>();
+        // the counts that only move because another mission ended (a weekly's "complete N dailies"), in any client language
+        private HashSet<string> _meta = new HashSet<string>(StringComparer.Ordinal);
+        // kills another player tagged first that a count for that mob type took right after (shared tagging)
+        private readonly HashSet<RecEvent> _sharedKills = new HashSet<RecEvent>();
 
         // Reply picks on alignment wheels: the side you mostly picked switches ForceAlignment on.
         private int _darkPicks;
@@ -245,6 +249,19 @@ namespace QuestRecorder
                     _questNames[e.QuestId] = e.QuestName;
                 if (e.QuestFqn.Length > 0 && !_questFqns.ContainsKey(e.QuestId))
                     _questFqns[e.QuestId] = e.QuestFqn;
+            }
+            _meta = ReplayBuilder.MetaTasks(_source);
+            for (int i = 0; i < _source.Count; i++)
+            {
+                RecEvent ke = _source[i];
+                if (ke.Kind != EvKind.Kill || ke.Target == null || ke.Target.Spec == 0 || !(ke.Note ?? string.Empty).StartsWith("tagged by another player", StringComparison.Ordinal))
+                    continue;
+                for (int j = i + 1; j < _source.Count && _source[j].Elapsed - ke.Elapsed <= 1.0; j++)
+                    if (_source[j].Kind == EvKind.QuestTask && _source[j].TaskTargets != null && _source[j].TaskTargets.Contains(ke.Target.Spec))
+                    {
+                        _sharedKills.Add(ke);
+                        break;
+                    }
             }
             foreach (RecEvent e in Reorder(_source))
             {
@@ -329,7 +346,7 @@ namespace QuestRecorder
                             Add(ActKind.Loot, e); // looting what you killed: a collect-from-mobs task
                         break;
                     case EvKind.Kill:
-                        if (e.Note.Length == 0) // tagged by another player: no credit, not a hotspot
+                        if (e.Note.Length == 0 || _sharedKills.Contains(e)) // tagged by another player: only when your count moved with it
                         {
                             Act k = Add(ActKind.Kill, e);
                             _recentKills.Add(k);
@@ -571,7 +588,7 @@ namespace QuestRecorder
         private void StepTrigger(RecEvent e, ulong branch, ulong step, int task)
         {
             // Weekly / area tasks such as "Complete Staff Cuts" tick by themselves when another quest finishes.
-            if (e.Kind == EvKind.QuestTask && e.Text.StartsWith("Complete ", StringComparison.OrdinalIgnoreCase))
+            if (ReplayBuilder.IsMetaTick(e, _meta))
                 return;
             _questTriggers++;
             if (e.CheckFailed)
@@ -1669,10 +1686,11 @@ namespace QuestRecorder
                     _questNames.TryGetValue(it.QuestId, out qn);
                     qn = qn ?? string.Empty;
                     bool repeatable = qn.IndexOf("[DAILY]", StringComparison.OrdinalIgnoreCase) >= 0 || qn.IndexOf("[WEEKLY]", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                      qn.IndexOf("[HEROIC", StringComparison.OrdinalIgnoreCase) >= 0 || it.Comment.IndexOf("mission board", StringComparison.OrdinalIgnoreCase) >= 0;
+                                      qn.IndexOf("[HEROIC", StringComparison.OrdinalIgnoreCase) >= 0 || it.Comment.IndexOf("mission board", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                      ReplayBuilder.IsWeekly(qn) || ReplayBuilder.IsHeroic(qn); // (the tags in any client language)
                     // A weekly comes back (3 times a week): only "not in my log", like the Oricon weekly.
                     // Dailies, heroics and everything else: not in my log and not done.
-                    bool weekly = repeatable && qn.IndexOf("[WEEKLY]", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool weekly = repeatable && (qn.IndexOf("[WEEKLY]", StringComparison.OrdinalIgnoreCase) >= 0 || ReplayBuilder.IsWeekly(qn));
                     NL(sb, 2, weekly
                         ? "<If Condition=\"(not HasQuest(" + q + "))\">"
                         : "<If Condition=\"((not HasQuest(" + q + ")) and (not IsQuestComplete(" + q + ")))\">");

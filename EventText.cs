@@ -339,7 +339,7 @@ namespace QuestRecorder
             var f = new List<string>(48);
             f.Add(e.Seq.ToString());
             f.Add(Fmt.Stamp(e.Time));
-            f.Add(Fmt.F1(e.Elapsed));
+            f.Add(Fmt.F3d(e.Elapsed)); // (3 decimals: a profile made again later reads the times the live one used)
             f.Add(e.Kind.ToString());
             f.Add(Fmt.F3(e.Pos.X));
             f.Add(Fmt.F3(e.Pos.Y));

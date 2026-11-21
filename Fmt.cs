@@ -22,6 +22,17 @@ namespace QuestRecorder
             return r.ToString("0.000", Inv);
         }
 
+        /// <summary>Seconds with 3 decimals (the time of an event in the recording .csv), never "-0.000".</summary>
+        public static string F3d(double v)
+        {
+            if (double.IsNaN(v) || double.IsInfinity(v))
+                return "0.000";
+            double r = Math.Round(v, 3, MidpointRounding.AwayFromZero);
+            if (r == 0.0)
+                r = 0.0;
+            return r.ToString("0.000", Inv);
+        }
+
         public static string F1(double v)
         {
             if (double.IsNaN(v) || double.IsInfinity(v))
@@ -157,6 +168,15 @@ namespace QuestRecorder
                 }
             }
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// A quoted string for a profile condition ('Lord Grathan\'s Key'), from the plain (not XML-escaped) text. The
+        /// condition still goes through XmlAttr when it is written.
+        /// </summary>
+        public static string PyStr(string s)
+        {
+            return "'" + (s ?? string.Empty).Replace("\\", "\\\\").Replace("'", "\\'") + "'";
         }
 
         /// <summary>Text that is safe inside an XML comment: no "--", no trailing "-", one line.</summary>

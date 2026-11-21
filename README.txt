@@ -18,7 +18,7 @@ If it doesn't show up, check the log for "Compiler Error" and send it to me.
 
 RECORDING
 ---------
-Stop the bot, tick Quest Recorder and it starts recording on its own. Then just play.
+Stop the bot, tick Quest Recorder, click the Quest Recorder button and press Start recording. Then just play.
 
 Ctrl+Shift+Z  - ignore your last action (a misclick, a wrong item - do it straight away)
 Ctrl+Shift+P  - pause here: the bot will stop at this spot and let you do it by hand

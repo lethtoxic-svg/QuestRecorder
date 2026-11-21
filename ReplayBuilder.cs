@@ -22,6 +22,9 @@ namespace QuestRecorder
             public float OnDist = -1f; // how far you stood from that NPC (game units), -1 = not known
             public bool OnDead; // that NPC was dead (a corpse)
             public float OnHealth = -1f; // that NPC's health (percent) when you used it, -1 = not known
+            public bool ForQuest; // the game said it was usable for one of your missions (or takes a hand-in) when you clicked it
+            public bool InFight; // a mission item you used while in a fight
+            public bool Bag; // a usable bag item (a stim, a medpac), not a mission item
         }
 
         /// <summary>
@@ -65,13 +68,18 @@ namespace QuestRecorder
                     foreach (Kill k in f.Kills)
                         names.Add(k.Name);
                 // the fight that finished that quest step (its gate says "step done"), with the same mobs: same task
+                // (on the same branch, when the fights' branch is known: another branch can reuse the step number)
                 string[] qs = kv.Key.Split('|');
+                string fb = fights[0].Branch;
+                if (fights.Exists(f => f.Branch != fb))
+                    fb = null;
                 foreach (Step s in steps)
                 {
                     if (s.Kind != "Grind" || s.Kills == null || s.Gate == null || fights.Contains(s))
                         continue;
-                    Match d = Regex.Match(s.Gate, @"IsBranchStepComplete\((0x[0-9A-F]+), \d+, (\d+)\)");
-                    if (d.Success && d.Groups[1].Value == qs[0] && d.Groups[2].Value == qs[1] && s.Kills.Exists(k => names.Contains(k.Name)))
+                    Match d = Regex.Match(s.Gate, @"IsBranchStepComplete\((0x[0-9A-F]+), (\d+), (\d+)\)");
+                    if (d.Success && d.Groups[1].Value == qs[0] && d.Groups[3].Value == qs[1] && (fb == null || d.Groups[2].Value == fb) &&
+                        s.Kills.Exists(k => names.Contains(k.Name)))
                         fights.Add(s);
                 }
                 if (fights.Count < 2)
@@ -103,31 +111,67 @@ namespace QuestRecorder
         private static void CollectSteps(List<Step> steps, Dictionary<string, ulong> maxFor, Dictionary<string, List<Vec3>> scanner)
         {
             var byTask = new Dictionary<string, List<Step>>(StringComparer.Ordinal);
-            foreach (Step s in steps)
+            // the branches each counter was on: another branch of the same quest can use the same step and task numbers for
+            // something else - those are kept apart (a counter seen on one branch only is grouped as before)
+            var branchesOf = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            for (int pass = 0; pass < 2; pass++)
+                foreach (Step s in steps)
+                {
+                    if (s.Gate == null || (s.Kind != "Use" && !(s.Kind == "Grind" && s.Comment.IndexOf("(kill and loot)", StringComparison.Ordinal) >= 0)))
+                        continue;
+                    Match m = Regex.Match(s.Gate, @"IsTaskValueGreaterThan\((0x[0-9A-F]+), (\d+), (\d+), \d+\)");
+                    if (!m.Success)
+                        continue;
+                    string key = m.Groups[1].Value + ", " + m.Groups[2].Value + ", " + m.Groups[3].Value;
+                    List<string> brs;
+                    if (!branchesOf.TryGetValue(key, out brs))
+                        branchesOf[key] = brs = new List<string>();
+                    if (pass == 0)
+                    {
+                        if (s.Branch != null && !brs.Contains(s.Branch))
+                            brs.Add(s.Branch);
+                        continue;
+                    }
+                    if (brs.Count > 1)
+                        key += "#" + (s.Branch ?? "?");
+                    List<Step> list;
+                    if (!byTask.TryGetValue(key, out list))
+                        byTask[key] = list = new List<Step>();
+                    list.Add(s);
+                }
+            foreach (KeyValuePair<string, List<Step>> kv0 in byTask)
             {
-                if (s.Gate == null || (s.Kind != "Use" && !(s.Kind == "Grind" && s.Comment.IndexOf("(kill and loot)", StringComparison.Ordinal) >= 0)))
-                    continue;
-                Match m = Regex.Match(s.Gate, @"IsTaskValueGreaterThan\((0x[0-9A-F]+), (\d+), (\d+), \d+\)");
-                if (!m.Success)
-                    continue;
-                string key = m.Groups[1].Value + ", " + m.Groups[2].Value + ", " + m.Groups[3].Value;
-                List<Step> list;
-                if (!byTask.TryGetValue(key, out list))
-                    byTask[key] = list = new List<Step>();
-                list.Add(s);
-            }
-            foreach (KeyValuePair<string, List<Step>> kv in byTask)
-            {
-                List<Step> parts = kv.Value;
+                List<Step> parts = kv0.Value;
+                int cut = kv0.Key.IndexOf('#');
+                var kv = new KeyValuePair<string, List<Step>>(cut >= 0 ? kv0.Key.Substring(0, cut) : kv0.Key, parts);
                 string[] k3 = kv.Key.Split(new[] { ", " }, StringSplitOptions.None);
-                // the step that finished it ("step done"), if it was one of these too
+                // the branch it was on: from the ticks, else from the parts' own object lines (null = not known)
+                string br = null;
+                foreach (Step s in parts)
+                    if (s.Branch != null)
+                    {
+                        br = s.Branch;
+                        break;
+                    }
+                if (br == null)
+                    foreach (Step s in parts)
+                    {
+                        string ul = s.Lines.Find(x => x.StartsWith("<UseObject", StringComparison.Ordinal) && Attr(x, "QuestId") == k3[0] &&
+                                                      Attr(x, "StepId") == k3[1] && Attr(x, "BranchId").Length > 0);
+                        if (ul != null)
+                        {
+                            br = Attr(ul, "BranchId");
+                            break;
+                        }
+                    }
+                // the step that finished it ("step done"), if it was one of these too (on the same branch)
                 Step finish = null;
                 foreach (Step s in steps)
                 {
                     if (s.Gate == null || parts.Contains(s))
                         continue;
                     Match d = Regex.Match(s.Gate, @"IsBranchStepComplete\((0x[0-9A-F]+), (\d+), (\d+)\)");
-                    if (d.Success && d.Groups[1].Value == k3[0] && d.Groups[3].Value == k3[1] &&
+                    if (d.Success && d.Groups[1].Value == k3[0] && d.Groups[3].Value == k3[1] && (br == null || d.Groups[2].Value == br) &&
                         (s.Kind == "Use" || (s.Kind == "Grind" && s.Comment.IndexOf("(kill and loot)", StringComparison.Ordinal) >= 0)))
                     {
                         finish = s;
@@ -147,7 +191,7 @@ namespace QuestRecorder
                             reached = n + 1;
                     }
                     ulong full;
-                    if (maxFor.TryGetValue(kv.Key, out full) && (ulong)reached >= full)
+                    if ((maxFor.TryGetValue(kv0.Key, out full) || maxFor.TryGetValue(kv.Key, out full)) && (ulong)reached >= full)
                         finish = null;
                 }
                 var all = new List<Step>(parts);
@@ -230,7 +274,7 @@ namespace QuestRecorder
                 }
                 ulong max;
                 string gate = finish != null ? finish.Gate
-                            : maxFor.TryGetValue(kv.Key, out max) ? "HasQuest(" + k3[0] + ") and not IsTaskValueGreaterThan(" + kv.Key + ", " + (max - 1) + ")" : parts[parts.Count - 1].Gate;
+                            : maxFor.TryGetValue(kv0.Key, out max) || maxFor.TryGetValue(kv.Key, out max) ? "HasQuest(" + k3[0] + ") and not IsTaskValueGreaterThan(" + kv.Key + ", " + (max - 1) + ")" : parts[parts.Count - 1].Gate;
                 string done = gate.StartsWith("HasQuest(", StringComparison.Ordinal) ? gate : "HasQuest(" + k3[0] + ") and " + gate;
                 Step first = parts[0];
                 var c = new Step
@@ -243,7 +287,8 @@ namespace QuestRecorder
                     Task = first.Task,
                     Targets = first.Targets,
                     Kills = mobs.Count > 0 ? mobs : null,
-                    At = first.At
+                    At = first.At,
+                    Branch = br
                 };
                 // dedupe mob names in the comment
                 if (mobs.Count > 0)
@@ -257,7 +302,7 @@ namespace QuestRecorder
                 }
                 string ids = finish != null
                     ? Regex.Replace(Regex.Match(finish.Gate, @"IsBranchStepComplete\((0x[0-9A-F]+), (\d+), (\d+)\)").Value, @"IsBranchStepComplete\((0x[0-9A-F]+), (\d+), (\d+)\)", " QuestId=\"$1\" BranchId=\"$2\" StepId=\"$3\"")
-                    : " QuestId=\"" + k3[0] + "\" BranchId=\"1\" StepId=\"" + k3[1] + "\" TaskId=\"" + k3[2] + "\"";
+                    : " QuestId=\"" + k3[0] + "\" BranchId=\"" + (br != null && br != "0" ? br : "1") + "\" StepId=\"" + k3[1] + "\" TaskId=\"" + k3[2] + "\"";
                 var sb = new StringBuilder();
                 sb.Append("<UseObject").Append(ids).Append(" Radius=\"150\" UseRange=\"5\" WaitTime=\"3000\" BlacklistDuration=\"30\" IgnoreLOS=\"True\"><Placeables>");
                 foreach (string name in objects)
@@ -314,6 +359,54 @@ namespace QuestRecorder
             return t - from;
         }
 
+        /// <summary>
+        /// How long you waited at this spot (within ~10 m) right before t with nothing done there, in seconds: since you got
+        /// there (your footsteps), or since the last click, cast, item, loot, talk, kill or mission moving, if that came later.
+        /// </summary>
+        private static double WaitedAt(IList<RecEvent> events, double t, Vec3 pos)
+        {
+            double from = t;
+            for (int i = events.Count - 1; i >= 0; i--)
+            {
+                RecEvent x = events[i];
+                if (x.Elapsed >= t)
+                    continue;
+                if (t - x.Elapsed > 900)
+                    break;
+                if (x.Kind == EvKind.Loading || x.Kind == EvKind.AreaChange || x.Kind == EvKind.ElevatorRide || x.Kind == EvKind.TaxiEnd ||
+                    x.Kind == EvKind.Died || x.Kind == EvKind.Revived)
+                    break;
+                if (!x.Pos.IsZero && x.Pos.DistanceTo(pos) > 1f)
+                    break; // you were somewhere else
+                if (x.Kind == EvKind.ObjectClick || x.Kind == EvKind.NpcClick || x.Kind == EvKind.CastStart || x.Kind == EvKind.Cast ||
+                    x.Kind == EvKind.QuestItem || x.Kind == EvKind.Loot || x.Kind == EvKind.ConvoStart || x.Kind == EvKind.ConvoEnd ||
+                    x.Kind == EvKind.ConvoChoice || x.Kind == EvKind.Kill || x.Kind == EvKind.QuestTask || x.Kind == EvKind.QuestStep ||
+                    x.Kind == EvKind.QuestAdded || x.Kind == EvKind.QuestCompleted || x.Kind == EvKind.HolocomAnswered ||
+                    x.Kind == EvKind.BoardOpen || x.Kind == EvKind.InteractionOpen || x.Kind == EvKind.Marker)
+                {
+                    from = x.Elapsed; // waited since you did that
+                    break;
+                }
+                if (!x.Pos.IsZero)
+                    from = x.Elapsed;
+            }
+            return t - from;
+        }
+
+        /// <summary>
+        /// Wait at the spot while the step is still on, at most a bit longer than you waited: a few short waits, each only
+        /// while the step hasn't moved on (never stuck there if it doesn't).
+        /// </summary>
+        private static List<string> WaitWhile(string gate, double waited)
+        {
+            int most = (int)Math.Ceiling(Math.Min(waited * 1.5 + 10, 600));
+            int each = Math.Max(5, (most + 5) / 6);
+            var l = new List<string>();
+            for (int sofar = 0; sofar < most; sofar += each)
+                l.Add("<If Condition=\"" + gate + "\"><WaitTimer QuestId=\"1\" WaitTime=\"" + each.ToString(CultureInfo.InvariantCulture) + "\" /></If>"); // (gates are written XML-escaped already)
+            return l;
+        }
+
         private static string UseRangeFor(float distUnits)
         {
             if (distUnits <= 0f)
@@ -329,6 +422,213 @@ namespace QuestRecorder
             return "any(r.QuestId == " + questHex + " for r in Me.Quests.PendingQuestRewards)";
         }
 
+        /// <summary>The conversation that started at start was still on at t, or ended at most 8 s before.</summary>
+        private static bool ConvoOnAt(List<Convo> convos, double start, double t)
+        {
+            Convo c = convos.FindLast(v => v.Start == start && v.Partner != HoloPartner);
+            return c == null || t <= c.End + 8;
+        }
+
+        /// <summary>The partner of a holocom call in the reply list (never a real name).</summary>
+        private const string HoloPartner = "\u0001holocom";
+
+        /// <summary>
+        /// A conversation (not a holocom call) that started at start was still on at t, or ended at most 8 s before, and began at
+        /// most 5 minutes before: a long story talk counts until it ends. Not seen as a conversation with someone: 20 s from its start.
+        /// </summary>
+        private static bool SceneOn(List<Convo> convos, double start, double t)
+        {
+            if (start < -1e8 || t < start)
+                return false;
+            Convo c = convos.FindLast(v => v.Start == start && v.Partner != HoloPartner);
+            return c != null ? t - start <= 300 && t <= c.End + 8 : t - start <= 20;
+        }
+
+        /// <summary>A holocom call that started at start was still on at t, or ended at most 8 s before (a long call with a cutscene).</summary>
+        private static bool CallLasted(List<Convo> convos, double start, double t)
+        {
+            if (start < -1e8 || t < start)
+                return false;
+            Convo c = convos.FindLast(v => v.Start == start && v.Partner == HoloPartner);
+            return c != null && t - start <= 300 && t <= c.End + 8;
+        }
+
+        /// <summary>
+        /// When the last kill did what moved at t: t itself, or the start of a scene that began by itself within 3 s of that
+        /// kill and was still on (or had just ended) at t - a boss that talks once beaten.
+        /// </summary>
+        private static double KillMoment(List<Kill> kills, double sceneAt, List<Convo> convos, double t)
+        {
+            if (kills.Count == 0 || t - kills[kills.Count - 1].At <= 3)
+                return t;
+            double k = kills[kills.Count - 1].At;
+            return sceneAt >= k && sceneAt - k <= 3 && SceneOn(convos, sceneAt, t) ? sceneAt : t;
+        }
+
+        /// <summary>The game's own bookkeeping quests, not missions: companion conversation cooldowns ([DNT] ...), companion
+        /// conversation quests, and quests whose name is only a raw token ("[taxi_quest_...]").</summary>
+        public static bool IsSystemQuest(RecEvent e)
+        {
+            string n = e.QuestName ?? string.Empty, f = e.QuestFqn ?? string.Empty;
+            return n.StartsWith("[DNT]", StringComparison.OrdinalIgnoreCase) || n.IndexOf("Conversation Cooldown", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   (f.StartsWith("qst.companion.", StringComparison.OrdinalIgnoreCase) && f.IndexOf(".conversations.", StringComparison.OrdinalIgnoreCase) >= 0) ||
+                   Regex.IsMatch(n, @"^\[[a-z0-9_.]+\]$");
+        }
+
+        // The tags the game puts in front of a mission's name, in each client language (English, German, French):
+        // [DAILY] [TAEGLICH] [QUOTIDIENNE] [JOURNALIERE], [WEEKLY] [WOECHENTLICH] [HEBDOMADAIRE], [HEROIC 2+] [HELDEN 2+] [HEROIQUE 2+]
+        // (written with their accents below: the source stays plain ASCII).
+        private const string RepeatTag = @"^\[(WEEKLY|DAILY|HEROIC|AREA|W\u00D6CHENTLICH|T\u00C4GLICH|HELDEN|HELDENHAFT|HEBDOMADAIRE|QUOTIDIENNE|JOURNALI\u00C8RE|H\u00C9RO\u00CFQUE)\b";
+        private const string WeeklyTag = @"^\[(WEEKLY|W\u00D6CHENTLICH|HEBDOMADAIRE)\b";
+        private const string HeroicTag = @"^\[(HEROIC|HELDEN|HELDENHAFT|H\u00C9RO\u00CFQUE)\b";
+
+        /// <summary>A mission the game gives again (daily, weekly, heroic, area): its tag in any client language, or a daily
+        /// area's daily by its internal name (the same in every language).</summary>
+        public static bool IsRepeatable(RecEvent e)
+        {
+            string f = e.QuestFqn ?? string.Empty;
+            return Regex.IsMatch(e.QuestName ?? string.Empty, RepeatTag, RegexOptions.IgnoreCase) ||
+                   (f.StartsWith("qst.daily_area.", StringComparison.OrdinalIgnoreCase) && f.IndexOf(".daily_quest", StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        /// <summary>A weekly, by its tag in any client language.</summary>
+        public static bool IsWeekly(string questName)
+        {
+            return Regex.IsMatch(questName ?? string.Empty, WeeklyTag, RegexOptions.IgnoreCase);
+        }
+
+        /// <summary>A heroic, by its tag in any client language.</summary>
+        public static bool IsHeroic(string questName)
+        {
+            return Regex.IsMatch(questName ?? string.Empty, HeroicTag, RegexOptions.IgnoreCase);
+        }
+
+        /// <summary>A dynamic encounter (7.6): the game starts it by itself when you come by, nobody gives it.</summary>
+        private static bool IsEncounter(RecEvent e)
+        {
+            return (e.QuestFqn ?? string.Empty).StartsWith("qst.dynamic_events.", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>"quest|step|task" of a count.</summary>
+        private static string TaskKey(RecEvent e)
+        {
+            return Fmt.Hex(e.QuestId) + "|" + e.Step.ToString(CultureInfo.InvariantCulture) + "|" + Math.Max(0, e.TaskIndex).ToString(CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>
+        /// The counts that move only because another mission ended (a weekly's "complete N dailies"): every tick of that task
+        /// came with another mission's completion (within 2 s before to 5 s after - the game can note the end a few looks
+        /// late), and it ticked at least twice that way or it is a weekly. By what happened, not by the text, so it works in
+        /// every client language.
+        /// </summary>
+        internal static HashSet<string> MetaTasks(IList<RecEvent> events)
+        {
+            var ends = new List<RecEvent>();
+            var hidden = new HashSet<ulong>();
+            int count = events.Count; // (index loops: the live list can grow while this runs)
+            for (int i = 0; i < count; i++)
+            {
+                RecEvent e = events[i];
+                if (e.QuestHidden && e.QuestId != 0)
+                    hidden.Add(e.QuestId);
+                if ((e.Kind == EvKind.QuestCompleted || e.Kind == EvKind.QuestRemoved) && e.QuestId != 0 && !IsSystemQuest(e))
+                    ends.Add(e);
+            }
+            var ticks = new Dictionary<string, int>(StringComparer.Ordinal);
+            var weekly = new HashSet<string>(StringComparer.Ordinal);
+            var other = new HashSet<string>(StringComparer.Ordinal); // ticked at least once with no other mission ending
+            if (ends.Count == 0)
+                return other;
+            for (int i = 0; i < count; i++)
+            {
+                RecEvent e = events[i];
+                if (e.Kind != EvKind.QuestTask || e.Max == 0 || e.QuestId == 0 || e.QuestHidden)
+                    continue;
+                string key = TaskKey(e);
+                bool withEnd = ends.Exists(x => x.QuestId != e.QuestId && !hidden.Contains(x.QuestId) && x.Elapsed - e.Elapsed >= -2.0 && x.Elapsed - e.Elapsed <= 5.0);
+                if (!withEnd)
+                {
+                    other.Add(key);
+                    continue;
+                }
+                int n;
+                ticks.TryGetValue(key, out n);
+                ticks[key] = n + 1;
+                if (IsWeekly(e.QuestName))
+                    weekly.Add(key);
+            }
+            var meta = new HashSet<string>(StringComparer.Ordinal);
+            foreach (KeyValuePair<string, int> kv in ticks)
+                if (!other.Contains(kv.Key) && (kv.Value >= 2 || weekly.Contains(kv.Key)))
+                    meta.Add(kv.Key);
+            return meta;
+        }
+
+        /// <summary>A count that moved only because another mission ended (see <see cref="MetaTasks"/>; the English
+        /// "Complete ..." text too, for recordings with too few ticks to tell).</summary>
+        internal static bool IsMetaTick(RecEvent e, HashSet<string> meta)
+        {
+            return e.Kind == EvKind.QuestTask &&
+                   (meta.Contains(TaskKey(e)) || (e.Text ?? string.Empty).StartsWith("Complete ", StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>The bot, on the profile's side, would pick every reply you picked in this conversation (all of them seen).</summary>
+        private static bool BotPicksSame(Convo c, string side)
+        {
+            for (int i = 0; i < c.Picks.Count; i++)
+                if (c.Picks[i] == "?" || i >= c.Wheels.Count || AutoPick(c.Wheels[i], side) != c.Picks[i])
+                    return false;
+            return true;
+        }
+
+        /// <summary>A reward window for this quest came up within 5 s after this time.</summary>
+        private static bool RewardSoon(IList<RecEvent> events, ulong quest, double t)
+        {
+            foreach (RecEvent x in events)
+                if (x.Kind == EvKind.RewardWindow && x.QuestId == quest && x.Elapsed >= t && x.Elapsed - t <= 5)
+                    return true;
+            return false;
+        }
+
+        /// <summary>Another (not hidden) mission moved within 2 s of this time, after your click and not from a kill.</summary>
+        private static bool AnotherTickNear(IList<RecEvent> events, HashSet<ulong> hidden, ulong quest, double t, double clickAt)
+        {
+            foreach (RecEvent x in events)
+            {
+                if ((x.Kind != EvKind.QuestTask && x.Kind != EvKind.QuestStep) || x.QuestId == quest || x.QuestHidden || hidden.Contains(x.QuestId) ||
+                    Math.Abs(x.Elapsed - t) > 2.0 || x.Elapsed < clickAt)
+                    continue;
+                bool byKill = false;
+                foreach (RecEvent k in events)
+                    if (k.Kind == EvKind.Kill && k.Elapsed <= x.Elapsed && x.Elapsed - k.Elapsed <= 1.0)
+                        byKill = true;
+                if (!byKill)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// The missions that finished or were dropped in the same instant this one came (within 0.5 s), with no conversation
+        /// around it (from 10 s before to 3 s after): the game granted it for that (Research Cancellation the moment Final
+        /// Stage completes). Empty when there is none, or a conversation could have given it.
+        /// </summary>
+        private static List<ulong> GrantedBy(IList<RecEvent> events, ulong quest, double t)
+        {
+            var by = new List<ulong>();
+            foreach (RecEvent x in events)
+            {
+                if (x.Elapsed < t - 10 || x.Elapsed > t + 3)
+                    continue;
+                if (x.Kind == EvKind.ConvoStart || x.Kind == EvKind.ConvoEnd || x.Kind == EvKind.ConvoChoice)
+                    return new List<ulong>();
+                if ((x.Kind == EvKind.QuestCompleted || x.Kind == EvKind.QuestRemoved) && x.QuestId != 0 && x.QuestId != quest &&
+                    Math.Abs(x.Elapsed - t) <= 0.5 && !by.Contains(x.QuestId))
+                    by.Add(x.QuestId);
+            }
+            return by;
+        }
+
         /// <summary>A normal (not hidden) mission moved within 2 s of this time.</summary>
         private static bool NormalTickNear(IList<RecEvent> events, HashSet<ulong> hidden, double t)
         {
@@ -339,7 +639,148 @@ namespace QuestRecorder
             return false;
         }
 
-        private static IList<RecEvent> ExactActions(IList<RecEvent> events)
+        /// <summary>Another (not hidden) mission ended from 2 s before to 5 s after this time (as in <see cref="MetaTasks"/>).</summary>
+        private static bool OtherEndNear(IList<RecEvent> events, HashSet<ulong> hidden, ulong quest, double t)
+        {
+            foreach (RecEvent x in events)
+                if ((x.Kind == EvKind.QuestCompleted || x.Kind == EvKind.QuestRemoved) && x.QuestId != 0 && x.QuestId != quest &&
+                    !hidden.Contains(x.QuestId) && !IsSystemQuest(x) && x.Elapsed - t >= -2.0 && x.Elapsed - t <= 5.0)
+                    return true;
+            return false;
+        }
+
+        /// <summary>You killed an NPC of this name from just before this time up to 2 minutes after (it fought you).</summary>
+        private static bool KilledSoonAfter(IList<RecEvent> events, string name, double t)
+        {
+            foreach (RecEvent ke in events)
+                if (ke.Kind == EvKind.Kill && ke.Target != null && ke.Target.Name == name && ke.Elapsed >= t - 1 && ke.Elapsed <= t + 120)
+                    return true;
+            return false;
+        }
+
+        /// <summary>
+        /// A mission item you used out of a fight up to 20 s before this fight started, near where its last mob died, when
+        /// that mob wasn't around (seen or killed near there) in the 5 minutes before you used it: the item brought the fight
+        /// out (a lure, a challenge totem, a beacon). Null when there is none.
+        /// </summary>
+        private static Use PreFightItem(List<Use> order, List<Kill> fight, List<Kill> mobSeen, List<Kill> allKills, double fightAt)
+        {
+            if (order == null || fight == null || fight.Count == 0)
+                return null;
+            Kill boss = fight[fight.Count - 1];
+            for (int i = order.Count - 1; i >= 0; i--)
+            {
+                Use u = order[i];
+                if (u.InFight || u.Bag || u.Pos.IsZero || u.At > fightAt + 1 || fightAt - u.At > 20 || boss.Pos.DistanceTo(u.Pos) > 4f ||
+                    u.Name.StartsWith("Heroic Transport", StringComparison.Ordinal) || IsTravelAbility(u.Name))
+                    continue;
+                bool around = false;
+                foreach (List<Kill> seen in new[] { mobSeen, allKills })
+                    foreach (Kill m in seen)
+                        if (m.At < u.At && u.At - m.At <= 300 && (m.Name == boss.Name || (m.Spec != 0 && m.Spec == boss.Spec)) && m.Pos.DistanceTo(boss.Pos) <= 10f)
+                            around = true;
+                if (!around)
+                    return u;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// An object you used or attacked in the middle of a fight, after which the mob that ended the fight (died within 3 s
+        /// of its last kill) died next to it (within 10 m, up to 2 minutes after the use) - not one of the mobs that started the
+        /// fight, and none of its kind killed near there in the 5 minutes before the use (not one more of the mobs you were
+        /// already fighting): the object that brings out that mob (the Field Generator attacked mid-fight brings out the Jedi
+        /// Field Commander). Not an object that died itself, not a use already written as a step. (Object uses only: mobs, your
+        /// companion and bag items are never in this list.) Null when there is none.
+        /// </summary>
+        private static Use MidFightSpawner(List<Use> fightUses, Dictionary<string, double> consumed, List<Kill> fight, List<Kill> allKills,
+                                           double fightAt, string fightMobs)
+        {
+            if (fightUses == null || fight == null || fight.Count == 0)
+                return null;
+            double endAt = fight[fight.Count - 1].At;
+            for (int i = fightUses.Count - 1; i >= 0; i--)
+            {
+                Use u = fightUses[i];
+                double when;
+                if (u.Pos.IsZero || u.At <= fightAt + 1 || (consumed.TryGetValue(UseKey(u.Id, u.Pos), out when) && when >= u.At) ||
+                    allKills.Exists(k => k.Name == u.Name && k.Pos.DistanceTo(u.Pos) <= 1f))
+                    continue;
+                foreach (Kill k in fight)
+                {
+                    if (k.At <= u.At || k.At - u.At > 120 || endAt - k.At > 3 || k.Pos.DistanceTo(u.Pos) > 1f || StartedFight(fightMobs, k.Name))
+                        continue;
+                    bool before = allKills.Exists(m => m.At < u.At && u.At - m.At <= 300 && (m.Name == k.Name || (m.Spec != 0 && m.Spec == k.Spec)) &&
+                                                       m.Pos.DistanceTo(k.Pos) <= 10f);
+                    if (!before)
+                        return u;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>The mob was one of those that attacked you when the fight started (as the recorder listed them: "Name (50 strong), ...").</summary>
+        private static bool StartedFight(string fightMobs, string name)
+        {
+            if (string.IsNullOrEmpty(fightMobs) || string.IsNullOrEmpty(name))
+                return false;
+            foreach (string part in fightMobs.Split(new[] { ", " }, StringSplitOptions.None))
+            {
+                int p = part.LastIndexOf(" (", StringComparison.Ordinal);
+                if ((p > 0 && part.EndsWith(")", StringComparison.Ordinal) ? part.Substring(0, p) : part) == name)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// The click on an object brought out a fight: a fight started from 1 s before to 15 s after it (until it ended, or for
+        /// 5 minutes) and one of its mobs died within 10 m of the object - and none of that fight's kills moved this quest
+        /// (then the fight is the quest's own, and the click is how you get it).
+        /// </summary>
+        private static bool FightCameOf(IList<RecEvent> events, double clickAt, Vec3 objPos, ulong quest)
+        {
+            int start = -1;
+            for (int i = 0; i < events.Count; i++)
+                if (events[i].Kind == EvKind.CombatStart && events[i].Elapsed >= clickAt - 1 && events[i].Elapsed <= clickAt + 15)
+                {
+                    start = i;
+                    break;
+                }
+            if (start < 0 || objPos.IsZero)
+                return false;
+            var killAt = new List<double>();
+            bool near = false;
+            for (int i = start + 1; i < events.Count && events[i].Kind != EvKind.CombatEnd && events[i].Elapsed - events[start].Elapsed <= 300; i++)
+            {
+                RecEvent k = events[i];
+                if (k.Kind != EvKind.Kill || k.Target == null)
+                    continue;
+                killAt.Add(k.Elapsed);
+                if ((k.Target.HasPos ? k.Target.Pos : k.Pos).DistanceTo(objPos) <= 1f)
+                    near = true;
+            }
+            if (!near)
+                return false;
+            foreach (RecEvent x in events)
+                if ((x.Kind == EvKind.QuestTask || x.Kind == EvKind.QuestStep) && x.QuestId == quest && killAt.Exists(ka => x.Elapsed >= ka && x.Elapsed - ka <= 1.0))
+                    return false;
+            return true;
+        }
+
+        /// <summary>Walk to where you used that item, then use it once (the plain pass makes it a hook before the fight).</summary>
+        private static List<string> PreFightLines(Use u, string q)
+        {
+            return new List<string>
+            {
+                "<MoveTo QuestId=\"" + q + "\" Name=\"Where you used " + A(u.Name) + "\" XYZ=\"" + X(u.Pos) + "\" />",
+                "<UseMissionItemOnce ItemName=\"" + A(u.Name) + "\"" +
+                (u.On != null ? " Npc=\"" + A(u.On) + "\" Range=\"" + UseRangeFor(u.OnDist) + "\"" + (u.OnDead ? " DeadOnly=\"True\"" : string.Empty) : string.Empty) +
+                " Before=\"Fight\" />"
+            };
+        }
+
+        private static IList<RecEvent> ExactActions(IList<RecEvent> events, HashSet<string> meta)
         {
             var killed = new HashSet<ulong>();
             var list = new List<RecEvent>(events.Count);
@@ -400,8 +841,7 @@ namespace QuestRecorder
                             continue;
                         if ((x.Kind == EvKind.QuestStep || x.Kind == EvKind.QuestTask) && x.QuestHidden && dt >= 0)
                             moved = true; // the helper quest (Glow injector)
-                        else if ((x.Kind == EvKind.QuestStep || x.Kind == EvKind.QuestTask) && !x.QuestHidden && dt <= 4.0 &&
-                                 !(x.Kind == EvKind.QuestTask && (x.Text ?? string.Empty).StartsWith("Complete ", StringComparison.OrdinalIgnoreCase)))
+                        else if ((x.Kind == EvKind.QuestStep || x.Kind == EvKind.QuestTask) && !x.QuestHidden && dt <= 4.0 && !IsMetaTick(x, meta))
                             moved = true; // a mission step or count moved with it
                         else if ((x.Kind == EvKind.QuestCompleted || x.Kind == EvKind.QuestRemoved) && !helpers.Contains(x.QuestId) && dt <= 0.3)
                             finished = true; // a mission ended right then: the game took the item away
@@ -501,6 +941,32 @@ namespace QuestRecorder
             return id != 0 ? "#" + id.ToString("X") : X(pos);
         }
 
+        /// <summary>An object you used for a step in the last minute that shows no mission marker: it is done, and not who you
+        /// talked to, handed in to or got a mission from.</summary>
+        private static bool UsedUp(ObjRef o, Dictionary<string, double> consumed, double t)
+        {
+            if (o == null || o.Kind != ObjKind.Placeable || o.TakesTurnIn || o.OffersQuest || (o.NodeId == 0 && !o.HasPos))
+                return false;
+            double when;
+            return consumed.TryGetValue(UseKey(o.NodeId, o.Pos), out when) && t - when <= 60;
+        }
+
+        /// <summary>The NPC a step names ("Speak to Tookreek", "Return to Lieutenant Harkun"), or null.</summary>
+        private static string NpcFromStepText(string text)
+        {
+            Match m = Regex.Match(text ?? string.Empty, @"^\s*(?:Speak|Talk|Return)\s+(?:with|to)\s+(?:the\s+)?(.+?)\s*$", RegexOptions.IgnoreCase);
+            return m.Success && m.Groups[1].Value.Length > 0 ? m.Groups[1].Value : null;
+        }
+
+        /// <summary>The start of the note on a kill another player tagged first.</summary>
+        private const string TaggedNote = "tagged by another player";
+
+        /// <summary>Your own companion (you talked to them, they aren't a quest NPC the bot walks to).</summary>
+        private static bool IsCompanion(ObjRef o)
+        {
+            return o != null && string.Equals(o.Toughness, "companion", StringComparison.OrdinalIgnoreCase);
+        }
+
         private sealed class Kill
         {
             public string Name;
@@ -526,8 +992,33 @@ namespace QuestRecorder
             public List<Kill> Kills;
             /// <summary>Other quests the same kills counted for: the fight goes on until they're done too.</summary>
             public Dictionary<ulong, string> Also;
+            /// <summary>Other tasks of this same quest the same kills counted for (task -> its gate): the fight goes on until they're done too.</summary>
+            public Dictionary<int, string> AlsoTasks;
+            /// <summary>The quest branch this step's tick was on (null = not known).</summary>
+            public string Branch;
             /// <summary>When the step was made (recording time).</summary>
             public double At = -1e9;
+            /// <summary>More about how the step was found: shown in the recorder window only, never in the profile.</summary>
+            public string Note = string.Empty;
+            /// <summary>The recorder isn't sure about this step (yellow in the review list).</summary>
+            public bool Unsure;
+            /// <summary>Short name for its fight area (null = made from the label).</summary>
+            public string Area;
+            /// <summary>A door route's own "not through yet" test (null = none).</summary>
+            public string Side;
+            /// <summary>A weekly's pick-up: taken from its board whenever it's offered (the game can still call a done weekly complete).</summary>
+            public bool Weekly;
+            /// <summary>A pick-up from a mission board / terminal (the game said the mission came from its board).</summary>
+            public bool Board;
+            /// <summary>
+            /// A pick-up from an object that is no mission board: the game said its own quest window or conversation, or a call
+            /// your click on it started, gave the mission, and no mission board opened after you clicked it.
+            /// </summary>
+            public bool NotBoard;
+            /// <summary>The lines carry their own gates (the new core's runner copies): written as they are.</summary>
+            public bool Raw;
+            /// <summary>The new core's plain words for what the bot does (the task tracker's line).</summary>
+            public string What = string.Empty;
         }
 
         /// <summary>A conversation and the replies you picked ("2 dark"; "?" when not seen).</summary>
@@ -549,14 +1040,20 @@ namespace QuestRecorder
             foreach (Step s in steps)
             {
                 int li = s.Lines.FindIndex(l => l.StartsWith("<TalkTo", StringComparison.Ordinal) || l.StartsWith("<TurnInQuest", StringComparison.Ordinal) ||
-                                                l.StartsWith("<PickUpQuest", StringComparison.Ordinal) || l.StartsWith("<PickUpIfOffered", StringComparison.Ordinal));
+                                                l.StartsWith("<PickUpQuest", StringComparison.Ordinal) || l.StartsWith("<PickUpIfOffered", StringComparison.Ordinal) ||
+                                                l.IndexOf("<AnswerHolocomCall", StringComparison.Ordinal) >= 0);
                 if (li < 0)
                     continue;
                 string line = s.Lines[li];
+                // a holocom call has nobody to talk to: its replies are kept only when they are all one side's (TempConvoSkip, the
+                // way the hand-made profiles answer calls)
+                bool call = line.IndexOf("<AnswerHolocomCall", StringComparison.Ordinal) >= 0; // (also one inside an If)
                 string npc = line.StartsWith("<TalkTo", StringComparison.Ordinal) ? Attr(line, "Name") : Attr(line, line.StartsWith("<TurnInQuest", StringComparison.Ordinal) ? "TurnInName" : "GiverName");
                 if (npc.Length == 0)
                     npc = Attr(line, "Name");
-                Convo c = convos.FindLast(v => v.Partner == npc && v.Start <= s.At + 1 && s.At - v.End <= 30);
+                // (the line holds the name XML-escaped, the conversation the game's own name)
+                string who = call ? HoloPartner : System.Net.WebUtility.HtmlDecode(npc);
+                Convo c = convos.FindLast(v => v.Partner == who && v.Start <= s.At + 1 && s.At - v.End <= 30);
                 if (c == null || c.Picks.Count == 0 || c.Picks.Contains("?"))
                     continue; // no wheel, or a pick the recorder didn't see: leave it to the bot
                 var sides = new HashSet<string>();
@@ -566,26 +1063,31 @@ namespace QuestRecorder
                     string align = c.Picks[i].Substring(c.Picks[i].IndexOf(' ') + 1);
                     if (align == "light" || align == "dark")
                         sides.Add(align);
-                    if (AutoPick(c.Wheels[i], align == "light" || align == "dark" ? align : side) != c.Picks[i])
+                    if (AutoPick(c.Wheels[i], align == "light" || align == "dark" ? align : side ?? "neutral") != c.Picks[i])
                         asBot = false;
                 }
-                if (sides.Count == 1 && asBot)
+                // (no TempConvoSkip: BuddyCron never ends it, so nothing after it would run; the profile's ForceAlignment answers)
+                if (asBot && (sides.Count == 0 || (sides.Count == 1 && sides.Contains(side ?? string.Empty))))
                 {
-                    string type = sides.Contains("dark") ? "Dark" : "Light";
-                    s.Lines.Insert(0, "<TempConvoSkip Type=\"" + type + "\" AutoSkip=\"True\">");
-                    s.Lines.Add("</TempConvoSkip>");
-                    s.Comment += " (your " + type.ToLowerInvariant() + " replies)";
+                    // the bot picks the same
+                }
+                else if (call)
+                {
+                    if (!asBot || sides.Count > 1)
+                        AddNote(s, "your holocom replies (not kept, the bot answers by its side): " + string.Join(", ", c.Picks.ToArray()));
                 }
                 else if (!asBot || sides.Count > 1)
                 {
                     var nums = c.Picks.ConvertAll(p => p.Substring(0, p.IndexOf(' ')));
                     string q = Attr(line, "QuestId");
-                    s.Lines[li] = "<TalkAndReply QuestId=\"" + (q.Length > 0 ? q : "1") + "\" Name=\"" + A(npc) + "\" Replies=\"" + string.Join(",", nums.ToArray()) +
+                    s.Lines[li] = "<TalkAndReply QuestId=\"" + (q.Length > 0 ? q : "1") + "\" Name=\"" + npc + "\" Replies=\"" + string.Join(",", nums.ToArray()) +
                                   "\" XYZ=\"" + Attr(line, "XYZ") + "\" />";
                     if (!line.StartsWith("<TalkTo", StringComparison.Ordinal))
                         s.Lines.Insert(li + 1, line); // still pick up / hand in afterwards if the talk didn't do it
-                    s.Comment += " (your replies: " + string.Join(", ", c.Picks.ToArray()) + ")";
+                    AddNote(s, "your replies: " + string.Join(", ", c.Picks.ToArray()));
                 }
+                else
+                    AddNote(s, "your " + string.Join("/", new List<string>(sides).ToArray()) + " replies (not kept, the bot answers by the profile's side)");
             }
         }
 
@@ -622,10 +1124,38 @@ namespace QuestRecorder
 
         public static string CreditName = string.Empty;
 
+        /// <summary>Turn to the way you faced before a special-bar ability (Macrobinoculars scans). Off until BuddyCron's
+        /// turn call in FaceHeadingCode is checked in game: a wrong call stops the profile's code from compiling.</summary>
+        public static bool FaceRecordedHeading = false;
+
+        /// <summary>Pick your own reply-wheel numbers (the ones the bot wouldn't pick by itself) with a BuddyCron Hook while
+        /// BuddyCron's own TalkTo / PickUpQuest / TurnInQuest talks (the calls of Quest Recorder's TalkAndReply, which works).
+        /// Off: the bot answers every wheel by the profile's side.</summary>
+        public static bool ReplayReplyPicks = false;
+
+        /// <summary>A pick-up from a giver runs only while the mission log has room (it holds 25; the game's hidden helper
+        /// quests left out of the count), so a full log skips it instead of BuddyCron's PickUpQuest trying forever. Off until
+        /// it is checked in game that the profile condition can read Me.Quests.ActiveQuestStates and which missions count.</summary>
+        public static bool PickUpOnlyWithRoom = false;
+        private const string LogHasRoom = "25 > len([x for x in Me.Quests.ActiveQuestStates if not x.IsHidden])";
+
+        /// <summary>A hand-in to an object with a same-name twin close by is pinned to that exact object (SearchRadius 0.001,
+        /// as for object pick-ups). Off until it is checked in game that TurnInQuest compares SearchRadius with the distance
+        /// squared like PickUpQuest does; off, every object hand-in keeps SearchRadius 20.</summary>
+        public static bool TurnInPinnedTwin = false;
+
+        /// <summary>An object click before a fight (WalkUpClick) whose use bar stopped with a second or more still to go (a hit
+        /// cut it short) is clicked once more when out of combat. Off until it is checked in game that IsCasting and
+        /// CastTimeRemaining follow an object's use bar; off, any cast or fight after the click counts as done.</summary>
+        public static bool RetryCutUse = false;
+
+        /// <summary>The one BuddyCron call that turns the character to a heading in degrees (MovementManager.Rotate takes degrees).</summary>
+        private const string FaceHeadingCode = "BuddyCron.Managers.MovementManager.Rotate(deg);";
+
         private const string RideKey = "\u0001ride|";
 
         /// <summary>The game's own travel abilities (BuddyCron's navigator does travel itself, so these are not mission items).</summary>
-        private static bool IsTravelAbility(string name)
+        internal static bool IsTravelAbility(string name)
         {
             foreach (string s in new[] { "Quick Travel", "Fleet Pass", "Priority Transport", "Stronghold", "Return to", "Recall", "Travel to" })
                 if (name.IndexOf(s, StringComparison.OrdinalIgnoreCase) >= 0)
@@ -656,6 +1186,14 @@ namespace QuestRecorder
             return string.Format(CultureInfo.InvariantCulture, "(Me.Position.{0} {1} {2:0.##})", axis, a > b ? "&gt;" : "&lt;", mid);
         }
 
+        /// <summary>"Not through the door yet": the height when the door changes floors, else the door's own side, like a lift.</summary>
+        private static string DoorSide(Vec3 from, Vec3 to)
+        {
+            if (Math.Abs(to.Y - from.Y) >= 2f)
+                return string.Format(CultureInfo.InvariantCulture, "(Me.Position.Y {0} {1:0.##})", from.Y > to.Y ? "&gt;" : "&lt;", (from.Y + to.Y) / 2f);
+            return SideOf(from, to);
+        }
+
         private static string A(string s)
         {
             return Fmt.XmlAttr(s ?? string.Empty);
@@ -666,12 +1204,54 @@ namespace QuestRecorder
         /// <summary>The &lt;CodeChunks&gt; the last plain pass made (BuddyCron's own code-in-profile), written into the header.</summary>
         [ThreadStatic] private static List<string> _codeChunks;
 
-        /// <summary>A C# string literal from an XML-escaped attribute value.</summary>
+        /// <summary>
+        /// The control panel's pick-up (ProfileEditor.PickUp) made like a recorded one: when it is a board pick-up (the rule of
+        /// IsBoardPickUp; boardOpen = the game had a board open), the steps of BoardPickUp with its code chunks added to chunks;
+        /// otherwise an empty list. A plain pass going on in this thread keeps its own chunks.
+        /// </summary>
+        internal static List<string> PanelBoardPickUp(string pickupLine, bool boardOpen, int no, string standXyz, List<string> chunks)
+        {
+            if (!IsBoardPickUp(new Step { Board = boardOpen }, pickupLine))
+                return new List<string>();
+            List<string> keep = _codeChunks;
+            _codeChunks = new List<string>();
+            try
+            {
+                List<string> lines = BoardPickUp(pickupLine, no, standXyz);
+                if (lines.Count > 0)
+                    chunks.AddRange(_codeChunks);
+                return lines;
+            }
+            finally
+            {
+                _codeChunks = keep;
+            }
+        }
+
+        /// <summary>
+        /// A C# string literal from an XML-escaped attribute value (a line break, or the "]]>" that would end the code
+        /// chunk's CDATA, written as a Unicode escape).
+        /// </summary>
         private static string CsString(string xmlValue)
         {
             string s = System.Net.WebUtility.HtmlDecode(xmlValue ?? string.Empty);
-            return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
+            var b = new StringBuilder(s.Length + 2).Append('"');
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '\\' || c == '"')
+                    b.Append('\\').Append(c);
+                else if (c == '\r' || c == '\n' || c == '\u0085' || c == '\u2028' || c == '\u2029' || (c == '>' && i >= 2 && s[i - 1] == ']' && s[i - 2] == ']'))
+                    b.Append("\\u").Append(((int)c).ToString("X4", CultureInfo.InvariantCulture));
+                else
+                    b.Append(c);
+            }
+            return b.Append('"').ToString();
         }
+
+        /// <summary>The plain pass's hook numbers so far (a second pass on more steps goes on from them).</summary>
+        [ThreadStatic] private static int _hookNo;
+        [ThreadStatic] private static bool _faceAdded;
 
         /// <summary>
         /// Turns every step only Quest Recorder knows into BuddyCron's own:
@@ -679,16 +1259,27 @@ namespace QuestRecorder
         /// one mission item -> UseItem with a condition, and a row of mission items or a special-bar quest ability -> a BuddyCron
         /// Hook (code inside the profile, like the CZ-198 Tentacle code) that waits for each cast.
         /// </summary>
-        private static void PlainSteps(List<Step> steps)
+        private static void PlainSteps(List<Step> steps, bool fresh = true)
         {
-            _codeChunks = new List<string>();
-            int hookNo = 0;
+            if (fresh)
+            {
+                _codeChunks = new List<string>();
+                _hookNo = 0;
+                _faceAdded = false;
+            }
             foreach (Step s in steps)
             {
                 var outLines = new List<string>();
                 string lastSpot = null;
+                string replyClose = null; // the reply Hook to take out after the pick-up / hand-in line that does the talking
+                int replyCloseAt = -1;
                 for (int li = 0; li < s.Lines.Count; li++)
                 {
+                    if (replyClose != null && li > replyCloseAt)
+                    {
+                        outLines.Add("<Hook Name=\"" + replyClose + "\" Operation=\"R\" Location=\"TreeStart\" />");
+                        replyClose = null;
+                    }
                     string l = s.Lines[li];
                     if (l.StartsWith("<MoveTo ", StringComparison.Ordinal))
                     {
@@ -703,20 +1294,52 @@ namespace QuestRecorder
                     }
                     if (l.StartsWith("<PickUpQuest ", StringComparison.Ordinal))
                     {
+                        // A mission board / terminal: BuddyCron's PickUpQuest asks the board for the mission forever when the
+                        // board doesn't list it (done this week, used up, or not for this character), and skips a weekly the game
+                        // still calls "complete" while the board offers it again. A BuddyCron Hook at the board takes it when the
+                        // board lists it and otherwise moves straight on.
+                        if (IsBoardPickUp(s, l))
+                        {
+                            List<string> board = BoardPickUp(l, ++_hookNo, lastSpot);
+                            if (board.Count > 0)
+                            {
+                                // (the walk to where you stood is the board's own first line)
+                                if (outLines.Count > 0 && outLines[outLines.Count - 1].StartsWith("<MoveTo ", StringComparison.Ordinal) &&
+                                    Attr(outLines[outLines.Count - 1], "XYZ") == lastSpot)
+                                    outLines.RemoveAt(outLines.Count - 1);
+                                // only "do I have it?": the hook moves on by itself when the board doesn't list the mission,
+                                // and the game's "already complete" has read true for missions the board offered again
+                                if (s.Gate != null)
+                                    s.Gate = Regex.Replace(s.Gate, @" and \(not IsQuestComplete\(0x[0-9A-F]+\)\)", string.Empty);
+                                outLines.AddRange(board);
+                                continue;
+                            }
+                        }
                         outLines.Add(l);
-                        // A weekly: the game can still call it "complete" while the terminal offers it again (even on a new
-                        // character), and BuddyCron's PickUpQuest skips anything "complete". A BuddyCron Hook at the giver takes
-                        // it from the board whenever it's offered.
-                        if (s.Comment.IndexOf("[WEEKLY", StringComparison.OrdinalIgnoreCase) >= 0)
-                            outLines.AddRange(WeeklyHook(l, ++hookNo));
                         continue;
                     }
                     if (l.StartsWith("<TalkAndReply ", StringComparison.Ordinal))
                     {
-                        // BuddyCron's own talk; when the quest is 1 the pickup / hand-in line after it does the talking
+                        // BuddyCron's own talk. For a pick-up or a hand-in the line right after it (put back there) does the
+                        // talking: no second talk in front of it.
                         string q = Attr(l, "QuestId");
-                        if (q.Length > 0 && q != "1")
-                            outLines.Add("<TalkTo QuestId=\"" + q + "\" GiverName=\"" + Attr(l, "Name") + "\" UseRange=\"20\" XYZ=\"" + Attr(l, "XYZ") + "\" />");
+                        string after = li + 1 < s.Lines.Count ? s.Lines[li + 1] : string.Empty;
+                        bool owned = ((after.StartsWith("<PickUpQuest ", StringComparison.Ordinal) || after.StartsWith("<PickUpIfOffered ", StringComparison.Ordinal)) && !IsBoardPickUp(s, after)) ||
+                                     after.StartsWith("<TurnInQuest ", StringComparison.Ordinal);
+                        string reply = ReplayReplyPicks ? ReplyHook(Attr(l, "Replies"), ++_hookNo, Attr(l, "XYZ")) : null;
+                        if (reply != null)
+                            outLines.Add("<Hook Name=\"" + reply + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
+                        if (!owned)
+                        {
+                            outLines.Add("<TalkTo QuestId=\"" + (q.Length > 0 ? q : "1") + "\" Name=\"" + Attr(l, "Name") + "\" WaitTime=\"5\" XYZ=\"" + Attr(l, "XYZ") + "\" />");
+                            if (reply != null)
+                                outLines.Add("<Hook Name=\"" + reply + "\" Operation=\"R\" Location=\"TreeStart\" />");
+                        }
+                        else if (reply != null)
+                        {
+                            replyClose = reply;
+                            replyCloseAt = li + 1;
+                        }
                         continue;
                     }
                     if (l.StartsWith("<EquipItem ", StringComparison.Ordinal))
@@ -727,9 +1350,20 @@ namespace QuestRecorder
                     }
                     if (l.StartsWith("<ClickObject ", StringComparison.Ordinal))
                     {
-                        string n = Attr(l, "Name"), xyz = Attr(l, "XYZ");
-                        outLines.Add("<MoveTo QuestId=\"1\" Name=\"" + n + "\" XYZ=\"" + xyz + "\" />");
+                        string n = Attr(l, "Name"), xyz = Attr(l, "XYZ"), stand = Attr(l, "Stand");
+                        if (stand.Length > 0 && Attr(l, "Fight") == "True" && FiniteXyz(xyz))
+                        {
+                            // before a fight: walk to where you stood, then up to the object until it can be clicked
+                            outLines.AddRange(WalkUpClick(n, xyz, stand, ++_hookNo));
+                            lastSpot = stand;
+                            continue;
+                        }
+                        // walk to where you stood when you clicked it (the object's own spot can be out of reach), then click it
+                        Vec3 sv, ov;
+                        string to = stand.Length > 0 && TryVec(stand, out sv) && TryVec(xyz, out ov) && sv.DistanceTo(ov) < 10f ? stand : xyz;
+                        outLines.Add("<MoveTo QuestId=\"1\" Name=\"" + n + "\" XYZ=\"" + to + "\" />");
                         outLines.Add("<Interact Name=\"" + n + "\" XYZ=\"" + xyz + "\" />");
+                        lastSpot = to;
                         continue;
                     }
                     bool once = l.StartsWith("<UseMissionItemOnce ", StringComparison.Ordinal);
@@ -739,40 +1373,97 @@ namespace QuestRecorder
                         outLines.Add(l);
                         continue;
                     }
-                    // a run: this line and the item / ability uses right after it (MoveTos to the same row in between skipped)
+                    // where the bot uses it: the MoveTo right before it (the spot you used it at)
+                    string baseMove = li > 0 && s.Lines[li - 1].StartsWith("<MoveTo ", StringComparison.Ordinal) && Attr(s.Lines[li - 1], "XYZ").Length > 0
+                                      ? s.Lines[li - 1] : null;
+                    // a run: this line and the item / ability uses right after it. The MoveTos between them (a row you used at
+                    // two places) are walked by BuddyCron while the hook waits; a MoveTo after the last use stays as it is.
                     var run = new List<string> { l };
-                    int lj = li + 1;
+                    var runAt = new List<string> { null }; // the spot each one was used at (null: the spot before the run)
+                    var walks = new List<string>();
+                    var pending = new List<string>();
+                    string usedAt = null;
+                    int lj = li + 1, lastUse = li;
                     while (lj < s.Lines.Count)
                     {
                         string n = s.Lines[lj];
                         if (n.StartsWith("<UseMissionItemOnce ", StringComparison.Ordinal))
+                        {
+                            foreach (string pm in pending)
+                                if (Attr(pm, "XYZ").Length > 0)
+                                {
+                                    walks.Add(pm);
+                                    usedAt = Attr(pm, "XYZ");
+                                }
+                            pending.Clear();
                             run.Add(n);
-                        else if (!n.StartsWith("<MoveTo ", StringComparison.Ordinal))
+                            runAt.Add(usedAt);
+                            lastUse = lj;
+                        }
+                        else if (n.StartsWith("<MoveTo ", StringComparison.Ordinal))
+                            pending.Add(n);
+                        else
                             break;
                         lj++;
                     }
-                    li = lj - 1;
-                    bool simple = run.Count == 1 && once && Attr(l, "Npc").Length == 0 && Attr(l, "AbilityName").Length == 0;
+                    li = lastUse;
+                    // a special-bar ability: walk to where you used it first (the hook casts where the bot stands)
+                    string abilitySpot = ability ? Attr(l, "XYZ") : string.Empty;
+                    if (abilitySpot.Length > 0)
+                    {
+                        string am = "<MoveTo QuestId=\"1\" Name=\"Where you used " + Attr(l, "AbilityName") + "\" XYZ=\"" + abilitySpot + "\" />";
+                        if (abilitySpot != lastSpot)
+                            outLines.Add(am);
+                        lastSpot = abilitySpot;
+                        baseMove = am;
+                    }
+                    // used before a fight it brings out (a lure, a totem): once, then the fight
+                    bool beforeFight = Attr(l, "Before") == "Fight";
+                    // used once, before the step's last action (Once="True"): the step doesn't move on by it, so neither a UseItem
+                    // until it does nor a row tried again until it does
+                    bool onceOnly = Attr(l, "Once") == "True";
+                    bool simple = run.Count == 1 && once && !beforeFight && !onceOnly && Attr(l, "Npc").Length == 0 && Attr(l, "AbilityName").Length == 0;
                     if (simple)
                     {
                         // one mission item on yourself, once: BuddyCron's UseItem until the step moves on (Vny's Heroic Transport way)
+                        // (in your mission items or your bags - a stim is a bag item - like the Heroic Transport check)
                         string item = Attr(l, "ItemName");
-                        string has = "any(i.Name == " + A(CsString(item).Replace("\"", "'")) + " for i in Me.QuestItems)";
+                        string py = Fmt.PyStr(System.Net.WebUtility.HtmlDecode(item));
+                        string has = A("(any(i.Name == " + py + " for i in Me.QuestItems) or any(i.Name == " + py + " for i in Me.Backpack))");
                         string cond = has + (s.Gate != null && s.Gate.Length > 0 ? " and (" + s.Gate + ")" : string.Empty);
                         outLines.Add("<UseItem ItemName=\"" + item + "\" Condition=\"" + cond + "\" WaitTime=\"3000\" Range=\"100000\"><Hotspots><Hotspot Name=\"Where you used it\" XYZ=\"" +
                                      (lastSpot ?? "0,0,0") + "\" /></Hotspots></UseItem>");
                         continue;
                     }
+                    if (walks.Count > 0)
+                        lastSpot = usedAt;
                     // a row (runes in order), an item on an NPC, or a quest ability: a BuddyCron Hook that does them in order,
                     // each after the cast before it has finished, and tries the row again if the step didn't move on
-                    hookNo++;
-                    string hook = "UseInOrder" + hookNo, v = "_r" + hookNo;
+                    _hookNo++;
+                    string hook = "UseInOrder" + _hookNo, v = "_r" + _hookNo;
                     var names = new List<string>();
                     var npcs = new List<string>();
                     var abil = new List<string>();
                     var opens = new List<string>();
-                    foreach (string r in run)
+                    var heads = new List<string>(); // the way you faced when you used it (special-bar abilities)
+                    var deads = new List<string>(); // used on a corpse
+                    var fights = new List<string>(); // may be used in a fight (you did, or the NPC fought you right after)
+                    var ranges = new List<string>(); // how close you stood to the NPC (game units)
+                    var hps = new List<string>(); // used on it once its health was down to this (0 = any)
+                    var hasAt = new List<string>();
+                    var spots = new List<string>(); // where you used it
+                    bool face = false;
+                    for (int ri = 0; ri < run.Count; ri++)
                     {
+                        string r = run[ri];
+                        float hd;
+                        if (FaceRecordedHeading && Attr(r, "AbilityName").Length > 0 && float.TryParse(Attr(r, "Heading"), NumberStyles.Float, CultureInfo.InvariantCulture, out hd))
+                        {
+                            heads.Add(hd.ToString("0.#", CultureInfo.InvariantCulture) + "f");
+                            face = true;
+                        }
+                        else
+                            heads.Add("float.NaN");
                         string an = Attr(r, "AbilityName");
                         bool isAb = an.Length > 0;
                         names.Add(CsString(isAb ? an : Attr(r, "ItemName")));
@@ -785,47 +1476,113 @@ namespace QuestRecorder
                         }
                         npcs.Add(CsString(npc));
                         opens.Add(CsString(Attr(r, "OpenWith")));
+                        deads.Add(Attr(r, "DeadOnly") == "True" ? "true" : "false");
+                        // (an ability line written without InCombat is used in a fight or not, as before)
+                        bool fightOk = Attr(r, "InCombat") == "True" || (r.StartsWith("<UseQuestAbility ", StringComparison.Ordinal) && Attr(r, "InCombat").Length == 0);
+                        fights.Add(fightOk ? "true" : "false");
+                        float rm;
+                        float ru = float.TryParse(Attr(r, "Range"), NumberStyles.Float, CultureInfo.InvariantCulture, out rm) && rm > 0f ? (rm >= 1f ? rm / 10f : rm) : 1.5f;
+                        ranges.Add(ru.ToString("0.###", CultureInfo.InvariantCulture) + "f");
+                        int hp;
+                        hps.Add(int.TryParse(Attr(r, "HealthPercent"), NumberStyles.Integer, CultureInfo.InvariantCulture, out hp) && hp > 0 && hp < 100
+                                ? hp.ToString(CultureInfo.InvariantCulture) + "f" : "0f");
+                        string spotXyz = runAt[ri] ?? (baseMove != null ? Attr(baseMove, "XYZ") : null);
+                        Vec3 wv;
+                        if (spotXyz != null && TryVec(spotXyz, out wv) && !float.IsNaN(wv.X + wv.Y + wv.Z) && !float.IsInfinity(wv.X + wv.Y + wv.Z))
+                        {
+                            hasAt.Add("true");
+                            spots.Add(string.Format(CultureInfo.InvariantCulture, "new System.Numerics.Vector3({0:0.###}f, {1:0.###}f, {2:0.###}f)", wv.X, wv.Y, wv.Z));
+                        }
+                        else
+                        {
+                            hasAt.Add("false");
+                            spots.Add("new System.Numerics.Vector3(0f, 0f, 0f)");
+                        }
                     }
                     string nl = "\r\n";
+                    if (face && !_faceAdded)
+                    {
+                        _codeChunks.Add("\t\t<CodeChunk Name=\"FaceHeading\" Type=\"Definition\"><![CDATA[" + nl +
+                                        "\t\t\tstatic void FaceHeading(float deg) { " + FaceHeadingCode + " }" + nl +
+                                        "\t\t]]></CodeChunk>");
+                        _faceAdded = true;
+                    }
                     _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl +
-                                    "\t\t\tstatic int " + v + "_i, " + v + "_t;" + nl +
-                                    "\t\t\tstatic bool " + v + "_p, " + v + "_s;" + nl +
-                                    "\t\t\tstatic System.DateTime " + v + "_next, " + v + "_last, " + v + "_at, " + v + "_done;" + nl +
+                                    "\t\t\tstatic int " + v + "_i, " + v + "_t, " + v + "_wi = -1;" + nl +
+                                    "\t\t\tstatic bool " + v + "_p, " + v + "_s, " + v + "_ok, " + v + "_w;" + nl +
+                                    "\t\t\tstatic System.DateTime " + v + "_next, " + v + "_last, " + v + "_at, " + v + "_done, " + v + "_ws, " + v + "_tw;" + nl +
                                     "\t\t]]></CodeChunk>");
+                    string mover = "BuddyCron.Navigation.Navigator.PlayerMover";
+                    // with the step's gate the row is tried again 8 s after it ends, until the step moves on; without one (or
+                    // before a fight) it is done once while the profile waits
+                    bool looped = s.Gate != null && s.Gate.Length > 0 && !beforeFight && !onceOnly;
+                    int wait = run.Count * 6 + 4;
+                    string again = (looped ? 8 : wait + 5).ToString(CultureInfo.InvariantCulture);
                     string body =
                         "var names = new[] { " + string.Join(", ", names) + " };" + nl +
                         "var npcs = new[] { " + string.Join(", ", npcs) + " };" + nl +
                         "var isAbility = new[] { " + string.Join(", ", abil) + " };" + nl +
                         "var openWith = new[] { " + string.Join(", ", opens) + " };" + nl +
+                        "var deadOnly = new[] { " + string.Join(", ", deads) + " };" + nl +
+                        "var inFight = new[] { " + string.Join(", ", fights) + " };" + nl +
+                        "var useRange = new[] { " + string.Join(", ", ranges) + " };" + nl +
+                        "var healthAt = new[] { " + string.Join(", ", hps) + " };" + nl +
+                        "var hasSpot = new[] { " + string.Join(", ", hasAt) + " };" + nl +
+                        "var spots = new[] { " + string.Join(", ", spots) + " };" + nl +
+                        (face ? "var headings = new[] { " + string.Join(", ", heads) + " };" + nl : string.Empty) +
                         "var me = BuddyCron.Core.Player;" + nl +
                         "var now = System.DateTime.Now;" + nl +
-                        "if ((now - " + v + "_last).TotalSeconds > 60) { " + v + "_i = 0; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_next = now; }" + nl +
+                        "if ((now - " + v + "_last).TotalSeconds > 60) { " + v + "_i = 0; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_wi = -1; " + v + "_next = now; }" + nl +
                         v + "_last = now;" + nl +
-                        "if (" + v + "_i >= names.Length) { if ((now - " + v + "_done).TotalSeconds > 8) { " + v + "_i = 0; " + v + "_next = now; } return false; }" + nl +
+                        "if (" + v + "_i >= names.Length) { if ((now - " + v + "_done).TotalSeconds > " + again + ") { " + v + "_i = 0; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_wi = -1; " + v + "_next = now; } return false; }" + nl +
                         "if (me.IsCasting) { if (" + v + "_p) " + v + "_s = true; return true; }" + nl +
                         "if (" + v + "_p && " + v + "_s) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
                         "if (now < " + v + "_next) return true;" + nl +
                         "if (" + v + "_p && (now - " + v + "_at).TotalSeconds < 1.5) return true;" + nl +
+                        // pressed and taken, and no cast bar came: an instant use, done (not pressed 4 times)
+                        "if (" + v + "_p && " + v + "_ok) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
+                        // dead, or in a fight this use wasn't part of: BuddyCron's own death handling and combat routine run first
+                        // (and the walk-back wait starts over once alive and out of the fight: a long fight or corpse run never
+                        // uses it where the bot happens to stand)
+                        "if (me.IsDead || (me.InCombat && !inFight[" + v + "_i])) { if (" + v + "_w) { " + mover + ".MoveStop(); " + v + "_w = false; } " + v + "_p = false; " + v + "_wi = -1; return false; }" + nl +
                         "if (" + v + "_t >= 4) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
+                        "if (" + v + "_wi != " + v + "_i) { " + v + "_wi = " + v + "_i; " + v + "_ws = now; " + v + "_tw = System.DateTime.MinValue; }" + nl +
+                        // away from where you used it (after a death, or the next place of the row): the profile's own MoveTo walks there
+                        "if (hasSpot[" + v + "_i] && " + v + "_tw == System.DateTime.MinValue && (now - " + v + "_ws).TotalSeconds < 120 && System.Numerics.Vector3.Distance(me.Location, spots[" + v + "_i]) > 1.5f) { " + v + "_w = true; return false; }" + nl +
                         "BuddyCron.Objects.HeroCharacter target = null;" + nl +
                         "if (npcs[" + v + "_i].Length > 0)" + nl +
                         "    foreach (var c in BuddyCron.Managers.HeroObjectManager.GetObjects<BuddyCron.Objects.HeroCharacter>())" + nl +
-                        "        if (c != null && c.IsValid && c.Name == npcs[" + v + "_i] && (target == null || c.Distance < target.Distance)) target = c;" + nl +
+                        "        if (c != null && c.IsValid && c.Name == npcs[" + v + "_i] && c.IsDead == deadOnly[" + v + "_i] && (!hasSpot[" + v + "_i] || System.Numerics.Vector3.Distance(c.Location, spots[" + v + "_i]) < 10f) && (target == null || c.Distance < target.Distance)) target = c;" + nl +
+                        // an item for an NPC that isn't here: not used on yourself (tried again, then skipped)
+                        "if (target == null && npcs[" + v + "_i].Length > 0 && !isAbility[" + v + "_i]) { " + v + "_t++; " + v + "_next = now.AddSeconds(1.5); return true; }" + nl +
+                        // "weaken it, then use it": in the fight, the combat routine fights it down to where you used it first
+                        "if (target != null && me.InCombat && healthAt[" + v + "_i] > 0f && target.HealthPercent > healthAt[" + v + "_i]) { " + v + "_p = false; return false; }" + nl +
+                        "if (target != null && target.Distance > useRange[" + v + "_i])" + nl +
+                        "{" + nl +
+                        "    if (" + v + "_tw == System.DateTime.MinValue) " + v + "_tw = now;" + nl +
+                        "    if ((now - " + v + "_tw).TotalSeconds < 20) { " + v + "_w = true; " + mover + ".MoveTowards(target.Location); return true; }" + nl +
+                        "}" + nl +
+                        mover + ".MoveStop();" + nl +
+                        v + "_w = false;" + nl +
+                        v + "_ok = false;" + nl +
                         "if (isAbility[" + v + "_i])" + nl +
                         "{" + nl +
                         "    if (openWith[" + v + "_i].Length > 0 && !BuddyCron.Managers.AbilityManager.HasAbility(names[" + v + "_i]))" + nl +
                         "    {" + nl +
-                        "        var opener = System.Linq.Enumerable.FirstOrDefault(BuddyCron.Core.Me.QuestItems, i => i.Name == openWith[" + v + "_i]);" + nl +
+                        "        var opener = System.Linq.Enumerable.FirstOrDefault(BuddyCron.Core.Me.QuestItems, i => i.Name == openWith[" + v + "_i])" + nl +
+                        "                ?? System.Linq.Enumerable.FirstOrDefault(BuddyCron.Core.Me.Backpack, i => i.Name == openWith[" + v + "_i]);" + nl +
                         "        if (opener != null) opener.Use();" + nl +
-                        "        " + v + "_next = now.AddSeconds(2); return true;" + nl +
+                        "        " + v + "_t++; " + v + "_next = now.AddSeconds(3); return true;" + nl +
                         "    }" + nl +
-                        "    BuddyCron.Managers.AbilityManager.Cast(names[" + v + "_i], target ?? (BuddyCron.Objects.HeroCharacter)me, false);" + nl +
+                        (face ? "    if (target == null && !float.IsNaN(headings[" + v + "_i])) FaceHeading(headings[" + v + "_i]);" + nl : string.Empty) +
+                        "    " + v + "_ok = BuddyCron.Managers.AbilityManager.Cast(names[" + v + "_i], target ?? (BuddyCron.Objects.HeroCharacter)me, false).Success;" + nl +
                         "}" + nl +
                         "else" + nl +
                         "{" + nl +
                         "    var item = System.Linq.Enumerable.FirstOrDefault(BuddyCron.Core.Me.QuestItems, i => i.Name == names[" + v + "_i])" + nl +
                         "            ?? System.Linq.Enumerable.FirstOrDefault(BuddyCron.Core.Me.Backpack, i => i.Name == names[" + v + "_i]);" + nl +
-                        "    if (item == null) { " + v + "_i++; return true; }" + nl +
+                        "    if (item == null) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
+                        "    try { var ab = item.Ability; " + v + "_ok = ab != null && ab.CastingTime <= 0f && ab.ChannelingTime <= 0f; } catch { " + v + "_ok = false; }" + nl +
                         "    if (target != null) item.UseAbility(target); else item.Use();" + nl +
                         "}" + nl +
                         v + "_p = true; " + v + "_s = false; " + v + "_at = now; " + v + "_t++;" + nl +
@@ -837,34 +1594,115 @@ namespace QuestRecorder
                     sbh.Append("\t\t]]></CodeChunk>");
                     _codeChunks.Add(sbh.ToString());
                     outLines.Add("<Hook Name=\"" + hook + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
-                    if (s.Gate != null && s.Gate.Length > 0)
-                        outLines.Add("<While Condition=\"" + s.Gate + "\"><WaitTimer QuestId=\"1\" WaitTime=\"3\" /></While>");
+                    if (looped)
+                    {
+                        // until the step moves on; each round the bot walks back to where you used them when it is away (after a
+                        // death) and through the row's places, the hook waiting while BuddyCron walks
+                        var back = new StringBuilder();
+                        if (baseMove != null)
+                            back.Append(WhenAway(baseMove));
+                        foreach (string w in walks)
+                            back.Append(WhenAway(w));
+                        // (bounded: about three rounds of the row, ~8 s an item and the hook's 8 s before it starts again,
+                        // then the profile goes on and the end says the mission isn't finished)
+                        int most = Math.Min(180, 3 * (names.Count * 8 + 8));
+                        for (int sofar = 0; sofar < most; sofar += 5)
+                            outLines.Add("<If Condition=\"" + s.Gate + "\">" + back.ToString() + "<WaitTimer QuestId=\"1\" WaitTime=\"5\" /></If>");
+                    }
                     else
-                        outLines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"" + (run.Count * 6 + 4).ToString(CultureInfo.InvariantCulture) + "\" />");
+                    {
+                        // once: back to where you used it when the bot is away from there, then the row's other places
+                        if (baseMove != null)
+                            outLines.Add(WhenAway(baseMove));
+                        outLines.AddRange(walks);
+                        outLines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"" + wait.ToString(CultureInfo.InvariantCulture) + "\" />");
+                    }
                     outLines.Add("<Hook Name=\"" + hook + "\" Operation=\"R\" Location=\"TreeStart\" />");
                 }
+                if (replyClose != null)
+                    outLines.Add("<Hook Name=\"" + replyClose + "\" Operation=\"R\" Location=\"TreeStart\" />");
                 s.Lines.Clear();
                 s.Lines.AddRange(outLines);
             }
         }
 
-        /// <summary>Steps (and a code chunk) that take a weekly from its giver's board when it's offered and not in the log.</summary>
-        private static List<string> WeeklyHook(string pickupLine, int no)
+        /// <summary>
+        /// A MoveTo that only walks when the bot is more than 10 m from its spot (the hook waits from 15 m), so a round at the
+        /// spot asks BuddyCron for no path.
+        /// </summary>
+        private static string WhenAway(string moveTo)
+        {
+            Vec3 p;
+            if (!TryVec(Attr(moveTo, "XYZ"), out p))
+                return moveTo;
+            return Fmt.Format("<If Condition=\"(((Me.Position.X - ({0})) ** 2 + (Me.Position.Y - ({1})) ** 2 + (Me.Position.Z - ({2})) ** 2) &gt; 1)\">",
+                              Fmt.F3(p.X), Fmt.F3(p.Y), Fmt.F3(p.Z)) + moveTo + "</If>";
+        }
+
+        /// <summary>
+        /// A pick-up from a mission board / terminal: an object giver (it has a SearchRadius) that the game said gave it from its
+        /// board, or one named like a board (Mission / Terminal) as the weekly-board rule below, unless the game said its own quest
+        /// window or conversation gave it (NotBoard).
+        /// </summary>
+        private static bool IsBoardPickUp(Step s, string pickupLine)
+        {
+            if (Attr(pickupLine, "SearchRadius").Length == 0 && Attr(pickupLine, "GiverType") != "Placeable")
+                return false; // an NPC giver: BuddyCron's PickUpQuest talks to it
+            if (s.Board)
+                return true;
+            if (s.NotBoard)
+                return false; // its quest window or conversation: BuddyCron's PickUpQuest takes it
+            string gn = Attr(pickupLine, "GiverName");
+            return gn.IndexOf("Terminal", StringComparison.OrdinalIgnoreCase) >= 0 || gn.IndexOf("Mission", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>
+        /// Steps (and code chunks) that take a mission from its board only when the board lists it: walk to the board (and up to
+        /// it until it can be used), open it, read its list after a second, take the mission if it's there, and move on when it
+        /// isn't (or after 20 s out of combat; BuddyCron fights first).
+        /// </summary>
+        private static List<string> BoardPickUp(string pickupLine, int no, string standXyz)
         {
             string id = Attr(pickupLine, "QuestId"), giver = Attr(pickupLine, "GiverName"), xyz = Attr(pickupLine, "XYZ");
             var lines = new List<string>();
             string[] p = xyz.Split(',');
-            if (id.Length == 0 || giver.Length == 0 || p.Length != 3)
+            if (id.Length == 0 || giver.Length == 0 || p.Length != 3 || !FiniteXyz(xyz))
                 return lines;
-            string hook = "TakeWeekly" + no, v = "_w" + no;
+            string hook = "TakeFromBoard" + no, v = "_w" + no;
             string nl = "\r\n";
+            // (a walk up to the board is stopped on every way out of the walk)
+            string stop = "if (" + v + "_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); " + v + "_mv = false; }";
             string body =
                 "ulong id = " + id + "UL;" + nl +
-                "var spot = new System.Numerics.Vector3(" + p[0] + "f, " + p[1] + "f, " + p[2] + "f);" + nl +
+                "var spot = new System.Numerics.Vector3(" + p[0].Trim() + "f, " + p[1].Trim() + "f, " + p[2].Trim() + "f);" + nl +
                 "var me = BuddyCron.Core.Player;" + nl +
-                "if (System.Linq.Enumerable.Contains(BuddyCron.Core.Me.Quests.ActiveQuestIds, id)) return false;" + nl +
-                "if (me.MissionBoardOpen) { BuddyCron.Objects.HeroGuiApiGfx.Instance.AcceptMission(id); return false; }" + nl +
-                "if ((System.DateTime.Now - " + v + "_click).TotalSeconds < 3) return false;" + nl +
+                "var now = System.DateTime.Now;" + nl +
+                "if ((now - " + v + "_last).TotalSeconds > 30) { " + v + "_start = now; " + v + "_open = System.DateTime.MinValue; " + v + "_done = false; " + v + "_mv = false; }" + nl +
+                v + "_last = now;" + nl +
+                "if (" + v + "_done || System.Linq.Enumerable.Contains(BuddyCron.Core.Me.Quests.ActiveQuestIds, id)) { " + stop + " return false; }" + nl +
+                // in a fight: BuddyCron fights first (the hook stays in until the fight ends), and the 20 s start after it
+                "if (me.InCombat) { " + stop + " " + v + "_start = now; return false; }" + nl +
+                "if ((now - " + v + "_start).TotalSeconds > 20) { " + stop + " " + v + "_done = true; return false; }" + nl +
+                "if (me.MissionBoardOpen)" + nl +
+                "{" + nl +
+                "    " + stop + nl +
+                "    if (" + v + "_open == System.DateTime.MinValue) " + v + "_open = now;" + nl +
+                "    if ((now - " + v + "_open).TotalSeconds < 1) return true;" + nl +
+                "    bool listed = false, onBoard = false, unknown = false;" + nl +
+                "    foreach (var mq in me.MissionBoardQuests)" + nl +
+                "    {" + nl +
+                "        if (mq == null) continue;" + nl +
+                "        ulong q = mq.QuestId;" + nl +
+                "        if ((q >> 48) != 0xE000UL) { unknown = true; continue; }" + nl +
+                "        listed = true;" + nl +
+                "        if (q == id) onBoard = true;" + nl +
+                "    }" + nl +
+                "    if (listed && !onBoard && !unknown) { " + v + "_done = true; return false; }" + nl +
+                "    if ((now - " + v + "_click).TotalSeconds >= 2) { BuddyCron.Objects.HeroGuiApiGfx.Instance.AcceptMission(id); " + v + "_click = now; }" + nl +
+                "    return true;" + nl +
+                "}" + nl +
+                v + "_open = System.DateTime.MinValue;" + nl +
+                "if ((now - " + v + "_click).TotalSeconds < 3) return true;" + nl +
                 "BuddyCron.Objects.HeroObject best = null; bool bestMarked = false;" + nl +
                 "foreach (var o in BuddyCron.Managers.HeroObjectManager.GetObjects<BuddyCron.Objects.HeroObject>())" + nl +
                 "{" + nl +
@@ -872,20 +1710,161 @@ namespace QuestRecorder
                 "    bool marked = o.QuestIndication.ToString() != \"None\";" + nl +
                 "    if (best == null || (marked && !bestMarked) || (marked == bestMarked && System.Numerics.Vector3.DistanceSquared(o.Location, spot) < System.Numerics.Vector3.DistanceSquared(best.Location, spot))) { best = o; bestMarked = marked; }" + nl +
                 "}" + nl +
-                "if (best != null && best.IsWithinInteractRange) { best.Interact(); " + v + "_click = System.DateTime.Now; }" + nl +
-                "return false;";
-            _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl + "\t\t\tstatic System.DateTime " + v + "_click;" + nl + "\t\t]]></CodeChunk>");
+                "if (best == null) { " + stop + " if ((now - " + v + "_start).TotalSeconds > 6) { " + v + "_done = true; return false; } return true; }" + nl +
+                "if (!best.IsWithinInteractRange) { BuddyCron.Navigation.Navigator.PlayerMover.MoveTowards(best.Location); " + v + "_mv = true; return true; }" + nl +
+                stop + nl +
+                "best.Interact(); " + v + "_click = now;" + nl +
+                "return true;";
+            _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl +
+                            "\t\t\tstatic System.DateTime " + v + "_click, " + v + "_start, " + v + "_last, " + v + "_open;" + nl +
+                            "\t\t\tstatic bool " + v + "_done, " + v + "_mv;" + nl +
+                            "\t\t]]></CodeChunk>");
             var sbh = new StringBuilder();
             sbh.Append("\t\t<CodeChunk Name=\"").Append(hook).Append("\" Type=\"Hook\"><![CDATA[").Append(nl);
             foreach (string bl in body.Split(new[] { nl }, StringSplitOptions.None))
                 sbh.Append("\t\t\t").Append(bl).Append(nl);
             sbh.Append("\t\t]]></CodeChunk>");
             _codeChunks.Add(sbh.ToString());
-            lines.Add("<MoveTo QuestId=\"1\" Name=\"" + giver + "\" XYZ=\"" + xyz + "\" />");
+            lines.Add("<MoveTo QuestId=\"1\" Name=\"" + giver + "\" XYZ=\"" + (string.IsNullOrEmpty(standXyz) ? xyz : standXyz) + "\" />");
             lines.Add("<Hook Name=\"" + hook + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
-            lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"8\" />");
+            lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"1\" />");
             lines.Add("<Hook Name=\"" + hook + "\" Operation=\"R\" Location=\"TreeStart\" />");
             return lines;
+        }
+
+        /// <summary>
+        /// A click on an object before a fight (the Field Generator that brings out the commander): walk to where you stood,
+        /// then a BuddyCron Hook walks up to that object until it can be clicked and clicks it. It holds while that click's
+        /// cast runs (so the fight step can't cut it). Once a cast or a fight came of a click it is not clicked again in that
+        /// run of the step (a fight keeps the hook in until it ends); otherwise it is clicked once more after 3 s. It lets
+        /// BuddyCron fight and revive first, and gives up a walk up that takes more than 15 s.
+        /// </summary>
+        private static List<string> WalkUpClick(string name, string xyz, string stand, int no)
+        {
+            var lines = new List<string>();
+            string[] p = xyz.Split(',');
+            string hook = "WalkUpClick" + no, v = "_c" + no;
+            string nl = "\r\n";
+            // (a walk up to the object is stopped on every way out of the walk)
+            string stop = "if (" + v + "_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); " + v + "_mv = false; }";
+            bool retryCut = RetryCutUse;
+            string body =
+                "var spot = new System.Numerics.Vector3(" + p[0].Trim() + "f, " + p[1].Trim() + "f, " + p[2].Trim() + "f);" + nl +
+                "var me = BuddyCron.Core.Player;" + nl +
+                "var now = System.DateTime.Now;" + nl +
+                // a new run of the step (the hook was out for 30 s): it may click again
+                "if ((now - " + v + "_last).TotalSeconds > 30) { " + v + "_done = false; " + v + "_click = System.DateTime.MinValue; " + v + "_cast = false; " + v + "_mv = false; " + v + "_n = 0; }" + nl +
+                v + "_last = now;" + nl +
+                "if (" + v + "_done || me.IsDead) { " + stop + " return false; }" + nl +
+                "double since = (now - " + v + "_click).TotalSeconds;" + nl +
+                "if (since < 20 && me.IsCasting && !me.IsLooting) { " + stop + " " + v + "_cast = true;" + (retryCut ? " " + v + "_left = me.CastTimeRemaining;" : string.Empty) + " return true; }" + nl +
+                "if (since < 1.5) return true;" + nl +
+                (retryCut ? "bool cut = " + v + "_cast && " + v + "_left >= 1;" + nl : string.Empty) +
+                // a cast or a fight came of the click: done for this run (the fight's end doesn't bring a second click)
+                "if (" + v + "_n > 0 && " + (retryCut ? "!cut && " : string.Empty) + "(" + v + "_cast || me.InCombat)) { " + stop + " " + v + "_done = true; return false; }" + nl +
+                "if (since < 3) { " + stop + " return false; }" + nl +
+                "if (" + v + "_n >= 2) { " + stop + " " + v + "_done = true; return false; }" + nl +
+                // in a fight before the click: BuddyCron fights first (the hook stays in until the fight ends)
+                "if (me.InCombat) { " + stop + " return false; }" + nl +
+                "BuddyCron.Objects.HeroPlaceable best = null;" + nl +
+                "foreach (var o in BuddyCron.Managers.HeroObjectManager.GetObjects<BuddyCron.Objects.HeroPlaceable>())" + nl +
+                "    if (o != null && o.IsValid && o.Name == " + CsString(name) + " && o.IsUsable && System.Numerics.Vector3.DistanceSquared(o.Location, spot) <= 4f && (best == null || System.Numerics.Vector3.DistanceSquared(o.Location, spot) < System.Numerics.Vector3.DistanceSquared(best.Location, spot))) best = o;" + nl +
+                "if (best == null) { " + stop + " return false; }" + nl +
+                "if (!best.IsWithinInteractRange)" + nl +
+                "{" + nl +
+                "    if (!" + v + "_mv) " + v + "_walk = now;" + nl +
+                "    else if ((now - " + v + "_walk).TotalSeconds > 15) { " + stop + " " + v + "_done = true; return false; }" + nl +
+                "    BuddyCron.Navigation.Navigator.PlayerMover.MoveTowards(best.Location); " + v + "_mv = true; return true;" + nl +
+                "}" + nl +
+                "BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); " + v + "_mv = false; best.Interact(); " + v + "_click = now; " + v + "_cast = false; " + v + "_n++;" + nl +
+                "return true;";
+            _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl +
+                            "\t\t\tstatic System.DateTime " + v + "_click, " + v + "_last, " + v + "_walk;" + nl +
+                            "\t\t\tstatic bool " + v + "_cast, " + v + "_mv, " + v + "_done;" + nl +
+                            "\t\t\tstatic int " + v + "_n;" + (retryCut ? " static double " + v + "_left;" : string.Empty) + nl +
+                            "\t\t]]></CodeChunk>");
+            var sbh = new StringBuilder();
+            sbh.Append("\t\t<CodeChunk Name=\"").Append(hook).Append("\" Type=\"Hook\"><![CDATA[").Append(nl);
+            foreach (string bl in body.Split(new[] { nl }, StringSplitOptions.None))
+                sbh.Append("\t\t\t").Append(bl).Append(nl);
+            sbh.Append("\t\t]]></CodeChunk>");
+            _codeChunks.Add(sbh.ToString());
+            lines.Add("<MoveTo QuestId=\"1\" Name=\"" + name + "\" XYZ=\"" + stand + "\" />");
+            lines.Add("<Hook Name=\"" + hook + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
+            lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"4\" />");
+            lines.Add("<Hook Name=\"" + hook + "\" Operation=\"R\" Location=\"TreeStart\" />");
+            return lines;
+        }
+
+        /// <summary>
+        /// The code chunks of a BuddyCron Hook that picks your reply-wheel numbers in order ("2,1"), one per wheel, while
+        /// BuddyCron's own talk runs (the calls of Quest Recorder's TalkAndReply). Wheels after the last one: BuddyCron answers
+        /// them by the profile's side. Returns the Hook's name, or null when there is nothing to pick.
+        /// It only acts while a conversation waits for a choice with the wheel shown. After each pick (the last one too) it holds
+        /// the bot at most 2 s, until the conversation moves on, so BuddyCron's talk doesn't pick that same wheel again (the
+        /// game's "invalid client conversation state"). A wheel comes again (a reply that leads back to it): the next pick.
+        /// Picks are made once per run of the step: a conversation that ended after some of them, or a second talk (BuddyCron's
+        /// pick-up trying again), is left to BuddyCron. A new run is the hook out for 30 s. With the NPC's spot it picks only
+        /// within 20 m of it (not in a scene that starts by itself on the way there).
+        /// </summary>
+        private static string ReplyHook(string replies, int no)
+        {
+            return ReplyHook(replies, no, null);
+        }
+
+        private static string ReplyHook(string replies, int no, string xyz)
+        {
+            var picks = new List<string>();
+            foreach (string p in (replies ?? string.Empty).Split(','))
+            {
+                int n;
+                if (int.TryParse(p.Trim(), out n) && n > 0)
+                    picks.Add(n.ToString(CultureInfo.InvariantCulture));
+            }
+            if (picks.Count == 0)
+                return null;
+            string hook = "Reply" + no, v = "_a" + no;
+            string nl = "\r\n";
+            string[] at = FiniteXyz(xyz) ? xyz.Split(',') : null;
+            string body =
+                "var picks = new[] { " + string.Join(", ", picks) + " };" + nl +
+                (at != null ? "var spot = new System.Numerics.Vector3(" + at[0].Trim() + "f, " + at[1].Trim() + "f, " + at[2].Trim() + "f);" + nl : string.Empty) +
+                "var now = System.DateTime.Now;" + nl +
+                // a new run of the step (the hook was out for 30 s): picks from the first wheel again
+                "if ((now - " + v + "_last).TotalSeconds > 30) { " + v + "_k = 0; " + v + "_node = -2; }" + nl +
+                v + "_last = now;" + nl +
+                "try" + nl +
+                "{" + nl +
+                "    var cnv = BuddyCron.Managers.ExtraNodeManager.ConvoOracle;" + nl +
+                // out of the conversation: one that ended after some picks leaves the rest of this run to BuddyCron
+                "    if (cnv == null || !cnv.IsInConversation) { if (" + v + "_k > 0 && (now - " + v + "_seen).TotalSeconds > 3) " + v + "_k = picks.Length; return false; }" + nl +
+                "    " + v + "_seen = now;" + nl +
+                // the conversation moved on: the next wheel is a new one (also the same wheel again)
+                "    if (!cnv.IsWaitingForChoice) { " + v + "_node = -2; return false; }" + nl +
+                "    long node = System.Convert.ToInt64(cnv.CurrentNodeNumber);" + nl +
+                // the wheel just picked (the last pick too): held up to 2 s while the pick lands
+                "    if (node == " + v + "_node) return (now - " + v + "_at).TotalSeconds < 2;" + nl +
+                "    if (" + v + "_k >= picks.Length || !cnv.ChoicesShown) return false;" + nl +
+                (at != null ? "    if (System.Numerics.Vector3.DistanceSquared(BuddyCron.Core.Player.Location, spot) > 4f) return false;" + nl : string.Empty) +
+                "    " + v + "_node = node;" + nl +
+                "    " + v + "_at = now;" + nl +
+                "    " + v + "_k++;" + nl +
+                "    cnv.SelectConversationOption(picks[" + v + "_k - 1]);" + nl +
+                "    return true;" + nl +
+                "}" + nl +
+                "catch { return false; }";
+            _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl +
+                            "\t\t\tstatic int " + v + "_k;" + nl +
+                            "\t\t\tstatic long " + v + "_node = -2;" + nl +
+                            "\t\t\tstatic System.DateTime " + v + "_seen, " + v + "_at, " + v + "_last;" + nl +
+                            "\t\t]]></CodeChunk>");
+            var sbh = new StringBuilder();
+            sbh.Append("\t\t<CodeChunk Name=\"").Append(hook).Append("\" Type=\"Hook\"><![CDATA[").Append(nl);
+            foreach (string bl in body.Split(new[] { nl }, StringSplitOptions.None))
+                sbh.Append("\t\t\t").Append(bl).Append(nl);
+            sbh.Append("\t\t]]></CodeChunk>");
+            _codeChunks.Add(sbh.ToString());
+            return hook;
         }
 
         /// <summary>The step names only Quest Recorder knows (a profile must have none of them).</summary>
@@ -910,13 +1889,14 @@ namespace QuestRecorder
             if (header)
                 list.AddRange(new[] { "What you did - Quest Recorder (LethToxic)", "OK = the bot does this by itself.  !! = it can't - the reason is on the line.", "" });
             var explained = new HashSet<RecEvent>();
+            HashSet<string> meta = MetaTasks(events);
             for (int i = 0; i < events.Count; i++)
             {
                 RecEvent e = events[i];
                 // a quest change nothing you did caused (no click, item, talk or kill just before): flag it
                 if ((e.Kind == EvKind.QuestTask || e.Kind == EvKind.QuestStep) && !e.QuestHidden && e.QuestId != 0 && !explained.Contains(e) &&
                     !(e.QuestName.Length > 0 && char.IsLower(e.QuestName[0])) && // the game's own helper quests
-                    !(e.Kind == EvKind.QuestTask && (e.Max == 0 || e.Text.StartsWith("Complete ", StringComparison.OrdinalIgnoreCase))))
+                    !(e.Kind == EvKind.QuestTask && (e.Max == 0 || IsMetaTick(e, meta))))
                 {
                     bool cause = false;
                     for (int j = i - 1; j >= 0 && e.Elapsed - events[j].Elapsed <= 5 && !cause; j--)
@@ -1006,7 +1986,133 @@ namespace QuestRecorder
 
         public static string Build(IList<RecEvent> events, string profileName, string fileName, string recordingName)
         {
-            return Build(events, profileName, fileName, recordingName, null);
+            List<string> problems;
+            return Build(events, profileName, fileName, recordingName, out problems);
+        }
+
+        /// <summary>The profile, checked: anything that keeps it from loading and running on plain BuddyCron is in problems,
+        /// and then the profile itself says it is not finished.</summary>
+        public static string Build(IList<RecEvent> events, string profileName, string fileName, string recordingName, out List<string> problems)
+        {
+            LastCoverage = null; // (never the last profile's line)
+            string text = Build(events, profileName, fileName, recordingName, null);
+            problems = PlainProblems(text);
+            if (problems.Count > 0)
+                text = MarkNotFinished(text, problems);
+            return text;
+        }
+
+        /// <summary>
+        /// What keeps a profile from running on plain BuddyCron: XML that doesn't load, a step only Quest Recorder knows,
+        /// code of a type other than Hook / Definition, a Hook with no code, code with brackets that don't match.
+        /// Empty when it's fine.
+        /// </summary>
+        public static List<string> PlainProblems(string profile)
+        {
+            var problems = new List<string>();
+            var doc = new System.Xml.XmlDocument();
+            try
+            {
+                doc.LoadXml(profile ?? string.Empty);
+            }
+            catch (System.Xml.XmlException ex)
+            {
+                problems.Add("the XML doesn't load (" + ex.Message + ")");
+                return problems;
+            }
+            var only = new HashSet<string>(RecorderOnlySteps, StringComparer.Ordinal);
+            var hooks = new HashSet<string>(StringComparer.Ordinal); // code chunks of type Hook
+            var named = new List<string>(); // hooks the steps use
+            foreach (System.Xml.XmlNode n in doc.SelectNodes("//*"))
+            {
+                var el = n as System.Xml.XmlElement;
+                if (el == null)
+                    continue;
+                string tag = el.LocalName;
+                string p = null;
+                if (only.Contains(tag) || tag == "RunCode")
+                    p = "a step only Quest Recorder knows (" + tag + ")";
+                else if (tag == "CodeChunk")
+                {
+                    string type = el.GetAttribute("Type");
+                    if (type == "Hook")
+                        hooks.Add(el.GetAttribute("Name"));
+                    else if (type != "Definition")
+                        p = "code of type \"" + type + "\" (" + el.GetAttribute("Name") + ")";
+                    if (p == null && !Balanced(el.InnerText))
+                        p = "code with brackets that don't match (" + el.GetAttribute("Name") + ")";
+                }
+                else if (tag == "Hook" && !named.Contains(el.GetAttribute("Name")))
+                    named.Add(el.GetAttribute("Name"));
+                if (p != null && !problems.Contains(p))
+                    problems.Add(p);
+            }
+            foreach (string h in named)
+                if (!hooks.Contains(h))
+                    problems.Add("a Hook with no code (" + h + ")");
+            return problems;
+        }
+
+        /// <summary>Every ( { [ in the code is closed in order (string and char literals skipped).</summary>
+        private static bool Balanced(string code)
+        {
+            var open = new Stack<char>();
+            char quote = '\0';
+            for (int i = 0; i < code.Length; i++)
+            {
+                char c = code[i];
+                if (quote != '\0')
+                {
+                    if (c == '\\')
+                        i++; // an escaped character
+                    else if (c == quote)
+                        quote = '\0';
+                    continue;
+                }
+                if (c == '/' && i + 1 < code.Length && code[i + 1] == '/')
+                {
+                    // a comment to the end of the line ("can't" in it is no char literal)
+                    while (i < code.Length && code[i] != '\n')
+                        i++;
+                    continue;
+                }
+                if (c == '/' && i + 1 < code.Length && code[i + 1] == '*')
+                {
+                    int end = code.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                    i = end < 0 ? code.Length : end + 1;
+                    continue;
+                }
+                if (c == '"' || c == '\'')
+                    quote = c;
+                else if (c == '(' || c == '{' || c == '[')
+                    open.Push(c);
+                else if (c == ')' || c == '}' || c == ']')
+                {
+                    char want = c == ')' ? '(' : (c == '}' ? '{' : '[');
+                    if (open.Count == 0 || open.Pop() != want)
+                        return false;
+                }
+            }
+            return open.Count == 0 && quote == '\0';
+        }
+
+        /// <summary>Marks a profile as not finished: its name, and a pop-up at the start that says what is wrong.</summary>
+        public static string MarkNotFinished(string text, List<string> problems)
+        {
+            if (text == null || text.Contains("<!-- Not finished -->"))
+                return text;
+            int n = text.IndexOf("</Name>", StringComparison.Ordinal);
+            if (n >= 0)
+                text = text.Substring(0, n) + " (not finished)" + text.Substring(n);
+            const string questing = "\t<Questing>\r\n";
+            int at = text.IndexOf(questing, StringComparison.Ordinal);
+            if (at >= 0)
+            {
+                at += questing.Length;
+                text = text.Substring(0, at) + "\t\t<!-- Not finished -->\r\n\t\t<UserDialog Title=\"Quest Recorder\" Message=\"" +
+                       A("Not finished: " + string.Join(", ", problems.ToArray())) + "\" />\r\n" + text.Substring(at);
+            }
+            return text;
         }
 
         /// <summary>Task tracker: one line per quest task / step the recording caught, with what the profile will do for it.</summary>
@@ -1027,16 +2133,42 @@ namespace QuestRecorder
             return j > i ? line.Substring(i, j - i) : string.Empty;
         }
 
+        /// <summary>
+        /// The step's label in a task tracker line: the profile's own comment for that step (the new core's steps start with
+        /// their number, as in the profile; other lines start with "- "). Null = not a step line.
+        /// </summary>
+        public static string TraceLabel(string line)
+        {
+            int arrow = (line ?? string.Empty).IndexOf("  ->  ", StringComparison.Ordinal);
+            if (arrow <= 0)
+                return null;
+            string label = line.Substring(0, arrow).Trim();
+            if (label.StartsWith("- ", StringComparison.Ordinal))
+                label = label.Substring(2).Trim();
+            return label.Length > 0 ? label : null;
+        }
+
+        /// <summary>A task tracker line the recorder isn't sure about ("??") or caught nothing for ("!!"): yellow in the review list.</summary>
+        public static bool TraceUnsure(string line)
+        {
+            int arrow = (line ?? string.Empty).IndexOf("  ->  ", StringComparison.Ordinal);
+            return arrow > 0 && (line.IndexOf("  ->  ?? ", StringComparison.Ordinal) == arrow || line.IndexOf("  ->  !! ", StringComparison.Ordinal) == arrow);
+        }
+
         private static void FillTrace(List<Step> steps, List<string> trace)
         {
-            int n = 0;
             foreach (Step s in steps)
             {
                 string what;
                 switch (s.Kind)
                 {
                     case "Pickup":
-                        what = "pick up";
+                        what = s.What.Length > 0 ? s.What : "pick up";
+                        break;
+                    case "Qr":
+                        if (s.What.Length == 0)
+                            continue;
+                        what = s.What;
                         break;
                     case "Complete":
                         what = "hand in";
@@ -1090,26 +2222,40 @@ namespace QuestRecorder
                     default:
                         continue; // walks between steps, skipped steps
                 }
-                n++;
-                trace.Add(n.ToString(CultureInfo.InvariantCulture) + ". " + s.Comment + "  ->  " + what);
+                // the label is the profile's comment (the control panel finds the step by it); notes go after the arrow
+                if (s.Note.Length > 0)
+                    what += "  (" + s.Note.Trim() + ")";
+                if (s.Unsure && !what.StartsWith("!!", StringComparison.Ordinal))
+                    what = "?? " + what;
+                bool numbered = s.Raw && Regex.IsMatch(s.Comment, @"^[0-9]+\. ");
+                trace.Add((numbered ? string.Empty : "- ") + s.Comment + "  ->  " + what);
             }
         }
 
         private static string Build(IList<RecEvent> events, string profileName, string fileName, string recordingName, List<string> trace)
         {
+            // (the new core reads the recording as it was loaded, every row: the filters below are this builder's own)
+            var loaded = new List<RecEvent>(events);
             // The shuttle can land you before its cast is noted ("jump while casting Heroic Transport"): put the cast
             // first, so the hop is seen as the mission item that moved you.
+            // (in any client language: the jump came while casting it - not a travel ability, not a cast on an object
+            // such as a door - and the cast, or the mission item named after it, is noted right after)
             var ordered = new List<RecEvent>(events);
             for (int i = 0; i + 1 < ordered.Count; i++)
             {
                 RecEvent j = ordered[i];
                 if (j.Kind != EvKind.Jump)
                     continue;
+                string casting = (j.Note ?? string.Empty).StartsWith("while casting ", StringComparison.Ordinal) ? j.Note.Substring("while casting ".Length) : string.Empty;
+                if (IsTravelAbility(casting))
+                    casting = string.Empty;
                 for (int k = i + 1; k < ordered.Count && ordered[k].Elapsed - j.Elapsed <= 3; k++)
                 {
                     RecEvent c = ordered[k];
+                    bool cast = casting.Length > 0 && c.Option == casting && c.Kind == EvKind.Cast && (c.Target == null || c.Target.Kind != ObjKind.Placeable);
+                    bool itemOf = casting.Length > 0 && c.Kind == EvKind.QuestItem && c.Note.Length == 0 && c.Option.StartsWith(casting, StringComparison.Ordinal);
                     if ((c.Kind == EvKind.Cast && c.Option.StartsWith("Heroic Transport", StringComparison.Ordinal)) ||
-                        (c.Kind == EvKind.QuestItem && c.Option.StartsWith("Heroic Transport", StringComparison.Ordinal)))
+                        (c.Kind == EvKind.QuestItem && c.Option.StartsWith("Heroic Transport", StringComparison.Ordinal)) || cast || itemOf)
                     {
                         ordered.RemoveAt(k);
                         ordered.Insert(i, c);
@@ -1125,12 +2271,15 @@ namespace QuestRecorder
             foreach (RecEvent ev in events)
                 if (ev.Kind == EvKind.QuestItem && ev.Note == "item gone" && ev.Option.Length > 0)
                     goneItems.Add(ev);
-            events = ExactActions(events);
+            // the counts that only move because another mission ended (a weekly's "complete N dailies"), in any client language
+            HashSet<string> metaTasks = MetaTasks(events);
+            events = ExactActions(events, metaTasks);
             // Quest abilities (special / temporary bar) and items you put on: kept only when a mission moved soon after
             // (6 s for an ability, 20 s for an item you put on), so a new class ability or a gear swap never becomes a step.
             // Each ability remembers the mission item you used before it (Macrobinoculars opens the scan).
             var abilityNames = new HashSet<string>(StringComparer.Ordinal);
             var abilityOpen = new Dictionary<string, string>(StringComparer.Ordinal);
+            var abilityHeading = new Dictionary<string, float>(StringComparer.Ordinal); // where you used an ability (or its name) -> the way you faced
             {
                 var keep = new List<RecEvent>(events.Count);
                 string lastItem = null;
@@ -1140,7 +2289,8 @@ namespace QuestRecorder
                     RecEvent x = events[i];
                     bool ability = x.Kind == EvKind.QuestItem && x.Note == "ability";
                     bool equip = x.Kind == EvKind.QuestItem && x.Note == "equipped";
-                    if (x.Kind == EvKind.QuestItem && !ability && !equip && x.Note != "item gone" && x.Option.Length > 0)
+                    // (a mission item only: a medpac or stim from your bags never opens a bar)
+                    if (x.Kind == EvKind.QuestItem && !ability && !equip && x.Note != "item gone" && x.Note != "bag item" && x.Option.Length > 0)
                     {
                         lastItem = x.Option;
                         lastItemAt = x.Elapsed;
@@ -1162,11 +2312,43 @@ namespace QuestRecorder
                             abilityNames.Add(x.Option);
                             if (!abilityOpen.ContainsKey(x.Option) && lastItem != null && x.Elapsed - lastItemAt <= 120)
                                 abilityOpen[x.Option] = lastItem;
+                            if (!x.Pos.IsZero)
+                                abilityHeading[X(x.Pos)] = x.Heading;
+                            if (!abilityHeading.ContainsKey(x.Option))
+                                abilityHeading[x.Option] = x.Heading;
                         }
                     }
                     keep.Add(x);
                 }
                 events = keep;
+            }
+            // PvP missions (warzones, starfighter) are left out: the bot can't play them
+            {
+                var pvp = new HashSet<ulong>();
+                string clickName = string.Empty;
+                double clickAt = -1e9;
+                foreach (RecEvent ev in events)
+                {
+                    if ((ev.Kind == EvKind.ObjectClick || ev.Kind == EvKind.NpcClick) && ev.Target != null)
+                    {
+                        clickName = ev.Target.Name;
+                        clickAt = ev.Elapsed;
+                    }
+                    if (ev.QuestId == 0 || pvp.Contains(ev.QuestId))
+                        continue;
+                    string text = (ev.QuestName ?? string.Empty) + "|" +
+                                  (ev.Kind == EvKind.QuestAdded ? (ev.Target != null ? ev.Target.Name : string.Empty) + "|" + ev.Option + "|" + (ev.Elapsed - clickAt <= 10 ? clickName : string.Empty) : string.Empty);
+                    if (Regex.IsMatch(text, @"\b(PvP|Warzones?|Starfighter)\b", RegexOptions.IgnoreCase))
+                        pvp.Add(ev.QuestId);
+                }
+                if (pvp.Count > 0)
+                {
+                    var kept = new List<RecEvent>(events.Count);
+                    foreach (RecEvent ev in events)
+                        if (ev.QuestId == 0 || !pvp.Contains(ev.QuestId))
+                            kept.Add(ev);
+                    events = kept;
+                }
             }
             _sameName = new Dictionary<string, List<Vec3>>(StringComparer.Ordinal);
             foreach (RecEvent e in events)
@@ -1217,10 +2399,33 @@ namespace QuestRecorder
             foreach (RecEvent e in events)
                 if (e.QuestHidden && e.QuestId != 0)
                     hiddenQuests.Add(e.QuestId);
+            // the quest steps whose counts all move only when another mission ends (a weekly's "complete N dailies" step)
+            var metaSteps = new HashSet<string>(StringComparer.Ordinal);
+            {
+                var plainSteps = new HashSet<string>(StringComparer.Ordinal);
+                foreach (RecEvent e in events)
+                {
+                    if (e.Kind != EvKind.QuestTask || e.Max == 0 || e.QuestId == 0 || e.QuestHidden)
+                        continue;
+                    string qs = Fmt.Hex(e.QuestId) + "|" + e.Step.ToString(CultureInfo.InvariantCulture);
+                    if (metaTasks.Contains(TaskKey(e)))
+                        metaSteps.Add(qs);
+                    else
+                        plainSteps.Add(qs);
+                }
+                metaSteps.ExceptWith(plainSteps);
+            }
+            // (a title the game hadn't read yet, "#...", gives way to the real one read later)
             var questTitles = new Dictionary<ulong, string>();
             foreach (RecEvent e in events)
-                if (e.QuestId != 0 && !string.IsNullOrEmpty(e.QuestName) && !questTitles.ContainsKey(e.QuestId))
+            {
+                if (e.QuestId == 0 || string.IsNullOrEmpty(e.QuestName))
+                    continue;
+                string had;
+                if (!questTitles.TryGetValue(e.QuestId, out had) ||
+                    (had.StartsWith("#", StringComparison.Ordinal) && !e.QuestName.StartsWith("#", StringComparison.Ordinal)))
                     questTitles[e.QuestId] = e.QuestName;
+            }
             var killedNames = new HashSet<string>(StringComparer.Ordinal);
             foreach (RecEvent e in events)
                 if (e.Kind == EvKind.Kill && e.Target != null && e.Target.Name.Length > 0)
@@ -1229,6 +2434,8 @@ namespace QuestRecorder
             var steps = new List<Step>();
             var markers = new List<KeyValuePair<string, Vec3>>();
             var uses = new List<Use>();
+            var fightUses = new List<Use>(); // objects you used or attacked in a fight (one may bring out the mob that ends it)
+            string fightMobs = string.Empty; // the mobs that started the last fight, as the recorder listed them
             var consumed = new Dictionary<string, double>(StringComparer.Ordinal);
             var seen = new Dictionary<string, Vec3>(StringComparer.Ordinal);
             var kills = new List<Kill>();
@@ -1245,15 +2452,33 @@ namespace QuestRecorder
             Vec3 lastBagItemPos = default(Vec3);
             double lastLootAt = -1e9;
             double talkAt = -1e9;
+            bool talkClicked = false; // you clicked who you talked to (not a scene that started by itself)
+            bool talkGave = false; // that talk gave you a mission (its end isn't a later step's talk)
+            double sceneAfterKillAt = -1e9; // a scene that started by itself right after a kill (nothing clicked)
+            ulong holoQuest = 0; // the mission whose holocom call was answered last, and when
+            double holoQuestAt = -1e9;
+            double lastPickAt = -1e9; // your last reply pick
+            var branchedAt = new List<KeyValuePair<ulong, double>>(); // a quest that took another branch right after your replies
+            var rewardAt = new Dictionary<ulong, double>(); // a reward window came up for it (since it was last picked up)
+            var pickupOf = new Dictionary<ulong, Step>(); // each quest's last pick-up step
+            var abandoned = new HashSet<ulong>(); // quests you dropped from your log
             double boardAt = -1e9; // when you last opened a mission board
             ObjRef lastClicked = null; // the last object or NPC you clicked (not lifts or taxis)
             double lastClickedAt = -1e9;
+            Vec3 lastClickedStand = default(Vec3); // where you stood when you clicked it
+            double otherCastAt = -1e9; // your last cast that wasn't on the object you last clicked (a travel cast, a mount ...)
+            Use giverUse = null; // the object you clicked for a pick-up (it may also bring out the fight that follows)
             ObjRef questWindow = null; // the NPC whose quest window you last opened
             double questWindowAt = -1e9;
             double holoAt = -1e9;
             string item = null;
             double itemAt = -1e9;
             double rideAt = -1e9;
+            // you were dead (since diedAt), or revived at revivedAt: a loading screen or move then is the medical center, not a door or item
+            // (also for recordings older than the "you were revived" note on the loading screen)
+            bool dead = false;
+            double diedAt = -1e9, revivedAt = -1e9;
+            double areaAt = -1e9; // you last came into another area
             double fightAt = -1e9;
             double castEndAt = -1e9;
             Step pendingRide = null;
@@ -1275,6 +2500,10 @@ namespace QuestRecorder
             string npcClickName = null;
             Vec3 npcClickPos = default(Vec3);
             double npcClickAt = -1e9;
+            bool npcClickLoot = false; // the last "NPC click" was a loot (a body), not a talk
+            List<Use> sameTake = null; // the clicks the last tick took, and when (one click can count for two quests)
+            double sameTakeAt = -1e9;
+            ulong sameTakeQuest = 0;
             Step lastWalk = null;
             var finalAt = new Dictionary<ulong, double>();
             double lastWalkAt = -1e9;
@@ -1314,27 +2543,57 @@ namespace QuestRecorder
             double bareCastAt = -1e9;
             Vec3 bareCastPos = default(Vec3);
 
+            // a mob another player tagged first can still move your count (shared tagging): its kill counts when a count the
+            // game lists that mob type for ticked within a second after it
+            var sharedKills = new HashSet<RecEvent>();
+            for (int i = 0; i < events.Count; i++)
+            {
+                RecEvent ke = events[i];
+                if (ke.Kind != EvKind.Kill || ke.Target == null || ke.Target.Spec == 0 || !(ke.Note ?? string.Empty).StartsWith(TaggedNote, StringComparison.Ordinal))
+                    continue;
+                for (int j = i + 1; j < events.Count && events[j].Elapsed - ke.Elapsed <= 1.0; j++)
+                    if (events[j].Kind == EvKind.QuestTask && events[j].TaskTargets != null && events[j].TaskTargets.Contains(ke.Target.Spec))
+                    {
+                        sharedKills.Add(ke);
+                        break;
+                    }
+            }
+
             bool haveTrail = false;
             Vec3 lastTrail = default(Vec3);
             var convos = new List<Convo>(); // every conversation and the replies you picked
             Convo convo = null;
             double prevT = 0;
+            ulong tickQuest = 0; // the quest the last event moved, and the branch that tick was on
+            string tickBranch = null;
             foreach (RecEvent e in events)
             {
                 double t = e.Elapsed;
                 foreach (Step made in steps)
                     if (made.At < -1e8)
+                    {
                         made.At = prevT; // when each step was made (to find the conversation it came from)
+                        if (made.Branch == null && tickQuest != 0 && made.Quest == tickQuest)
+                            made.Branch = tickBranch;
+                    }
+                tickQuest = 0;
                 prevT = t;
                 if ((e.Kind == EvKind.ObjectClick || e.Kind == EvKind.NpcClick) && e.Target != null && e.Target.Name.Length > 0 && !transport.Contains(e.Target.Name))
                 {
                     lastClicked = e.Target;
                     lastClickedAt = t;
+                    lastClickedStand = e.Pos;
                 }
+                // (when that cast started: one you began before the click and the click cut short is no later cast)
+                // (a travel cast always counts, even when the game tied it to the object you had just clicked)
+                if (e.Kind == EvKind.Cast && (IsTravelAbility(e.Option ?? string.Empty) || !(e.Target != null && lastClicked != null && e.Target.Name == lastClicked.Name)))
+                    otherCastAt = Math.Max(otherCastAt, t - Math.Max(0, e.DurationMs) / 1000.0);
                 switch (e.Kind)
                 {
                     case EvKind.ConvoStart:
-                        convo = e.Note == How.HolocomCall || e.Target == null ? null : new Convo { Partner = e.Target.Name, Start = t, End = t + 600 };
+                        // (a holocom call has nobody next to you: kept under a name no one has, for its replies and its end)
+                        convo = e.Note == How.HolocomCall ? new Convo { Partner = HoloPartner, Start = t, End = t + 600 }
+                              : e.Target == null ? null : new Convo { Partner = e.Target.Name, Start = t, End = t + 600 };
                         if (convo != null)
                             convos.Add(convo);
                         break;
@@ -1359,7 +2618,8 @@ namespace QuestRecorder
                     // stand at the lift (CZ-198 22:11: the bot froze at that lift until LethToxic took it down by hand).
                     pendingRide.Kind = "Ride"; // its own gate: only while you're still on the lift's side
                     pendingRide.Gate = SideOf(rideFrom, e.Pos);
-                    pendingRide.Comment = "Walk past the " + pendingLift.Name + " (you didn't ride it)";
+                    pendingRide.Comment = "Walk past the " + pendingLift.Name;
+                    AddNote(pendingRide, "you didn't ride it");
                     pendingRide.Lines[0] = "<MoveTo QuestId=\"1\" Name=\"Past the " + A(pendingLift.Name) + "\" XYZ=\"" + X(e.Pos) + "\" />";
                     pendingRide = null;
                 }
@@ -1426,7 +2686,10 @@ namespace QuestRecorder
                             double itemUseAt = item != null ? itemAt : -1e9;
                             double npcAt = npcClickName != null ? npcClickAt : -1e9;
                             if (useAt >= itemUseAt && useAt >= npcAt && uses.Count > 0)
+                            {
+                                fightUses.Remove(uses[uses.Count - 1]);
                                 uses.RemoveAt(uses.Count - 1);
+                            }
                             else if (itemUseAt >= npcAt && item != null)
                             {
                                 item = null;
@@ -1441,10 +2704,10 @@ namespace QuestRecorder
                         {
                             // your pause / wait hotkey: its own step right here, run when the next step is still to do
                             FlushRoute(steps, markers);
-                            var spot = new Step { Kind = "Route", Comment = e.Note.StartsWith(PauseNote, StringComparison.Ordinal) ? "Your pause here" : "Your wait here" };
+                            var spot = new Step { Kind = "Route", Comment = e.Note.StartsWith(PauseNote, StringComparison.Ordinal) ? "Pause here" : "Wait here" };
                             spot.Lines.Add("<MoveTo QuestId=\"1\" Name=\"" + A(spot.Comment) + "\" XYZ=\"" + X(e.Pos) + "\" />");
                             spot.Lines.Add(e.Note.StartsWith(PauseNote, StringComparison.Ordinal)
-                                ? "<UserDialog Title=\"Quest Recorder\" Message=\"You paused here when you recorded: do this part by hand, then press Continue.\" IsBotContinueAllowed=\"True\" />"
+                                ? "<UserDialog Title=\"Quest Recorder\" Message=\"Do this part by hand, then press Continue.\" IsBotContinueAllowed=\"True\" />"
                                 : "<WaitTimer QuestId=\"1\" WaitTime=\"10\" />");
                             steps.Add(spot);
                             break;
@@ -1475,7 +2738,7 @@ namespace QuestRecorder
                             if (!knownItems.Contains(usedItem))
                                 knownItems.Add(usedItem);
                             if (itemOrder.Count == 0 || itemOrder[itemOrder.Count - 1].Name != usedItem || t - itemOrder[itemOrder.Count - 1].At > 5)
-                                itemOrder.Add(new Use { Name = usedItem, Pos = e.Pos, At = t });
+                                itemOrder.Add(new Use { Name = usedItem, Pos = e.Pos, At = t, InFight = inCombat });
                             item = usedItem;
                             itemAt = t;
                             itemPos = e.Pos;
@@ -1521,9 +2784,18 @@ namespace QuestRecorder
                                 uses[uses.Count - 1].Id = o.NodeId;
                             if (e.Kind == EvKind.Cast)
                                 uses[uses.Count - 1].Cast = true;
+                            if (o.UsableForQuest || o.TakesTurnIn)
+                                uses[uses.Count - 1].ForQuest = true;
+                            if (inCombat && !fightUses.Contains(uses[uses.Count - 1]))
+                                fightUses.Add(uses[uses.Count - 1]);
                             break;
                         }
-                        uses.Add(new Use { Name = o.Name, Pos = p, At = t, Cast = e.Kind == EvKind.Cast, Stand = e.Pos, Id = o.NodeId });
+                        uses.Add(new Use { Name = o.Name, Pos = p, At = t, Cast = e.Kind == EvKind.Cast, Stand = e.Pos, Id = o.NodeId, ForQuest = o.UsableForQuest || o.TakesTurnIn });
+                        if (inCombat)
+                        {
+                            fightUses.RemoveAll(fu => t - fu.At > 300);
+                            fightUses.Add(uses[uses.Count - 1]);
+                        }
                         break;
                     }
                     case EvKind.Loot:
@@ -1537,17 +2809,35 @@ namespace QuestRecorder
                                 npcClickName = e.Target.Name;
                                 npcClickPos = e.Target.HasPos ? e.Target.Pos : e.Pos;
                                 npcClickAt = t;
+                                npcClickLoot = true;
                             }
                         }
                         break;
                     case EvKind.ConvoStart:
                         if (e.Note == How.HolocomCall)
                             holoAt = t;
-                        else if (e.Target != null && e.Target.Name.Length > 0)
+                        else
                         {
-                            talk = e.Target;
-                            talkAt = t;
+                            if (e.Target != null && e.Target.Name.Length > 0 && !IsCompanion(e.Target))
+                            {
+                                talk = e.Target;
+                                talkAt = t;
+                                // you clicked who you talk to (and maybe walked up to them first)
+                                talkClicked = lastClicked != null && t - lastClickedAt <= 20 && lastClicked.Name == e.Target.Name;
+                                talkGave = false;
+                            }
+                            // a scene that started by itself (nothing clicked) right after a kill: a boss that talks once beaten
+                            if (allKills.Count > 0 && t - allKills[allKills.Count - 1].At <= 3 && !(lastClicked != null && t - lastClickedAt <= 6))
+                                sceneAfterKillAt = t;
                         }
+                        break;
+                    case EvKind.HolocomAnswered:
+                        holoQuest = e.QuestId;
+                        holoQuestAt = t;
+                        break;
+                    case EvKind.RewardWindow:
+                        if (e.QuestId != 0)
+                            rewardAt[e.QuestId] = t;
                         break;
                     case EvKind.BoardOpen:
                         boardAt = t;
@@ -1595,7 +2885,8 @@ namespace QuestRecorder
                             // NPC a moment later is a second use (two prisoners freed with one Shackle Remote)
                             Use lastUse = itemOrder.Count > 0 ? itemOrder[itemOrder.Count - 1] : null;
                             if (lastUse == null || lastUse.Name != e.Option || t - lastUse.At > 5 || (on != null && lastUse.On != null && on != lastUse.On))
-                                itemOrder.Add(new Use { Name = e.Option, Pos = e.Pos, At = t, On = on, OnDist = onDist, OnDead = onDead, OnHealth = onHealth }); // (its cast may have been noted already)
+                                itemOrder.Add(new Use { Name = e.Option, Pos = e.Pos, At = t, On = on, OnDist = onDist, OnDead = onDead, OnHealth = onHealth,
+                                                         InFight = inCombat, Bag = e.Note == "bag item" }); // (its cast may have been noted already)
                             else if (lastUse.On == null)
                             {
                                 lastUse.On = on;
@@ -1618,9 +2909,18 @@ namespace QuestRecorder
                             itemOnHealth = onHealth;
                         }
                         break;
+                    case EvKind.Died:
+                        dead = true;
+                        diedAt = t;
+                        break;
+                    case EvKind.Revived:
+                        dead = false;
+                        revivedAt = t;
+                        break;
                     case EvKind.Loading:
-                        // handled with the jump / area change it causes (below)
-                        if (e.HasFrom && item != null && t - itemAt <= 30)
+                        // handled with the jump / area change it causes (below) - not a revive at a medical center
+                        if (e.HasFrom && item != null && t - itemAt <= 30 &&
+                            !((dead && t - diedAt <= 600) || t - revivedAt <= 10 || e.Note.StartsWith(How.Revived, StringComparison.Ordinal)))
                             goto case EvKind.Jump;
                         break;
                     case EvKind.NpcClick:
@@ -1629,6 +2929,7 @@ namespace QuestRecorder
                             npcClickName = e.Target.Name;
                             npcClickPos = e.Target.HasPos ? e.Target.Pos : e.Pos;
                             npcClickAt = t;
+                            npcClickLoot = false;
                         }
                         break;
                     case EvKind.Target:
@@ -1645,6 +2946,7 @@ namespace QuestRecorder
                             dark++;
                         else if (!e.OptionGuessed && e.Option.EndsWith(" light", StringComparison.Ordinal))
                             light++;
+                        lastPickAt = t;
                         break;
                     case EvKind.ElevatorOpen:
                     case EvKind.ElevatorRide:
@@ -1669,7 +2971,7 @@ namespace QuestRecorder
                             // walk points so far come first
                             if (markers.Count > 0)
                             {
-                                var before = new Step { Kind = "Route", Comment = "Your route" };
+                                var before = new Step { Kind = "Route", Comment = "Walk" };
                                 AddRoute(before, markers);
 
                                 steps.Add(before);
@@ -1689,11 +2991,28 @@ namespace QuestRecorder
                     }
                     case EvKind.TaxiStart:
                     case EvKind.TaxiEnd:
+                        rideAt = t;
+                        break;
                     case EvKind.ShipTravel:
                         rideAt = t;
+                        // your ship flew you to another planet: BuddyCron's SpaceTravel, only while on board that ship
+                        if (e.Option.Length > 0 && e.AreaId != 0)
+                        {
+                            FlushRoute(steps, markers);
+                            var fly = new Step { Kind = "Ride", Comment = "Fly to " + e.Option, Gate = "(Core.Player.AreaId == " + Fmt.Hex(e.AreaId) + ")",
+                                                 Unsure = true, Note = "the galaxy map's name for it: check that BuddyCron's SpaceTravel knows " + e.Option +
+                                                                       "; it only runs on board the ship you recorded on (another class's ship is another area)" };
+                            fly.Lines.Add("<SpaceTravel Planet=\"" + A(e.Option) + "\" />");
+                            // the flight's loading screen (hand-made profiles wait 15-90 s after a SpaceTravel)
+                            fly.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"30\" />");
+                            steps.Add(fly);
+                        }
                         break;
                     case EvKind.AreaChange:
                     case EvKind.Jump:
+                    {
+                        // a revive at a medical center moved you (dead until now, or just revived): no item hop, door or walk points
+                        bool reviveMove = (dead && t - diedAt <= 600) || t - revivedAt <= 10 || e.Note.StartsWith(How.Revived, StringComparison.Ordinal);
                         // A mission item that moved you.
                         if ((item == null || t - itemAt > 30) && castItem != null && t - castItemAt <= 3 && e.Kind == EvKind.Jump)
                         {
@@ -1702,6 +3021,8 @@ namespace QuestRecorder
                             itemPos = castItemPos;
                         }
                         castItem = null;
+                        if (reviveMove)
+                            item = null; // what you used before you died didn't move you
                         // (a heroic shuttle from the Fleet goes through a loading screen to the planet: that's a hop too)
                         bool otherArea = e.Kind == EvKind.AreaChange && !e.Pos.IsZero;
                         if (item != null && t - itemAt <= 30 && (otherArea || (e.HasFrom && e.FromPos.DistanceTo(e.Pos) >= 30f)) && t - rideAt > 5)
@@ -1743,9 +3064,44 @@ namespace QuestRecorder
                             lastTrail = e.Pos;
                             break;
                         }
+                        // A door into another area you clicked (your ship's ramp, its exit, an airlock - not a lift or taxi):
+                        // click it where you did, then wait while still in the area you came from (the loading screen).
+                        // (not an object a step already used, and you hadn't walked off since the click: walking through a
+                        // phase barrier after clicking something else keeps the walk points below)
+                        // (a click after the last ride: the ride's own arrival is no door - your ship's exit after it flew you is)
+                        // (not an object that gives or takes missions, and nothing else cast after the click: a quick travel
+                        // or other travel cast right after using a terminal or dropbox moved you, not the object)
+                        if (e.Kind == EvKind.AreaChange && (t - rideAt > 20 || lastClickedAt > rideAt) && e.HasFrom && e.FromArea != 0 && e.AreaId != 0 &&
+                            e.FromArea != e.AreaId && !e.Pos.IsZero && !reviveMove &&
+                            lastClicked != null && lastClicked.Kind == ObjKind.Placeable && lastClicked.Name.Length > 0 &&
+                            !lastClicked.Name.StartsWith("#", StringComparison.Ordinal) && t - lastClickedAt <= 15 && lastClickedAt > areaAt &&
+                            !lastClicked.OffersQuest && !lastClicked.TakesTurnIn && otherCastAt <= lastClickedAt &&
+                            !UsedUp(lastClicked, consumed, t) && !e.FromPos.IsZero &&
+                            ((!lastClickedStand.IsZero && e.FromPos.DistanceTo(lastClickedStand) <= 1.5f) || (lastClicked.HasPos && e.FromPos.DistanceTo(lastClicked.Pos) <= 1.5f)))
+                        {
+                            FlushRoute(steps, markers);
+                            string dn = lastClicked.Name;
+                            Vec3 dp = lastClicked.HasPos ? lastClicked.Pos : lastClickedStand;
+                            string inArea = "(Core.Player.AreaId == " + Fmt.Hex(e.FromArea) + ")";
+                            var door = new Step { Kind = "Ride", Comment = "Through " + dn, Gate = inArea };
+                            float sd = lastClickedStand.IsZero ? 0f : lastClickedStand.DistanceTo(dp);
+                            if (sd >= 0.3f && sd < 10f)
+                                door.Lines.Add("<MoveTo QuestId=\"1\" Name=\"Stand for " + A(dn) + "\" XYZ=\"" + X(lastClickedStand) + "\" />");
+                            door.Lines.Add("<Interact Name=\"" + A(dn) + "\" IgnoreLOS=\"True\" WaitTime=\"3\" XYZ=\"" + X(dp) + "\" />");
+                            door.Lines.AddRange(WaitWhile(inArea, 60));
+                            steps.Add(door);
+                            // that click was the way in: no step's use, giver or hand-in
+                            uses.RemoveAll(u => u.Name == dn && u.At >= lastClickedAt - 1);
+                            fightUses.RemoveAll(u => u.Name == dn && u.At >= lastClickedAt - 1);
+                            lastClicked = null;
+                            areaAt = t;
+                            break;
+                        }
+                        if (e.Kind == EvKind.AreaChange)
+                            areaAt = t;
                         // a phase door / doorway you went through.
                         // (not a quick travel or fleet pass you cast: BuddyCron plans its own way, no walk points for it)
-                        if (t - rideAt > 20 && e.HasFrom && !e.Note.StartsWith(How.Revived, StringComparison.Ordinal) &&
+                        if (t - rideAt > 20 && e.HasFrom && !reviveMove &&
                             e.Note.IndexOf("Quick Travel", StringComparison.OrdinalIgnoreCase) < 0 &&
                             e.Note.IndexOf("Fleet Pass", StringComparison.OrdinalIgnoreCase) < 0 &&
                             e.Note.IndexOf("Stronghold", StringComparison.OrdinalIgnoreCase) < 0)
@@ -1754,15 +3110,17 @@ namespace QuestRecorder
                             markers.Add(new KeyValuePair<string, Vec3>("Came out here", e.Pos));
                         }
                         break;
+                    }
                     case EvKind.CombatStart:
                         fightAt = t;
+                        fightMobs = e.Note ?? string.Empty;
                         inCombat = true;
                         break;
                     case EvKind.CombatEnd:
                         inCombat = false;
                         break;
                     case EvKind.Kill:
-                        if (e.Note.Length == 0 && e.Target != null)
+                        if ((e.Note.Length == 0 || sharedKills.Contains(e)) && e.Target != null)
                         {
                             var k = new Kill { Name = e.Target.Name, Pos = e.Target.HasPos ? e.Target.Pos : e.Pos, At = t, Leg = leg, Spec = e.Target.Spec };
                             kills.Add(k);
@@ -1779,51 +3137,192 @@ namespace QuestRecorder
                         break;
                     case EvKind.QuestAdded:
                     {
-                        uses.Clear(); // the click on the giver / board was the pick-up
-                        if (e.QuestHidden || e.QuestId == 0)
+                        // (the game's own helper and bookkeeping quests: no pick-up. Clicks on objects the game said were for one
+                        // of your missions stay for the step they move, however long that step takes)
+                        if (e.QuestHidden || e.QuestId == 0 || IsSystemQuest(e))
+                        {
+                            uses.RemoveAll(u => t - u.At > 10 && !u.ForQuest);
                             break;
+                        }
                         string q = Fmt.Hex(e.QuestId);
                         picked.Add(e.QuestId);
+                        rewardAt.Remove(e.QuestId); // a new go at it
                         // a weekly comes back (3 times a week): only "not in my log", like the Oricon weekly. Dailies and heroics: not in my log and not done.
-                        bool repeat = Regex.IsMatch(e.QuestName ?? string.Empty, @"^\[(WEEKLY|DAILY|HEROIC|AREA)\b", RegexOptions.IgnoreCase);
-                        bool isWeekly = repeat && (e.QuestName ?? string.Empty).StartsWith("[WEEKLY", StringComparison.OrdinalIgnoreCase);
-                        var s = new Step { Kind = "Pickup", Gate = isWeekly ? "(not HasQuest(" + q + "))" : "(not HasQuest(" + q + ")) and (not IsQuestComplete(" + q + "))", Comment = "Pick up " + e.QuestName };
+                        // (its tag in any client language)
+                        string qName;
+                        if (!questTitles.TryGetValue(e.QuestId, out qName))
+                            qName = e.QuestName ?? string.Empty;
+                        bool repeat = IsRepeatable(e) || Regex.IsMatch(qName, RepeatTag, RegexOptions.IgnoreCase);
+                        bool isWeekly = repeat && IsWeekly(qName);
+                        // a dynamic encounter starts again whenever it is up: also only "not in my log", and nobody gives it
+                        bool encounter = IsEncounter(e);
+                        var s = new Step { Kind = "Pickup", Gate = isWeekly || encounter ? "(not HasQuest(" + q + "))" : "(not HasQuest(" + q + ")) and (not IsQuestComplete(" + q + "))", Comment = "Pick up " + qName, Weekly = isWeekly };
+                        // granted when another mission finished, with no mission board or quest window open: nobody gives it,
+                        // and it can't come before that mission is gone from your log - so its pick-up waits for that and
+                        // never stalls in front of the step that brings it
+                        List<ulong> grantedBy = t - boardAt > 10 && t - questWindowAt > 10 ? GrantedBy(events, e.QuestId, t) : new List<ulong>();
                         if (isWeekly)
                             weeklies.Add(e.QuestId);
                         // put down to the mission board, but you were talking to someone after opening it: they gave it
                         // (End of Torvix comes from General Konya, not the Black Hole Mission Terminal)
-                        // the giver is whatever you clicked right before it landed in your log
-                        // the game handed it out by itself (an [AREA] mission when you walk in): no giver, not the enemy you had targeted
-                        bool selfGranted = e.Note == How.NoGiver;
-                        ObjRef giver = selfGranted ? null : lastClicked != null && t - lastClickedAt <= 60 ? lastClicked : e.Target;
+                        // the game handed it out by itself (an [AREA] mission when you walk in), or in a holocom call nothing you clicked set off
+                        bool selfGranted = encounter || e.Note == How.NoGiver ||
+                                           (e.Note == How.Holocom && !(lastClicked != null && holoAt >= lastClickedAt && holoAt - lastClickedAt <= 6));
+                        ObjRef giver = null;
+                        if (!selfGranted && grantedBy.Count == 0)
+                        {
+                            // the NPC you were talking to when it came (also when you had clicked an object just before that conversation)
+                            bool talked = e.Target != null && e.Target.Name.Length > 0 && (e.Note == How.Offered || e.Note == How.Talking);
+                            // else your last click (the terminal, the Recon Droid, General Konya) - unless a conversation, quest window or board
+                            // opened after it, or it is an object you had already used for a step
+                            bool clickFresh = lastClicked != null && t - lastClickedAt <= 60 && !UsedUp(lastClicked, consumed, t);
+                            bool openedLater = talkAt > lastClickedAt + 6 || questWindowAt > lastClickedAt + 8 || boardAt > lastClickedAt + 10;
+                            bool clickStartedTalk = talkAt >= lastClickedAt && talkAt <= lastClickedAt + 6;
+                            // with someone talking to you, a plain object (no mission marker, not usable for a mission) never beats them
+                            bool plainObject = lastClicked != null && lastClicked.Kind == ObjKind.Placeable && !lastClicked.OffersQuest && !lastClicked.UsableForQuest;
+                            giver = clickFresh && !openedLater && !(talked && (clickStartedTalk || plainObject)) ? lastClicked : e.Target;
+                            if (UsedUp(giver, consumed, t) || IsCompanion(giver))
+                                giver = null;
+                            // a mob you fought or looted never gives a mission (Dreadtooth)
+                            if (giver != null && !talked && giver.Kind == ObjKind.Npc && !giver.OffersQuest && (giver.Dead || killedNames.Contains(giver.Name)))
+                                giver = null;
+                            // a giver stands next to you when the mission lands
+                            if (giver != null && giver.HasPos && !e.Pos.IsZero && giver.Pos.DistanceTo(e.Pos) > 2f)
+                                giver = null;
+                            // it came with another mission's progress (a bonus that step opened): not given by what you clicked
+                            if (giver != null && !talked && e.Note != How.Board && e.Note != "from its quest window" &&
+                                AnotherTickNear(events, hiddenQuests, e.QuestId, t, giver == lastClicked ? lastClickedAt : t - 2))
+                                giver = null;
+                            // a kill after your click set it off (a bonus mission that comes with the first mob of a kind): not
+                            // given by what you clicked before the fight
+                            if (giver != null && !talked && giver == lastClicked && e.Note != How.Board && e.Note != "from its quest window" &&
+                                allKills.Count > 0 && allKills[allKills.Count - 1].At > lastClickedAt && t - allKills[allKills.Count - 1].At <= 3)
+                                giver = null;
+                        }
+                        // the talk gave this mission: its end is not what a later step was done with
+                        if (giver != null && talk != null && giver.Name == talk.Name)
+                            talkGave = true;
+                        // the object you clicked that gave it: kept for a fight it brings out (the Field Generator brings out the
+                        // commander) - not a mission board, a holocom call or a mission the game handed out by itself
+                        bool fightGiver = false;
+                        if (giver != null && giver == lastClicked && giver.Kind == ObjKind.Placeable && t - lastClickedAt <= 10 &&
+                            string.IsNullOrEmpty(e.Option) && e.Note != How.Board && e.Note != How.Holocom)
+                        {
+                            Use gu = uses.FindLast(u => u.Name == lastClicked.Name);
+                            giverUse = gu ?? new Use { Name = lastClicked.Name, Pos = lastClicked.HasPos ? lastClicked.Pos : e.Pos, At = lastClickedAt,
+                                                       Stand = lastClickedStand.IsZero ? e.Pos : lastClickedStand, Id = lastClicked.NodeId };
+                            // an object with no mission marker (no hand-in either) that the game said was for a mission you already had,
+                            // whose click brought out a fight that isn't this quest's own: the quest came with that fight, not from the
+                            // object (the Field Generator brings out the commander) - no pick-up from it (BuddyCron's PickUpQuest would
+                            // click it for a quest it doesn't give); the click stays for the fight. Not when a conversation or quest
+                            // window of it gave the quest.
+                            fightGiver = giver.UsableForQuest && !giver.OffersQuest && !giver.TakesTurnIn && e.Note != How.Offered && e.Note != How.Talking &&
+                                         e.Note != "from its quest window" && FightCameOf(events, giverUse.At, giverUse.Pos, e.QuestId);
+                        }
+                        // the click on the giver / board was the pick-up; when nothing you clicked gave it (walked in, a holocom, a bonus that
+                        // came with a step) the clicks of the last 10 s stay for the step they move
+                        if (giver != null && giver.Name.Length > 0)
+                            uses.Clear();
+                        else
+                            uses.RemoveAll(u => t - u.At > 10 && !u.ForQuest);
+                        if (fightGiver)
+                        {
+                            AddNote(s, "it came as you clicked " + giver.Name + ", which brought out a fight: the bot clicks it before that fight");
+                            giver = null;
+                        }
                         if (giver != null && giver.Name.Length > 0)
                         {
                             Vec3 gp = giver.HasPos ? giver.Pos : e.Pos;
+                            // an object: stand where you stood when you clicked it (the object's own spot can be out of reach)
+                            Vec3 stand = giver == lastClicked ? lastClickedStand : e.Pos;
+                            string range = "20";
+                            if (giver.Kind == ObjKind.Placeable && giver.HasPos && !stand.IsZero)
+                            {
+                                float d = stand.DistanceTo(gp);
+                                if (d >= 0.3f && d < 10f)
+                                {
+                                    s.Lines.Add("<MoveTo QuestId=\"1\" Name=\"Stand for " + A(giver.Name) + "\" XYZ=\"" + X(stand) + "\" />");
+                                    range = Math.Max(20, (int)Math.Ceiling((d + 1f) * 10f)).ToString(CultureInfo.InvariantCulture);
+                                }
+                            }
                             // dailies / weeklies / heroics: the giver stops offering them once done today, and BuddyCron's
                             // PickUpQuest would click it forever - PickUpIfOffered gives up after 3 tries.
-                                s.Lines.Add("<" + (repeat ? "PickUpIfOffered" : "PickUpQuest") + " QuestName=\"" + A(e.QuestName) + "\" QuestId=\"" + q + "\"" + (giver.Kind == ObjKind.Placeable ? (giver.HasPos ? " SearchRadius=\"0.02\"" : " SearchRadius=\"20\"") : string.Empty) +
-                                            " UseRange=\"20\" GiverName=\"" + A(giver.Name) + "\" XYZ=\"" + X(gp) + "\"" + (isWeekly && repeat ? " Repeatable=\"True\"" : string.Empty) + " />");
+                            // An object giver is pinned to its own spot (a twin terminal 0.07 away is shut out: SearchRadius is squared).
+                            // (no GiverType: not checked that BuddyCron's PickUpQuest reads it, and it finds objects without it)
+                            if (PickUpOnlyWithRoom)
+                                s.Gate += " and (" + LogHasRoom + ")";
+                            s.Board = giver.Kind == ObjKind.Placeable && e.Note == How.Board && e.Target != null && e.Target.Name == giver.Name;
+                            // its own quest window or conversation, or a call your click on it started, gave it, and no mission board
+                            // opened after you clicked it (or began that talk): not a board, whatever its name
+                            double givenFrom = lastClicked != null && lastClicked.Name == giver.Name ? lastClickedAt : Math.Max(talkAt, questWindowAt);
+                            s.NotBoard = !s.Board && giver.Kind == ObjKind.Placeable && boardAt < givenFrom - 1 &&
+                                         ((e.Target != null && e.Target.Name == giver.Name && (e.Note == How.Offered || e.Note == How.Talking || e.Note == "from its quest window")) ||
+                                          (e.Note == How.Holocom && giver == lastClicked));
+                            s.Lines.Add("<" + (repeat ? "PickUpIfOffered" : "PickUpQuest") + " QuestName=\"" + A(qName) + "\" QuestId=\"" + q + "\"" +
+                                        (giver.Kind == ObjKind.Placeable ? (giver.HasPos ? " SearchRadius=\"0.001\"" : " SearchRadius=\"20\"") : string.Empty) +
+                                        " UseRange=\"" + range + "\" GiverName=\"" + A(giver.Name) + "\" XYZ=\"" + X(gp) + "\"" + (isWeekly && repeat ? " Repeatable=\"True\"" : string.Empty) + " />");
                         }
                         else
                         {
-                            // walk to where it landed in your log so the game hands it out again
-                            s.Lines.Add("<MoveTo QuestId=\"1\" Name=\"" + A(e.QuestName) + "\" XYZ=\"" + X(e.Pos) + "\" />");
+                            // walk to where it landed in your log so the game hands it out again (an area mission can take
+                            // a few seconds more to come). Only "do I have it?" (nobody gives it, and the game's "already
+                            // complete" has read true wrongly), and for a mission another one's end grants, only once that one
+                            // is gone from your log
+                            s.Gate = "(not HasQuest(" + q + "))";
+                            foreach (ulong g in grantedBy)
+                                s.Gate += " and (not HasQuest(" + Fmt.Hex(g) + "))";
+                            if (grantedBy.Count > 0)
+                                AddNote(s, "it came the moment another mission finished: the bot gets it the same way, and only walks here if it hasn't");
+                            s.Lines.Add("<MoveTo QuestId=\"1\" Name=\"" + A(qName) + "\" XYZ=\"" + X(e.Pos) + "\" />");
                             s.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"3\" />");
+                            s.Lines.Add("<If Condition=\"not HasQuest(" + q + ")\"><WaitTimer QuestId=\"1\" WaitTime=\"5\" /></If>");
+                            // what started it that the bot can't do by itself: said in the review list (yellow)
+                            string fromItem = null;
+                            if (item != null && t - itemAt <= 6 && itemAt >= lastClickedAt && !item.StartsWith("Heroic Transport", StringComparison.Ordinal))
+                                fromItem = item;
+                            else if (lastBagItem != null && t - lastBagItemAt <= 6 && lastBagItemAt >= lastClickedAt)
+                                fromItem = lastBagItem;
+                            else
+                                foreach (RecEvent g in goneItems)
+                                {
+                                    // (not an item the game took away as another mission ended right then)
+                                    if (g.Elapsed > t + 1 || t - g.Elapsed > 6 || g.Elapsed < lastClickedAt || g.Option.StartsWith("Heroic Transport", StringComparison.Ordinal))
+                                        continue;
+                                    bool ended = false;
+                                    foreach (RecEvent x in events)
+                                        if ((x.Kind == EvKind.QuestCompleted || x.Kind == EvKind.QuestRemoved || x.Kind == EvKind.QuestAbandoned) && Math.Abs(x.Elapsed - g.Elapsed) <= 1.0)
+                                            ended = true;
+                                    if (!ended)
+                                        fromItem = g.Option;
+                                }
+                            if (fromItem != null)
+                            {
+                                s.Unsure = true;
+                                AddNote(s, "it came right after you used " + fromItem + ": if the bot doesn't get it, use " + fromItem + " by hand");
+                            }
+                            else if (e.Note == How.Holocom)
+                            {
+                                s.Unsure = true;
+                                AddNote(s, "it came in a holocom call: if the bot doesn't get it, answer the call by hand");
+                            }
                         }
+                        pickupOf[e.QuestId] = s;
                         steps.Add(s);
                         break;
                     }
                     case EvKind.QuestTask:
                     case EvKind.QuestStep:
                     {
-                        if (e.QuestId == 0)
-                            break;
+                        if (e.QuestId == 0 || IsSystemQuest(e))
+                            break; // (a companion conversation cooldown has nothing to do in the world)
                         if (pendingEquip != null && t - pendingEquipAt <= 20 && !e.QuestHidden && !hiddenQuests.Contains(e.QuestId))
                         {
                             string eq = Fmt.Hex(e.QuestId);
-                            string worn = pendingEquip.Replace("'", "\\'");
+                            // (the gate goes into the profile as it is: the name quoted for the condition, then XML-escaped)
+                            string worn = A(Fmt.PyStr(pendingEquip));
                             var eqLines = new List<string> { "<EquipItem ItemName=\"" + A(pendingEquip) + "\" />" };
-                            AddStep(steps, "Item", "HasQuest(" + eq + ") and not HasItemEquipped('" + worn + "')", "Put on " + pendingEquip + " (like you did, right before " + e.QuestName + " moved on)", eqLines, e.QuestId);
+                            Step put = AddStep(steps, "Item", "HasQuest(" + eq + ") and not HasItemEquipped(" + worn + ")", "Put on " + pendingEquip, eqLines, e.QuestId);
+                            AddNote(put, "like you did, right before " + e.QuestName + " moved on");
                             pendingEquip = null;
                         }
                         if (e.QuestHidden || hiddenQuests.Contains(e.QuestId)) // the game marks its helper quests hidden only sometimes
@@ -1839,7 +3338,9 @@ namespace QuestRecorder
                                 {
                                     Kind = "Grind",
                                     Gate = Fmt.Format("HasQuest({0}) and not IsBranchStepComplete({0}, {1}, {2})", hq, hb, hs),
-                                    Comment = "Kill and loot " + lastLoot.Name + " (your loot moved the game's helper quest - e.g. an anti-radiation injector)",
+                                    Comment = "Kill and loot " + lastLoot.Name,
+                                    Note = "your loot moved one of the game's hidden helper quests",
+                                    Area = lastLoot.Name,
                                     Quest = e.QuestId,
                                     Kills = new List<Kill> { new Kill { Name = lastLoot.Name, Pos = lastLoot.HasPos ? lastLoot.Pos : e.Pos, At = t, Leg = leg, Spec = lastLoot.Spec } }
                                 };
@@ -1850,7 +3351,10 @@ namespace QuestRecorder
                             // A bag item (a stim) that moved the game's helper quest: use it here, where you did (Glow: the
                             // stim that keeps you alive on the lower level). Used once; the helper quest moving on ends it.
                             // (not when a normal mission moved at the same moment: a medpac in a Black Hole fight isn't a step)
-                            if (lastBagItem != null && t - lastBagItemAt <= 6 && !NormalTickNear(events, hiddenQuests, t))
+                            // (not a count of a bonus mission that started hidden and shows now, when you clicked a mission object
+                            // after the stim: the click moved it - Section X Cleanse the Cannon)
+                            if (lastBagItem != null && t - lastBagItemAt <= 6 && !NormalTickNear(events, hiddenQuests, t) &&
+                                (e.QuestHidden || !(e.Kind == EvKind.QuestTask && e.Max > 0 && uses.Exists(u => u.ForQuest && u.At >= lastBagItemAt && u.At <= t))))
                             {
                                 string iq = Fmt.Hex(e.QuestId);
                                 ulong ib = e.HasOldStep ? e.OldBranch : e.Branch, ist = e.HasOldStep ? e.OldStep : e.Step;
@@ -1858,7 +3362,8 @@ namespace QuestRecorder
                                 {
                                     Kind = "Item",
                                     Gate = Fmt.Format("HasQuest({0}) and not IsBranchStepComplete({0}, {1}, {2})", iq, ib, ist),
-                                    Comment = "Use " + lastBagItem + " (it moved the game's helper quest - e.g. a stim that keeps you alive)",
+                                    Comment = "Use " + lastBagItem,
+                                    Note = "it moved the game's helper quest (e.g. a stim that keeps you alive)",
                                     Quest = e.QuestId
                                 };
                                 useStep.Lines.Add("<MoveTo QuestId=\"1\" Name=\"Where you used " + A(lastBagItem) + "\" XYZ=\"" + X(lastBagItemPos) + "\" />");
@@ -1883,7 +3388,8 @@ namespace QuestRecorder
                                 {
                                     Kind = "Item",
                                     Gate = Fmt.Format("HasQuest({0}) and not IsBranchStepComplete({0}, {1}, {2})", mq, mb, ms),
-                                    Comment = "Use " + item + " (it moved the game's helper quest - e.g. an injector that keeps you alive)",
+                                    Comment = "Use " + item,
+                                    Note = "it moved the game's helper quest (e.g. an injector that keeps you alive)",
                                     Quest = e.QuestId
                                 };
                                 Vec3 at = itemPos.IsZero ? e.Pos : itemPos;
@@ -1900,11 +3406,19 @@ namespace QuestRecorder
                             if (e.QuestHidden)
                                 break;
                         }
-                        if (e.Kind == EvKind.QuestTask && e.Text.StartsWith("Complete ", StringComparison.OrdinalIgnoreCase))
-                            break; // a weekly's "Complete X" ticks by itself
+                        if (IsMetaTick(e, metaTasks))
+                            break; // a weekly's "Complete X" ticks by itself (another mission ending moved it)
+                        // ...and its last one, which shows as its step finishing: the other mission's own end does that
+                        // (it must not take the clicks or the fight that finished the other mission)
+                        if (e.Kind == EvKind.QuestStep && e.HasOldStep && metaSteps.Contains(Fmt.Hex(e.QuestId) + "|" + e.OldStep.ToString(CultureInfo.InvariantCulture)) &&
+                            OtherEndNear(events, hiddenQuests, e.QuestId, t))
+                            break;
                         string q = Fmt.Hex(e.QuestId);
                         bool isCount = e.Kind == EvKind.QuestTask && e.Max > 0;
                         int task = e.TaskIndex >= 0 ? e.TaskIndex : 0;
+                        // another branch right after your replies: the replies may have picked it (checked after the build)
+                        if (e.Kind == EvKind.QuestStep && e.HasOldStep && e.OldBranch != e.Branch && t - lastPickAt <= 15)
+                            branchedAt.Add(new KeyValuePair<ulong, double>(e.QuestId, t));
                         string gate, what;
                         if (isCount)
                         {
@@ -1912,6 +3426,7 @@ namespace QuestRecorder
                             what = Fmt.Format("{0}: {1} ({2}/{3})", e.QuestName, e.Text, e.Count, e.Max);
                             countsSeen[q + "|" + e.Step + "|" + task] = new[] { (long)e.Count, (long)e.Max };
                             taskTexts[q + "|" + e.Step + "|" + task] = e.Text;
+                            tickBranch = e.Branch.ToString(CultureInfo.InvariantCulture);
                             // the kill right before this count moved it: remember which task it counted for
                             if (allKills.Count > 0 && t - allKills[allKills.Count - 1].At <= 1.0 &&
                                 (e.TaskTargets.Count == 0 || allKills[allKills.Count - 1].Spec == 0 || e.TaskTargets.Contains(allKills[allKills.Count - 1].Spec))) // only if the game counts that mob type for this task
@@ -1947,7 +3462,18 @@ namespace QuestRecorder
                                 what = Fmt.Format("{0}: {1} ({2}/{2}) - step {3} done{4}", e.QuestName, tt ?? "count", oneShortMax, os,
                                                   e.Text.Length > 0 ? " (next: " + e.Text + ")" : string.Empty);
                             }
+                            tickBranch = ob.ToString(CultureInfo.InvariantCulture);
+                            // that step is over: its counts are history (another branch can use the same step number for
+                            // other tasks - a count left from this one must not make that step's finish "one short")
+                            if (e.Kind == EvKind.QuestStep && e.HasOldStep && (e.OldStep != e.Step || e.OldBranch != e.Branch))
+                                foreach (string dk in new List<string>(countsSeen.Keys))
+                                    if (dk.StartsWith(q + "|" + os + "|", StringComparison.Ordinal))
+                                    {
+                                        countsSeen.Remove(dk);
+                                        taskTexts.Remove(dk);
+                                    }
                         }
+                        tickQuest = e.QuestId;
                         // the same moment: another quest counting the same action, or this quest's task finishing its step
                         if (e.Kind == EvKind.QuestStep || (isCount && e.Count >= e.Max))
                             finalAt[e.QuestId] = t; // this tick finished the step / count
@@ -1956,12 +3482,47 @@ namespace QuestRecorder
                         // Shackle Remote, both counts within a second - each count is its own use on its own NPC)
                         if (sameMoment && item != null && t - itemAt <= 20 && isCount && lastProgressQuest == e.QuestId)
                             sameMoment = false;
+                        // the mobs that died just now (for the fight the last tick made)
+                        List<Kill> justDied = allKills.FindAll(k => k.At <= t + 0.01 && t - k.At <= 4.0);
+                        // (not another quest's count whose mob types the game lists, when none of the mobs that just died is one of
+                        // them: the kill didn't move it - you walked into its spot or did something else - it gets its own step)
+                        if (sameMoment && lastProgressQuest != e.QuestId && isCount && e.TaskTargets.Count > 0 && steps.Count > 0 &&
+                            steps[steps.Count - 1].Kind == "Grind" && steps[steps.Count - 1].Quest != e.QuestId &&
+                            justDied.Count > 0 && justDied.TrueForAll(k => k.Spec != 0 && !e.TaskTargets.Contains(k.Spec)))
+                            sameMoment = false;
                         if (sameMoment && (lastProgressQuest != e.QuestId || lastProgressKind == EvKind.QuestTask)) // another quest, or a second count / the step of this quest ticking for the same action (Section X Hyperbiology ticks two counts per sample)
                         {
                             // One kill counting for two quests (Control the Battlefield + Asset Liquidation): the fight
                             // keeps going until this quest's count is reached too.
                             Step fight = steps.Count > 0 ? steps[steps.Count - 1] : null;
-                            if (fight != null && fight.Kind == "Grind" && fight.Quest != e.QuestId && kills.Count + (fight.Kills != null ? 1 : 0) > 0)
+                            // the same kills moved another task of this quest's step too (a named mob that also counts toward
+                            // "Forces", an AoE that killed two kinds): the fight goes on until that task is done too, and hunts its mobs
+                            List<Kill> forTask = isCount && e.TaskTargets.Count > 0 ? justDied.FindAll(k => k.Spec != 0 && e.TaskTargets.Contains(k.Spec)) : new List<Kill>();
+                            if (fight != null && fight.Kind == "Grind" && fight.Quest == e.QuestId && isCount && e.TaskIndex != fight.Task && fight.Kills != null &&
+                                forTask.Count > 0 && fight.Gate != null && fight.Gate.IndexOf("IsTaskValueGreaterThan(" + q + ", " + e.Step + ", ", StringComparison.Ordinal) >= 0 &&
+                                fight.Comment.IndexOf("(kill and loot)", StringComparison.Ordinal) < 0)
+                            {
+                                if (fight.AlsoTasks == null)
+                                    fight.AlsoTasks = new Dictionary<int, string>();
+                                fight.AlsoTasks[task] = gate;
+                                foreach (Kill k in forTask)
+                                {
+                                    k.Credit.Add(q + "|" + task);
+                                    if (!fight.Kills.Contains(k))
+                                        fight.Kills.Add(k);
+                                }
+                                if (fight.Targets != null)
+                                {
+                                    var both = new List<ulong>(fight.Targets);
+                                    foreach (ulong sp in e.TaskTargets)
+                                        if (!both.Contains(sp))
+                                            both.Add(sp);
+                                    fight.Targets = both;
+                                }
+                                if (e.Text.Length > 0 && fight.Comment.IndexOf("; " + e.Text, StringComparison.Ordinal) < 0)
+                                    fight.Comment += "; " + e.Text + " (" + e.Count + "/" + e.Max + ")";
+                            }
+                            else if (fight != null && fight.Kind == "Grind" && fight.Quest != e.QuestId && kills.Count + (fight.Kills != null ? 1 : 0) > 0)
                             {
                                 if (fight.Also == null)
                                     fight.Also = new Dictionary<ulong, string>();
@@ -1974,6 +3535,16 @@ namespace QuestRecorder
                             {
                                 // the last kill finished the step: fight until the step is done, not one short of it
                                 fight.Gate = gate;
+                            }
+                            else if (isCount && sameTake != null && sameTakeQuest != e.QuestId && t - sameTakeAt <= 1.0)
+                            {
+                                // one click counted for two quests: this count gets that click too, next to its earlier clicks
+                                string ids2 = Fmt.Format(" QuestId=\"{0}\" BranchId=\"{1}\" StepId=\"{2}\" TaskId=\"{3}\" TaskValue=\"{4}\"", q, e.Branch, e.Step, task, e.Count > 0 ? e.Count - 1 : 0);
+                                var cs2 = new Step { Kind = "Use", Gate = gate, Comment = what, Quest = e.QuestId, At = t, Branch = e.Branch.ToString(CultureInfo.InvariantCulture) };
+                                foreach (Use u in sameTake)
+                                    cs2.Lines.AddRange(UseAt(u.Name, u.Pos, u.Stand, ids2));
+                                int at2 = steps.FindLastIndex(st => st.Quest == sameTakeQuest && Math.Abs(st.At - sameTakeAt) < 0.05);
+                                steps.Insert(at2 >= 0 ? at2 : steps.Count, cs2);
                             }
                             lastProgressAt = t;
                             lastProgressQuest = e.QuestId;
@@ -2004,7 +3575,7 @@ namespace QuestRecorder
                         if (markers.Count > 0)
                         {
                             // Walk points are their own step.
-                            var route = new Step { Kind = "Route", Comment = "Your route" };
+                            var route = new Step { Kind = "Route", Comment = "Walk" };
                             AddRoute(route, markers);
                             steps.Add(route);
                             markers.Clear();
@@ -2014,12 +3585,31 @@ namespace QuestRecorder
                         // (no guessing which object the task means from its name)
                         List<string> ow = Words(doneText);
                         var recent = uses.FindAll(u => t - u.At <= (isCount ? 30 : 180)); // a puzzle can take a few minutes
+                        // the conversation this step was done with, if one is on: a holocom call, or a talk (one you started
+                        // yourself by clicking them counts until it ends - a story talk can run well past 20 s)
+                        bool callNow = t - holoAt <= 20 || (CallLasted(convos, holoAt, t) &&
+                                       (holoQuest == 0 || holoQuest == e.QuestId || hiddenQuests.Contains(holoQuest) || Math.Abs(holoQuestAt - holoAt) > 30));
+                        bool talkNow = talk != null && ConvoOnAt(convos, talkAt, t) && (t - talkAt <= 20 || (talkClicked && !talkGave && SceneOn(convos, talkAt, t)));
+                        // what you clicked before that conversation and the game didn't mark as for a mission (a loot crate on the
+                        // way) didn't do this step - the talk did (a click that opened the conversation, or came after it, stays)
+                        double convAt = Math.Max(callNow ? holoAt : -1e9, talkNow && talkClicked && talk.Kind != ObjKind.Placeable ? talkAt : -1e9);
+                        if (convAt > -1e8)
+                        {
+                            recent = recent.FindAll(u => u.ForQuest || u.At >= convAt - 6);
+                            if (item != null && t - itemAt <= 20 && itemAt < convAt - 6)
+                                item = null; // (a mission item used before it, the same)
+                        }
+                        // a scene that started by itself right after the last kill (a boss that talks once beaten): the kill moved
+                        // this, as if it had moved right then - unless the step was to speak to someone
+                        double killAt = KillMoment(kills, sceneAfterKillAt, convos, t);
+                        if (killAt < t && NpcFromStepText(doneText) != null)
+                            killAt = t;
                         var named = new List<Use>();
                         bool keepRest = false;
                         List<Use> take = recent;
                         // a kill right before the tick and no object the objective names.
                         var spawners = new List<Use>();
-                        if (named.Count == 0 && kills.Count > 0 && t - kills[kills.Count - 1].At <= 3 && (take.Count == 0 || t - take[take.Count - 1].At > 3))
+                        if (named.Count == 0 && kills.Count > 0 && killAt - kills[kills.Count - 1].At <= 3 && (take.Count == 0 || t - take[take.Count - 1].At > 3))
                         {
                             // ...or an object you really used.
                             take = take.FindAll(u => kills.Exists(k => k.Pos.DistanceTo(u.Pos) <= (u.Cast ? 3f : 1f)) ||
@@ -2036,8 +3626,10 @@ namespace QuestRecorder
                                 take = new List<Use> { take[0] };
                             }
                         }
-                        // A step finished after several objects.
-                        if (!isCount && take.Count > 1)
+                        // A step finished after several objects - or a count after several clicks on objects of one name (one
+                        // spent, or not the one that counted): the earlier ones are clicked once each, only the last one waits
+                        // for the count (each waiting for it, the bot clicked the first one forever)
+                        if (take.Count > 1 && (!isCount || (spawners.Count == 0 && !keepRest && take.TrueForAll(u => u.Name == take[0].Name))))
                         {
                             var seq = new List<Use>();
                             foreach (Use u in take)
@@ -2064,21 +3656,31 @@ namespace QuestRecorder
                                 consumed[UseKey(u.Id, u.Pos)] = t;
                                 uses.Remove(u);
                             }
-                            AddStep(steps, "Use", gate, what + " (do it by hand)", lines, e.QuestId);
+                            AddNote(AddStep(steps, "Use", gate, what, lines, e.QuestId), "do it by hand");
                             break;
                         }
+                        bool killCause = kills.Count > 0 && killAt - kills[kills.Count - 1].At <= 3;
+                        // an object use that ended within 3 s of the tick did it, even if a mob died at the same moment
+                        if (take.Count > 0 && t - take[take.Count - 1].At <= 3)
+                            killCause = false;
+                        // a step a fight finished: what you clicked before it is clicked once (End of Torvix: the Master Safety
+                        // Control brings the waves), not used again and again until the step is done
+                        bool clickOnce = killCause && !isCount;
                         // Every use in the order you did it, tied to the quest so it can never loop.
                         string countIds = isCount
                             ? Fmt.Format(" QuestId=\"{0}\" BranchId=\"{1}\" StepId=\"{2}\" TaskId=\"{3}\" TaskValue=\"{4}\"", q, e.Branch, e.Step, task, e.Count > 0 ? e.Count - 1 : 0)
                             : useIds;
                         foreach (Use u in take)
                         {
-                            if (spawners.Contains(u))
+                            if (spawners.Contains(u) || clickOnce)
                             {
                                 // the object only starts the fight. Clicked by its exact spot (Quest Recorder's ClickObject):
                                 // BuddyCron's Interact takes the one nearest the bot and skips one it clicked for 30 s, so
                                 // a row of clicks on side-by-side objects (Torvix Pipeline Controls) came out wrong.
-                                lines.Add("<ClickObject QuestId=\"" + q + "\" Name=\"" + A(u.Name) + "\" XYZ=\"" + X(u.Pos) + "\" />");
+                                // The bot stands where you stood; before a fight it then walks up to it until it can click it.
+                                lines.Add("<ClickObject QuestId=\"" + q + "\" Name=\"" + A(u.Name) + "\" XYZ=\"" + X(u.Pos) + "\"" +
+                                          (!u.Stand.IsZero || killCause ? " Stand=\"" + X(u.Stand.IsZero ? u.Pos : u.Stand) + "\"" : string.Empty) +
+                                          (killCause ? " Fight=\"True\"" : string.Empty) + " />");
                                 consumed[UseKey(u.Id, u.Pos)] = t;
                                 uses.Remove(u);
                                 continue;
@@ -2087,20 +3689,40 @@ namespace QuestRecorder
                             consumed[UseKey(u.Id, u.Pos)] = t;
                             uses.Remove(u);
                         }
+                        // the clicks this tick took: another quest counting the same click a moment later gets them too
+                        var plainUses = take.FindAll(u => !spawners.Contains(u) && !clickOnce);
+                        if (plainUses.Count > 0)
+                        {
+                            sameTake = plainUses;
+                            sameTakeAt = t;
+                            sameTakeQuest = e.QuestId;
+                        }
                         if (named.Count == 0 && !keepRest)
                             uses.Clear();
 
-                        bool killCause = kills.Count > 0 && t - kills[kills.Count - 1].At <= 3;
-                        // an object use that ended within 3 s of the tick did it, even if a mob died at the same moment
-                        if (take.Count > 0 && t - take[take.Count - 1].At <= 3)
-                            killCause = false;
                         if (killCause)
                         {
                             // a boss step keeps every mob from the whole fight, in the order you killed them.
-                            double from = Math.Min(fightAt, t - 3);
+                            double from = Math.Min(fightAt, killAt - 3);
                             var use = kills.FindAll(k => isCount || k.At >= from - 1);
+                            if (killAt < t)
+                            {
+                                // the scene after the kill was part of the fight, not a talk for a later step
+                                if (talk != null && talkAt == sceneAfterKillAt)
+                                    talk = null;
+                                sceneAfterKillAt = -1e9;
+                            }
+                            // a mission item you used just before this fight, where its mob then died, and that mob wasn't
+                            // around before (a lure, a totem): used once first (not when an object you clicked brought it out)
+                            Use preFight = lines.Count == 0 && !(giverUse != null && giverUse.At >= fightAt - 15 && fightAt >= giverUse.At - 1 && giverUse.At <= t)
+                                           ? PreFightItem(orderNow, use, mobSeen, allKills, fightAt) : null;
+                            if (preFight != null)
+                                lines.AddRange(PreFightLines(preFight, q));
                             Step prev = steps.Count > 0 ? steps[steps.Count - 1] : null;
-                            if (isCount && lines.Count == 0 && prev != null && prev.Kind == "Grind" && prev.Quest == e.QuestId && prev.Task == e.TaskIndex)
+                            // (only that same count of that same step: once the last kill finished a step, the fight waits for
+                            // that step - the next step's first count of the same task number is a fight of its own)
+                            if (isCount && lines.Count == 0 && prev != null && prev.Kind == "Grind" && prev.Quest == e.QuestId && prev.Task == e.TaskIndex &&
+                                prev.Gate != null && prev.Gate.IndexOf("IsTaskValueGreaterThan(" + q + ", " + e.Step + ", " + task + ", ", StringComparison.Ordinal) >= 0)
                             {
                                 prev.Gate = gate; // the same kill count going on: its stop point moves up
                                 prev.Comment = what;
@@ -2110,6 +3732,17 @@ namespace QuestRecorder
                             {
                                 var g = new Step { Kind = "Grind", Gate = gate, Comment = what, Quest = e.QuestId, Task = e.TaskIndex, Targets = e.TaskTargets.Count > 0 ? e.TaskTargets : null, Kills = use };
                                 g.Lines.AddRange(lines);
+                                // the object you clicked for a pick-up brought this fight out (the Field Generator): click it first
+                                // (only a fight that started after that click, within 15 s, near it)
+                                if (giverUse != null && giverUse.At >= fightAt - 15 && fightAt >= giverUse.At - 1 && giverUse.At <= t && use.Exists(k => k.Pos.DistanceTo(giverUse.Pos) <= 1f) &&
+                                    !g.Lines.Exists(l => Attr(l, "Name") == A(giverUse.Name) || Attr(l, "ObjectName") == A(giverUse.Name)))
+                                {
+                                    g.Lines.Insert(0, "<ClickObject QuestId=\"" + q + "\" Name=\"" + A(giverUse.Name) + "\" XYZ=\"" + X(giverUse.Pos) + "\" Stand=\"" +
+                                                      X(giverUse.Stand.IsZero ? giverUse.Pos : giverUse.Stand) + "\" Fight=\"True\" />");
+                                    giverUse = null;
+                                }
+                                if (preFight != null)
+                                    AddNote(g, "uses " + preFight.Name + " first, as you did right before this fight");
                                 steps.Add(g);
                             }
                             // an item used before that kill wasn't what moved this count, and it doesn't carry on to the next
@@ -2122,6 +3755,9 @@ namespace QuestRecorder
                         // kept for a count you got by looting what the mobs dropped (the tick comes after the loot, not the kill)
                         List<Kill> lootKills = kills.FindAll(k => t - k.At <= 20);
                         kills.Clear();
+                        // a stim or medpac you used before a click that moved this: the click did it, the stim isn't part of it
+                        if (item != null && item == lastBagItem && Math.Abs(itemAt - lastBagItemAt) < 0.01 && take.Exists(u => u.At >= itemAt))
+                            item = null;
                         if (item != null && t - itemAt <= 20)
                         {
                             // a quest item you used right before (UseItem fires it at the spot you used it)
@@ -2177,13 +3813,19 @@ namespace QuestRecorder
                                         lastSpot = u.Pos;
                                     }
                                     // on the NPC you used it on, from as close as you stood (a corpse: DeadOnly)
+                                    // (used in a fight, or on a mob that fought you right after: it may be used in a fight)
                                     lines.Add("<UseMissionItemOnce ItemName=\"" + A(u.Name) + "\"" +
-                                              (u.On != null ? " Npc=\"" + A(u.On) + "\" Range=\"" + UseRangeFor(u.OnDist) + "\"" + (u.OnDead ? " DeadOnly=\"True\"" : string.Empty) : string.Empty) + " />");
+                                              (u.On != null ? " Npc=\"" + A(u.On) + "\" Range=\"" + UseRangeFor(u.OnDist) + "\"" + (u.OnDead ? " DeadOnly=\"True\"" : string.Empty) : string.Empty) +
+                                              (u.InFight || (u.On != null && KilledSoonAfter(events, u.On, u.At)) ? " InCombat=\"True\"" : string.Empty) + " />");
                                 }
+                                // the last one where you used it, when that was somewhere else
+                                if (!itemPos.IsZero && lastSpot.DistanceTo(itemPos) > 5f)
+                                    lines.Add("<MoveTo QuestId=\"" + q + "\" Name=\"Where you used " + A(item) + "\" XYZ=\"" + X(itemPos) + "\" />");
                                 // the last one once too: if the order went wrong, the whole row is tried again next round
                                 // instead of pressing one rune forever
                                 lines.Add("<UseMissionItemOnce ItemName=\"" + A(item) + "\"" +
-                                          (itemOn != null ? " Npc=\"" + A(itemOn) + "\" Range=\"" + UseRangeFor(itemOnDist) + "\"" + (itemOnDead ? " DeadOnly=\"True\"" : string.Empty) : string.Empty) + " />");
+                                          (itemOn != null ? " Npc=\"" + A(itemOn) + "\" Range=\"" + UseRangeFor(itemOnDist) + "\"" + (itemOnDead ? " DeadOnly=\"True\"" : string.Empty) : string.Empty) +
+                                          (itemInCombat || killedAfter ? " InCombat=\"True\"" : string.Empty) + " />");
                                 lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"3\" />");
                             }
                             else
@@ -2235,19 +3877,34 @@ namespace QuestRecorder
                             AddStep(steps, "Use", gate, what, lines, e.QuestId);
                             break;
                         }
-                        if (t - holoAt <= 20)
+                        if (callNow)
                         {
                             lines.Add("<AnswerHolocomCall QuestName=\"" + A(e.QuestName) + "\" QuestId=\"" + q + "\" />");
                             holoAt = -1e9;
                             AddStep(steps, "Holocom", gate, what, lines, e.QuestId);
                             break;
                         }
-                        if (talk != null && t - talkAt <= 20)
+                        if (talkNow && !UsedUp(talk, consumed, t))
                         {
                             lines.Add("<" + (talk.Kind == ObjKind.Placeable ? "Interact" : "TalkTo") + " QuestId=\"" + q + "\" Name=\"" + A(talk.Name) + "\" WaitTime=\"5\" XYZ=\"" +
                                       X(talk.HasPos ? talk.Pos : e.Pos) + "\" />");
                             talk = null;
                             AddStep(steps, "Talk", gate, what, lines, e.QuestId);
+                            break;
+                        }
+                        // the talk was credited to an object you had already used (older recordings): the NPC the step names
+                        // ("Speak to Tookreek"), where you clicked them or where it ticked
+                        string saidTo = talk != null && t - talkAt <= 20 && UsedUp(talk, consumed, t) && ConvoOnAt(convos, talkAt, t) ? NpcFromStepText(doneText) : null;
+                        if (saidTo != null && !killedNames.Contains(saidTo) && saidTo.IndexOf("Dropbox", StringComparison.OrdinalIgnoreCase) < 0)
+                        {
+                            Vec3 sp;
+                            if (!npcSpots.TryGetValue(saidTo, out sp))
+                                sp = e.Pos;
+                            lines.Add("<TalkTo QuestId=\"" + q + "\" Name=\"" + A(saidTo) + "\" WaitTime=\"5\" XYZ=\"" + X(sp) + "\" />");
+                            Step said = AddStep(steps, "Talk", gate, what, lines, e.QuestId);
+                            said.Unsure = true;
+                            AddNote(said, "the talk was credited to " + talk.Name + ", which you had already used: talks to the NPC the step names");
+                            talk = null;
                             break;
                         }
                         // A count that moved right after you looted a mob whose kill already counted for another task (Section X
@@ -2303,11 +3960,12 @@ namespace QuestRecorder
                         {
                             lines.Add("<UseItem QuestId=\"" + q + "\"" + Fmt.Format(" BranchId=\"{0}\" StepId=\"{1}\" TaskId=\"{2}\" TaskValue=\"{3}\"", e.Branch, e.Step, task, e.Count > 0 ? e.Count - 1 : 0) +
                                       " ItemName=\"" + A(sameItem) + "\" WaitTime=\"3000\" XYZ=\"" + X(e.Pos) + "\"><Hotspots><Hotspot Name=\"Where it ticked\" XYZ=\"" + X(e.Pos) + "\" /></Hotspots></UseItem>");
-                            AddStep(steps, "Item", gate, what + " (your " + sameItem + ")", lines, e.QuestId);
+                            AddNote(AddStep(steps, "Item", gate, what, lines, e.QuestId), "your " + sameItem);
                             break;
                         }
                         // (no guessing from names: a tick with no click of yours just walks to where it ticked)
-                        if (npcClickName != null && t - npcClickAt <= 30 && !killedNames.Contains(npcClickName) && !followers.Contains(npcClickName))
+                        if (npcClickName != null && !npcClickLoot && t - npcClickAt <= 30 && !killedNames.Contains(npcClickName) && !followers.Contains(npcClickName) &&
+                            (e.Pos.IsZero || e.Pos.DistanceTo(npcClickPos) <= 1.5f))
                         {
                             // you clicked an NPC (no conversation) and the count went up a bit later (Black Hole 'Identify.
                             lines.Add("<TalkTo QuestId=\"" + q + "\" Name=\"" + A(npcClickName) + "\" WaitTime=\"5\" XYZ=\"" + X(npcClickPos) + "\" />");
@@ -2368,7 +4026,9 @@ namespace QuestRecorder
                                 usedItemNames.Add(later.Option);
                                 string onWho = targetNpc.Name;
                                 targetNpc = null;
-                                AddStep(steps, "Item", gate, what + " (not sure: you targeted " + onWho + " and held " + later.Option + " - the game gave no signal for the use)", lines, e.QuestId);
+                                Step guess = AddStep(steps, "Item", gate, what, lines, e.QuestId);
+                                guess.Unsure = true;
+                                AddNote(guess, "you targeted " + onWho + " and held " + later.Option + " - the game gave no signal for the use");
                                 break;
                             }
                         }
@@ -2387,7 +4047,9 @@ namespace QuestRecorder
                             if (!string.IsNullOrEmpty(sibling))
                             {
                                 lines.Add("<UseObject ObjectName=\"" + sibling + "\"" + countIds + " UseRange=\"20\" IgnoreLOS=\"True\" WaitTime=\"3000\" BlacklistDuration=\"5\" Radius=\"50\" XYZ=\"" + X(e.Pos) + "\" />");
-                                AddStep(steps, "Use", gate, what + " (not sure: the game didn't say what you used - any " + sibling + " near where it ticked, like your other counts)", lines, e.QuestId);
+                                Step guess = AddStep(steps, "Use", gate, what, lines, e.QuestId);
+                                guess.Unsure = true;
+                                AddNote(guess, "the game didn't say what you used - any " + sibling + " near where it ticked, like your other counts");
                                 break;
                             }
                         }
@@ -2398,8 +4060,21 @@ namespace QuestRecorder
                         double stay = !isCount && !e.Pos.IsZero ? StayedAt(events, t, e.Pos, out fought) : 0;
                         if (!isCount && stay >= 20 && fought)
                         {
-                            lines.Add("<While Condition=\"" + A(gate) + "\"><MoveTo QuestId=\"1\" Name=\"Defend here\" XYZ=\"" + X(e.Pos) + "\" /><WaitTimer QuestId=\"1\" WaitTime=\"3\" /></While>");
-                            AddStep(steps, "Walk", gate, what + " (defend: you held this spot " + ((int)stay).ToString(CultureInfo.InvariantCulture) + " s while the fight came to you - the bot waits here until it moves on)", lines, e.QuestId);
+                            lines.Add("<While Condition=\"" + gate + "\"><MoveTo QuestId=\"1\" Name=\"Defend here\" XYZ=\"" + X(e.Pos) + "\" /><WaitTimer QuestId=\"1\" WaitTime=\"3\" /></While>");
+                            AddNote(AddStep(steps, "Walk", gate, what, lines, e.QuestId),
+                                    "defend: you held this spot " + ((int)stay).ToString(CultureInfo.InvariantCulture) + " s while the fight came to you - the bot waits here until it moves on");
+                            break;
+                        }
+                        // The step moved on by itself a while after you got there, with nothing done (a timer, a scene, an NPC
+                        // you waited for): the bot waits there too, while the step is on, at most a bit longer than you did -
+                        // walking there and straight on ran the next steps while this one was still going.
+                        double waited = !isCount && !e.Pos.IsZero ? WaitedAt(events, t, e.Pos) : 0;
+                        if (waited >= 10)
+                        {
+                            lines.Add("<MoveTo QuestId=\"" + q + "\" Name=\"Where it ticked\" XYZ=\"" + X(e.Pos) + "\" />");
+                            lines.AddRange(WaitWhile(gate, waited));
+                            AddNote(AddStep(steps, "Walk", gate, what, lines, e.QuestId),
+                                    "you waited here " + ((int)waited).ToString(CultureInfo.InvariantCulture) + " s and it moved on by itself - the bot waits here while it's on");
                             break;
                         }
                         lines.Add("<MoveTo QuestId=\"" + q + "\" Name=\"Where it ticked\" XYZ=\"" + X(e.Pos) + "\" />");
@@ -2414,6 +4089,10 @@ namespace QuestRecorder
                     }
                     case EvKind.QuestRemoved:
                     {
+                        // gone with its reward window up (the game didn't say why): handed in
+                        if (!e.QuestHidden && e.QuestId != 0 && !IsSystemQuest(e) &&
+                            (rewardAt.ContainsKey(e.QuestId) || RewardSoon(events, e.QuestId, t)))
+                            goto case EvKind.QuestCompleted;
                         // picked up and gone again without any progress.
                         ulong gone = e.QuestId;
                         if (gone != 0 && !steps.Exists(st => st.Quest == gone && st.Kind != "Pickup"))
@@ -2423,37 +4102,215 @@ namespace QuestRecorder
                         }
                         break;
                     }
+                    case EvKind.QuestAbandoned:
+                    {
+                        // you dropped it: what that go at it made goes too (a mission taken by mistake, a story quest dropped after
+                        // the wrong reply and taken again) - a fight that counted for another quest too stays, for that one
+                        ulong dropped = e.QuestId;
+                        if (e.QuestHidden || dropped == 0 || IsSystemQuest(e))
+                            break;
+                        abandoned.Add(dropped);
+                        string dh = Fmt.Hex(dropped);
+                        string dropPart = " + " + e.QuestName + ": ";
+                        Step took;
+                        int from = pickupOf.TryGetValue(dropped, out took) ? Math.Max(0, steps.IndexOf(took)) : 0;
+                        for (int di = steps.Count - 1; di >= from; di--)
+                        {
+                            Step ds = steps[di];
+                            if (ds == took)
+                            {
+                                steps.RemoveAt(di);
+                                continue;
+                            }
+                            if (ds.Also != null && ds.Also.Remove(dropped))
+                            {
+                                int cut = ds.Comment.IndexOf(dropPart, StringComparison.Ordinal);
+                                if (cut >= 0)
+                                {
+                                    int next = ds.Comment.IndexOf(" + ", cut + 3, StringComparison.Ordinal);
+                                    ds.Comment = ds.Comment.Substring(0, cut) + (next >= 0 ? ds.Comment.Substring(next) : string.Empty);
+                                }
+                            }
+                            if (ds.Quest != dropped)
+                                continue;
+                            if (ds.Also != null && ds.Also.Count > 0)
+                            {
+                                ulong keep = new List<ulong>(ds.Also.Keys)[0];
+                                ds.Quest = keep;
+                                ds.Gate = ds.Also[keep];
+                                ds.Also.Remove(keep);
+                                ds.AlsoTasks = null;
+                                ds.Task = -1;
+                                ds.Targets = null;
+                                int own = ds.Comment.IndexOf(" + ", StringComparison.Ordinal);
+                                if (own >= 0)
+                                    ds.Comment = ds.Comment.Substring(own + 3);
+                                for (int dl = 0; dl < ds.Lines.Count; dl++)
+                                    ds.Lines[dl] = ds.Lines[dl].Replace("QuestId=\"" + dh + "\"", "QuestId=\"" + Fmt.Hex(keep) + "\"");
+                            }
+                            else
+                                steps.RemoveAt(di);
+                        }
+                        picked.RemoveAll(pq => pq == dropped);
+                        weeklies.Remove(dropped);
+                        pickupOf.Remove(dropped);
+                        finalAt.Remove(dropped);
+                        stepText.Remove(dropped);
+                        rewardAt.Remove(dropped);
+                        foreach (string dk in new List<string>(countsSeen.Keys))
+                            if (dk.StartsWith(dh + "|", StringComparison.Ordinal))
+                                countsSeen.Remove(dk);
+                        foreach (string dk in new List<string>(taskTexts.Keys))
+                            if (dk.StartsWith(dh + "|", StringComparison.Ordinal))
+                                taskTexts.Remove(dk);
+                        foreach (string dk in new List<string>(itemForTask.Keys))
+                            if (dk.StartsWith(dh + "/", StringComparison.Ordinal))
+                                itemForTask.Remove(dk);
+                        if (sameTakeQuest == dropped)
+                            sameTake = null;
+                        break;
+                    }
                     case EvKind.QuestCompleted:
                     {
-                        if (e.QuestHidden || e.QuestId == 0)
+                        if (e.QuestHidden || e.QuestId == 0 || IsSystemQuest(e))
                             break;
                         string q = Fmt.Hex(e.QuestId);
+                        // The last count of a task can go with the quest leaving your log (Section X Research Stations: 2/3, then
+                        // done): when exactly one task of the step was one short, the click that finished it is that last count.
+                        string pre = q + "|" + e.Step + "|";
+                        int shorts = 0;
+                        string shortTask = null;
+                        long shortMax = 0;
+                        foreach (KeyValuePair<string, long[]> sc in countsSeen)
+                        {
+                            if (!sc.Key.StartsWith(pre, StringComparison.Ordinal) || sc.Value[0] >= sc.Value[1])
+                                continue;
+                            shorts++;
+                            if (sc.Value[0] == sc.Value[1] - 1)
+                            {
+                                shortTask = sc.Key.Substring(pre.Length);
+                                shortMax = sc.Value[1];
+                            }
+                        }
+                        if (shorts == 1 && shortTask != null)
+                        {
+                            string ctext;
+                            if (!taskTexts.TryGetValue(pre + shortTask, out ctext))
+                                ctext = "count";
+                            string cg = Fmt.Format("HasQuest({0}) and not IsTaskValueGreaterThan({0}, {1}, {2}, {3})", q, e.Step, shortTask, shortMax - 1);
+                            string cw = Fmt.Format("{0}: {1} ({2}/{2})", e.QuestName, ctext, shortMax);
+                            string cids = Fmt.Format(" QuestId=\"{0}\" BranchId=\"{1}\" StepId=\"{2}\" TaskId=\"{3}\" TaskValue=\"{4}\"", q, e.Branch, e.Step, shortTask, shortMax - 1);
+                            List<Use> lastCounted = null;
+                            int insertAt = steps.Count;
+                            // only a task you counted with clicks before (or a click on a mission object), and only when no kill
+                            // came after that click (a kill count that ends on its last kill keeps its last fight)
+                            string taskPart = "IsTaskValueGreaterThan(" + q + ", " + e.Step + ", " + shortTask + ", ";
+                            bool byClicks = steps.Exists(st => st.Quest == e.QuestId && st.Kind == "Use" && st.Gate != null && st.Gate.IndexOf(taskPart, StringComparison.Ordinal) >= 0);
+                            // (the reward window comes ~1.2 s after the finishing tick, and later after a short cutscene: 3 s)
+                            if (sameTake != null && sameTakeQuest != e.QuestId && t - sameTakeAt <= 3.0 &&
+                                (byClicks || sameTake.Exists(u => u.ForQuest)) && !kills.Exists(k => k.At > sameTakeAt))
+                            {
+                                // the click another quest's tick took a moment ago (it counted for both)
+                                lastCounted = sameTake;
+                                int at3 = steps.FindLastIndex(st => st.Quest == sameTakeQuest && Math.Abs(st.At - sameTakeAt) < 0.05);
+                                if (at3 >= 0)
+                                    insertAt = at3;
+                            }
+                            else if (uses.Count > 0 && t - uses[uses.Count - 1].At <= 3 && (byClicks || uses[uses.Count - 1].ForQuest) &&
+                                     !kills.Exists(k => k.At > uses[uses.Count - 1].At))
+                            {
+                                lastCounted = new List<Use> { uses[uses.Count - 1] };
+                                uses.RemoveAt(uses.Count - 1);
+                            }
+                            if (lastCounted != null)
+                            {
+                                var cs3 = new Step { Kind = "Use", Gate = cg, Comment = cw, Quest = e.QuestId, At = t, Branch = e.Branch.ToString(CultureInfo.InvariantCulture) };
+                                foreach (Use lu in lastCounted)
+                                {
+                                    cs3.Lines.AddRange(UseAt(lu.Name, lu.Pos, lu.Stand, cids));
+                                    consumed[UseKey(lu.Id, lu.Pos)] = t;
+                                }
+                                steps.Insert(insertAt, cs3);
+                                finalAt[e.QuestId] = t; // done by that click: no extra last click or last fight
+                            }
+                            countsSeen[pre + shortTask] = new[] { shortMax, shortMax };
+                        }
                         // Finished by your last kill or use, with no count tick in between.
                         double fin;
                         bool ticked = finalAt.TryGetValue(e.QuestId, out fin) && t - fin <= 3.0; // a finishing tick ~1.2 s before the reward window
-                        if (!ticked && !(talk != null && t - talkAt <= 20))
+                        // a weekly whose count only other missions' ends move, ending with one of them (the 5th heroic done): that
+                        // mission's own end did it - not its last click, fight or talk
+                        bool byOther = metaSteps.Contains(q + "|" + e.Step.ToString(CultureInfo.InvariantCulture)) && OtherEndNear(events, hiddenQuests, e.QuestId, t);
+                        if (byOther)
+                            ticked = true;
+                        // a scene that started by itself right after your last kill (a boss that talks once beaten): the kill finished
+                        // it - unless the last step was to speak to someone
+                        string endText;
+                        double killEnd = KillMoment(kills, sceneAfterKillAt, convos, t);
+                        if (killEnd < t && stepText.TryGetValue(e.QuestId, out endText) && NpcFromStepText(endText) != null)
+                            killEnd = t;
+                        bool scene = killEnd < t;
+                        // (a talk you started by clicking them counts until it ends, when you clicked nothing after it)
+                        bool talked = !scene && !byOther && talk != null && !UsedUp(talk, consumed, t) &&
+                                      (t - talkAt <= 20 || (talkClicked && !talkGave && SceneOn(convos, talkAt, t) && !uses.Exists(uc => uc.At > talkAt + 1)));
+                        // finished in a holocom call that came after any talk (a class mission's last "use your holocom"): the bot answers it
+                        // (not when a kill right before it or a click after the call did it)
+                        bool byCall = !ticked && !scene && holoAt > -1e8 && holoAt > talkAt && (t - holoAt <= 20 || CallLasted(convos, holoAt, t) || e.Note == How.Holocom) &&
+                                      (holoQuest == 0 || holoQuest == e.QuestId || hiddenQuests.Contains(holoQuest) || Math.Abs(holoQuestAt - holoAt) > 30) &&
+                                      !(kills.Count > 0 && t - kills[kills.Count - 1].At <= 3) && !uses.Exists(uc => uc.At > holoAt + 1);
+                        if (byCall)
+                            talked = false;
+                        if (!ticked && !talked && !byCall)
                         {
                             string doneGate = "HasQuest(" + q + ") and not IsQuestComplete(" + q + ")";
                             Use lastUse = uses.Count > 0 && t - uses[uses.Count - 1].At <= 3 ? uses[uses.Count - 1] : null;
                             if (lastUse == null && uses.Count > 0)
                             {
                                 // the last thing you clicked before the reward came up (no kill after it)
-                                Use lastClick = uses.FindLast(u => t - u.At <= 60);
+                                Use lastClick = uses.FindLast(u => t - u.At <= (u.ForQuest ? 60 : 10));
                                 if (lastClick != null && (kills.Count == 0 || kills[kills.Count - 1].At < lastClick.At))
                                     lastUse = lastClick;
                             }
-                            if (kills.Count > 0 && t - kills[kills.Count - 1].At <= 3 && (lastUse == null || lastUse.At < kills[kills.Count - 1].At))
+                            if (kills.Count > 0 && killEnd - kills[kills.Count - 1].At <= 3 && (lastUse == null || lastUse.At < kills[kills.Count - 1].At))
                             {
-                                double from = Math.Min(fightAt, t - 3);
+                                double from = Math.Min(fightAt, killEnd - 3);
                                 var g = new Step { Kind = "Grind", Gate = doneGate, Comment = e.QuestName + ": last fight", Quest = e.QuestId,
                                                    Kills = kills.FindAll(k => k.At >= from - 1) };
-                                // the thing you clicked that brought the boss out (Kregg's Locker draws Kregg out)
+                                // the thing you clicked that brought the boss out (Kregg's Locker draws Kregg out), also when that click
+                                // was a pick-up (the Field Generator gives Research Cancellation and brings out its commander)
                                 Use spawner = uses.FindLast(u => u.At <= fightAt + 1 && fightAt - u.At <= 15);
+                                bool fromGiver = false;
+                                if (spawner == null && giverUse != null && giverUse.At >= fightAt - 15 && fightAt >= giverUse.At - 1 && giverUse.At <= t && g.Kills.Exists(k => k.Pos.DistanceTo(giverUse.Pos) <= 1f))
+                                {
+                                    spawner = giverUse;
+                                    fromGiver = true;
+                                }
+                                // or the mission item you used right before it (a lure, a totem): used once first
+                                Use preFight = spawner == null ? PreFightItem(itemOrder, g.Kills, mobSeen, allKills, fightAt) : null;
+                                // or an object you used or attacked mid-fight, after which its boss came out next to it (the Field
+                                // Generator attacked in the middle of the fight brings out the commander)
+                                if (spawner == null && preFight == null)
+                                    spawner = MidFightSpawner(fightUses, consumed, g.Kills, allKills, fightAt, fightMobs);
                                 if (spawner != null)
                                 {
-                                    g.Lines.AddRange(UseAt(spawner.Name, spawner.Pos, spawner.Stand, " QuestId=\"" + q + "\""));
+                                    // walked up to from where you stood and clicked once, not clicked again and again during the fight
+                                    g.Lines.Add("<ClickObject QuestId=\"" + q + "\" Name=\"" + A(spawner.Name) + "\" XYZ=\"" + X(spawner.Pos) + "\" Stand=\"" +
+                                                X(spawner.Stand.IsZero ? spawner.Pos : spawner.Stand) + "\" Fight=\"True\" />");
                                     g.Comment = e.QuestName + ": click " + spawner.Name + ", then the last fight";
-                                    uses.Remove(spawner);
+                                    if (fromGiver)
+                                        giverUse = null;
+                                    else
+                                    {
+                                        uses.Remove(spawner);
+                                        fightUses.Remove(spawner);
+                                    }
+                                }
+                                else if (preFight != null)
+                                {
+                                    g.Lines.AddRange(PreFightLines(preFight, q));
+                                    g.Comment = e.QuestName + ": use " + preFight.Name + ", then the last fight";
+                                    AddNote(g, "uses " + preFight.Name + " first, as you did right before this fight");
+                                    itemOrder.Remove(preFight);
                                 }
                                 steps.Add(g);
                                 kills.Clear();
@@ -2464,22 +4321,65 @@ namespace QuestRecorder
                                 u.Lines.AddRange(UseAt(lastUse.Name, lastUse.Pos, lastUse.Stand, " QuestId=\"" + q + "\""));
                                 steps.Add(u);
                                 uses.Remove(lastUse);
+                                fightUses.Remove(lastUse);
                             }
                         }
                         var s = new Step { Kind = "Complete", Quest = e.QuestId, Comment = "Reward: " + e.QuestName };
                         // Handed in to someone you were talking to.
                         ObjRef by = null;
-                        if (talk != null && t - talkAt <= 20)
+                        if (talked)
                             by = talk;
-                        else if (e.Target != null && e.Target.Name.Length > 0 && e.Note.IndexOf("clicked", StringComparison.OrdinalIgnoreCase) < 0 &&
-                                 e.Note.IndexOf("talk", StringComparison.OrdinalIgnoreCase) >= 0)
+                        else if (!scene && !byCall && !byOther && e.Target != null && e.Target.Name.Length > 0 && !IsCompanion(e.Target) && e.Note.IndexOf("clicked", StringComparison.OrdinalIgnoreCase) < 0 &&
+                                 e.Note.IndexOf("talk", StringComparison.OrdinalIgnoreCase) >= 0 && !UsedUp(e.Target, consumed, t))
                             by = e.Target;
+                        bool byExact = by != null; // (a spot the game gave, not one guessed from the step text)
+                        // the talk was credited to an object you had already used (older recordings): the NPC you had selected then, standing
+                        // where you finished it
+                        bool talkUsedUp = !scene && !byCall && !byOther && ((talk != null && t - talkAt <= 20 && UsedUp(talk, consumed, t)) ||
+                                          (e.Note.IndexOf("talk", StringComparison.OrdinalIgnoreCase) >= 0 && UsedUp(e.Target, consumed, t)));
+                        if (by == null && talkUsedUp && targetNpc != null && Math.Abs(targetNpcAt - talkAt) <= 10 && targetNpc.HasPos && !e.Pos.IsZero &&
+                            targetNpc.Pos.DistanceTo(e.Pos) <= 1f && !killedNames.Contains(targetNpc.Name) && !followers.Contains(targetNpc.Name))
+                            by = targetNpc;
+                        if (by == null && talkUsedUp)
+                        {
+                            // no NPC selected: the NPC the last step named ("Speak to Tookreek"), where you clicked them or where you finished
+                            string lastText;
+                            string named = stepText.TryGetValue(e.QuestId, out lastText) ? NpcFromStepText(lastText) : null;
+                            if (named != null && !killedNames.Contains(named))
+                            {
+                                Vec3 np;
+                                bool seenAt = npcSpots.TryGetValue(named, out np);
+                                bool obj = named.IndexOf("Dropbox", StringComparison.OrdinalIgnoreCase) >= 0;
+                                by = new ObjRef { Name = named, Kind = obj ? ObjKind.Placeable : ObjKind.Npc, Pos = seenAt ? np : e.Pos, HasPos = seenAt || !e.Pos.IsZero };
+                                AddNote(s, "the talk was credited to something you had already used: handed in to " + named + ", named by the step");
+                            }
+                            else
+                                AddNote(s, "the talk was credited to something you had already used, and no NPC was found: no hand-in written");
+                            s.Unsure = true;
+                        }
                         if (by != null)
                         {
                             s.Gate = "HasQuest(" + q + ") and not IsQuestComplete(" + q + ")";
                             s.Quest = e.QuestId;
-                            s.Lines.Add("<TurnInQuest QuestName=\"" + A(e.QuestName) + "\" QuestId=\"" + q + "\"" + (by.Kind == ObjKind.Placeable ? " SearchRadius=\"20\" UseRange=\"20\"" : string.Empty) +
+                            // an object with a same-name twin close by is pinned to its own spot, like its pick-up (SearchRadius is squared:
+                            // 20 also takes the twin up to 4.5 away)
+                            string turnRadius = TurnInPinnedTwin && byExact && by.HasPos && TwinWithin(by.Name, by.Pos, 4.5f) ? "0.001" : "20";
+                            s.Lines.Add("<TurnInQuest QuestName=\"" + A(e.QuestName) + "\" QuestId=\"" + q + "\"" + (by.Kind == ObjKind.Placeable ? " Type=\"Placeable\" SearchRadius=\"" + turnRadius + "\" UseRange=\"20\"" : string.Empty) +
                                         " TurnInName=\"" + A(by.Name) + "\" XYZ=\"" + X(by.HasPos ? by.Pos : e.Pos) + "\" />");
+                        }
+                        else if (byCall)
+                        {
+                            // (answered only while the quest is still open: the call is what finishes it)
+                            s.Lines.Add("<If Condition=\"HasQuest(" + q + ") and not IsQuestComplete(" + q + ")\"><AnswerHolocomCall QuestName=\"" + A(e.QuestName) + "\" QuestId=\"" + q + "\" /></If>");
+                            AddNote(s, "it ended in a holocom call: the bot answers it, then takes the reward");
+                            holoAt = -1e9;
+                        }
+                        if (scene)
+                        {
+                            // that scene is spent: not a talk a later step or hand-in was done with
+                            if (talk != null && talkAt == sceneAfterKillAt)
+                                talk = null;
+                            sceneAfterKillAt = -1e9;
                         }
                         // Take the reward right here, where you did (CZ-198: the quest leaves your log the moment it's
                         // done while its reward waits, so "HasQuest" skipped this and every reward came at the end).
@@ -2491,7 +4391,7 @@ namespace QuestRecorder
                         if (s.Gate == null)
                         {
                             s.Gate = "(HasQuest(" + q + ") and not IsQuestComplete(" + q + ")) or " + RewardWaiting(q);
-                            s.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"3\" />");
+                            s.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"" + (byCall ? "5" : "3") + "\" />");
                         }
                         else
                             s.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"5\" />");
@@ -2516,64 +4416,114 @@ namespace QuestRecorder
 
             if (pendingRide != null)
                 steps.Remove(pendingRide); // the recording ended before you came out of the lift
+            foreach (Step made in steps)
+                if (made.At < -1e8)
+                {
+                    made.At = prevT; // (the steps the last event made: their time, for the board pick below)
+                    if (made.Branch == null && tickQuest != 0 && made.Quest == tickQuest)
+                        made.Branch = tickBranch;
+                }
             // A weekly that was already in your log when you started (Black Hole: you had the weekly, the board only
             // offered the 4 dailies): picked up at the same mission board as the missions you took - marked "not sure"
             // (yellow in the review list), the recording never saw where it came from.
+            // (each weekly at the board of its own area and time: a recording across two daily areas has two boards)
             {
-                string board = null, boardXyz = null, boardRadius = "20";
-                int boardIdx = -1;
+                // the object pick-ups from a mission board / terminal: the game said it came from a board, or the name says so
+                var boards = new List<Step>();
+                var boardArea = new Dictionary<Step, ulong>();
                 for (int i = 0; i < steps.Count; i++)
                 {
-                    if (steps[i].Kind != "Pickup" || steps[i].Lines.Count == 0)
+                    if (steps[i].Kind != "Pickup")
                         continue;
-                    Match bm = Regex.Match(steps[i].Lines[0], "SearchRadius=\"([^\"]+)\" UseRange=\"20\" GiverName=\"([^\"]+)\" XYZ=\"([^\"]+)\"");
-                    if (!bm.Success || (bm.Groups[2].Value.IndexOf("Terminal", StringComparison.OrdinalIgnoreCase) < 0 &&
-                                        bm.Groups[2].Value.IndexOf("Mission", StringComparison.OrdinalIgnoreCase) < 0))
+                    string pl = steps[i].Lines.Find(ln => ln.StartsWith("<PickUp", StringComparison.Ordinal));
+                    if (pl == null || Attr(pl, "SearchRadius").Length == 0 || steps[i].NotBoard)
+                        continue; // an object giver only (and not one the game said gave it by its quest window or a talk)
+                    string gn = Attr(pl, "GiverName"), gq = Attr(pl, "QuestId");
+                    RecEvent added = null;
+                    foreach (RecEvent ev in events)
+                        if (ev.Kind == EvKind.QuestAdded && Fmt.Hex(ev.QuestId) == gq && (added == null || Math.Abs(ev.Elapsed - steps[i].At) < Math.Abs(added.Elapsed - steps[i].At)))
+                            added = ev;
+                    // (the game's "from the board" only when the giver written is that board's own terminal: a board you had
+                    // just closed is also noted for what you clicked next)
+                    bool fromBoard = added != null && added.Note == How.Board && added.Target != null && A(added.Target.Name) == gn;
+                    if (!fromBoard && gn.IndexOf("Terminal", StringComparison.OrdinalIgnoreCase) < 0 && gn.IndexOf("Mission", StringComparison.OrdinalIgnoreCase) < 0)
                         continue; // only a mission board / terminal gives area weeklies
-                    board = bm.Groups[2].Value;
-                    boardXyz = bm.Groups[3].Value; boardRadius = bm.Groups[1].Value;
-                    boardIdx = i;
+                    boards.Add(steps[i]);
+                    boardArea[steps[i]] = added != null ? added.AreaId : 0;
                 }
-                if (board != null)
+                if (boards.Count > 0)
                 {
                     var had = new List<KeyValuePair<ulong, string>>();
+                    var hadAt = new Dictionary<ulong, RecEvent>(); // each one's first move in the recording
                     foreach (RecEvent ev in events)
                     {
-                        if (ev.QuestId == 0 || ev.QuestHidden || hiddenQuests.Contains(ev.QuestId) || picked.Contains(ev.QuestId))
+                        if (ev.QuestId == 0 || ev.QuestHidden || hiddenQuests.Contains(ev.QuestId) || picked.Contains(ev.QuestId) || abandoned.Contains(ev.QuestId))
                             continue;
                         if (ev.Kind != EvKind.QuestTask && ev.Kind != EvKind.QuestStep && ev.Kind != EvKind.QuestCompleted)
                             continue;
                         string nm = ev.QuestName ?? string.Empty;
-                        if (!nm.StartsWith("[WEEKLY", StringComparison.OrdinalIgnoreCase) || had.Exists(h => h.Key == ev.QuestId))
+                        if (!IsWeekly(nm) || had.Exists(h => h.Key == ev.QuestId))
                             continue;
                         had.Add(new KeyValuePair<ulong, string>(ev.QuestId, nm));
+                        hadAt[ev.QuestId] = ev;
                     }
+                    var lastAt = new Dictionary<Step, Step>(); // the step last put after each board
                     foreach (KeyValuePair<ulong, string> h in had)
                     {
+                        // its board: one in the area it moved in (any, if none there), the last one before it first moved (else the first)
+                        RecEvent first = hadAt[h.Key];
+                        List<Step> near = boards.FindAll(b => first.AreaId != 0 && boardArea[b] == first.AreaId);
+                        if (near.Count == 0)
+                            near = boards;
+                        Step bs = near.FindLast(b => b.At <= first.Elapsed) ?? near[0];
+                        string pl = bs.Lines.Find(ln => ln.StartsWith("<PickUp", StringComparison.Ordinal));
+                        string board = Attr(pl, "GiverName"), boardXyz = Attr(pl, "XYZ"), boardRadius = Attr(pl, "SearchRadius");
+                        string boardRange = Attr(pl, "UseRange").Length > 0 ? Attr(pl, "UseRange") : "20";
+                        string boardStand = bs.Lines.Find(ln => ln.StartsWith("<MoveTo", StringComparison.Ordinal)); // where you stood at it
                         string hq = Fmt.Hex(h.Key);
                         weeklies.Add(h.Key);
                         var ws = new Step
                         {
                             Kind = "Pickup",
                             Gate = "(not HasQuest(" + hq + "))",
-                            Comment = "Pick up " + h.Value + " (not sure: it was already in your log when you recorded - picked up at " + System.Net.WebUtility.HtmlDecode(board) + " like your other missions)",
-                            At = steps[boardIdx].At
+                            Comment = "Pick up " + h.Value,
+                            Note = "it was already in your log when you recorded - picked up at " + System.Net.WebUtility.HtmlDecode(board) + " like your other missions",
+                            Unsure = true,
+                            At = bs.At,
+                            Weekly = true,
+                            Board = true
                         };
-                        ws.Lines.Add("<PickUpQuest QuestName=\"" + A(h.Value) + "\" QuestId=\"" + hq + "\" SearchRadius=\"" + boardRadius + "\" UseRange=\"20\" GiverName=\"" + board + "\" XYZ=\"" + boardXyz + "\" />");
-                        steps.Insert(++boardIdx, ws);
+                        if (PickUpOnlyWithRoom)
+                            ws.Gate += " and (" + LogHasRoom + ")";
+                        if (boardStand != null)
+                            ws.Lines.Add(boardStand);
+                        ws.Lines.Add("<PickUpQuest QuestName=\"" + A(h.Value) + "\" QuestId=\"" + hq + "\"" +
+                                     " SearchRadius=\"" + boardRadius + "\" UseRange=\"" + boardRange + "\" GiverName=\"" + board + "\" XYZ=\"" + boardXyz + "\" />");
+                        Step after;
+                        if (!lastAt.TryGetValue(bs, out after))
+                            after = bs;
+                        steps.Insert(steps.IndexOf(after) + 1, ws);
+                        lastAt[bs] = ws;
                     }
                 }
             }
             foreach (Step made in steps)
                 if (made.At < -1e8)
+                {
                     made.At = prevT;
-            ApplyReplies(steps, convos, dark >= light ? "dark" : "light");
+                    if (made.Branch == null && tickQuest != 0 && made.Quest == tickQuest)
+                        made.Branch = tickBranch;
+                }
+            ApplyReplies(steps, convos, dark > light ? "dark" : (light > dark ? "light" : null));
             // The game's own count for each task: if you stopped (or a tick got lost) before the end, the last step of
             // that task still runs until the task is done (19/20 when you stopped -> goes on to 20/20).
             var maxFor = new Dictionary<string, ulong>(StringComparer.Ordinal);
             foreach (RecEvent ev in events)
                 if (ev.Kind == EvKind.QuestTask && ev.Max > 0 && !ev.QuestHidden)
+                {
                     maxFor[Fmt.Hex(ev.QuestId) + ", " + ev.Step + ", " + Math.Max(0, ev.TaskIndex)] = ev.Max;
+                    maxFor[Fmt.Hex(ev.QuestId) + ", " + ev.Step + ", " + Math.Max(0, ev.TaskIndex) + "#" + ev.Branch.ToString(CultureInfo.InvariantCulture)] = ev.Max; // (on that branch)
+                }
             ShareTaskFights(steps);
             CollectSteps(steps, maxFor, scanner);
             var lastOfTask = new Dictionary<string, Step>(StringComparer.Ordinal);
@@ -2583,6 +4533,11 @@ namespace QuestRecorder
                     continue;
                 foreach (Match m in Regex.Matches(s.Gate, @"IsTaskValueGreaterThan\((0x[0-9A-F]+, \d+, \d+), (\d+)\)"))
                     lastOfTask[m.Groups[1].Value] = s;
+                // (another task of the same step the same kills moved: that fight is its last step too, unless a later one is)
+                if (s.AlsoTasks != null)
+                    foreach (string ag in s.AlsoTasks.Values)
+                        foreach (Match m in Regex.Matches(ag, @"IsTaskValueGreaterThan\((0x[0-9A-F]+, \d+, \d+), (\d+)\)"))
+                            lastOfTask[m.Groups[1].Value] = s;
             }
             foreach (KeyValuePair<string, Step> kv in lastOfTask)
             {
@@ -2607,17 +4562,37 @@ namespace QuestRecorder
                 if (s.Also != null)
                     foreach (ulong k in new List<ulong>(s.Also.Keys))
                         s.Also[k] = Regex.Replace(s.Also[k], @"IsTaskValueGreaterThan\(" + Regex.Escape(kv.Key) + @", \d+\)", full);
+                if (s.AlsoTasks != null)
+                    foreach (int k in new List<int>(s.AlsoTasks.Keys))
+                        s.AlsoTasks[k] = Regex.Replace(s.AlsoTasks[k], @"IsTaskValueGreaterThan\(" + Regex.Escape(kv.Key) + @", \d+\)", full);
             }
             KeepBestOfRepeats(steps);
+            // a quest that took another branch right after replies the bot wouldn't pick by itself: said in the review list
+            string pickSide = dark >= light ? "dark" : "light";
+            foreach (KeyValuePair<ulong, double> br in branchedAt)
+            {
+                Convo bc = convos.FindLast(v => v.Picks.Count > 0 && v.Start <= br.Value && br.Value - v.End <= 15);
+                if (bc == null || BotPicksSame(bc, pickSide))
+                    continue;
+                Step bs = steps.Find(st => st.Quest == br.Key && Math.Abs(st.At - br.Value) < 0.05);
+                if (bs == null)
+                    continue;
+                bs.Unsure = true;
+                AddNote(bs, "this quest took another branch after your replies: the profile follows only that branch");
+            }
+            ShareItemTargets(steps, mobSeen, itemSpots);
             // A fight where none of the mobs you killed are on the game's list for that task: say so (yellow in the
             // review list) instead of guessing.
             foreach (Step s in steps)
             {
-                if (s.Kind != "Grind" || s.Targets == null || s.Targets.Count == 0 || s.Kills == null || s.Comment.IndexOf("(not sure", StringComparison.Ordinal) >= 0)
+                if (s.Kind != "Grind" || s.Targets == null || s.Targets.Count == 0 || s.Kills == null || s.Unsure)
                     continue;
                 bool known = s.Kills.Exists(k => k.Spec != 0);
                 if (known && !s.Kills.Exists(k => k.Spec != 0 && s.Targets.Contains(k.Spec)))
-                    s.Comment += " (not sure: the game doesn't count the mobs you killed here for this task)";
+                {
+                    s.Unsure = true;
+                    AddNote(s, "the game doesn't count the mobs you killed here for this task");
+                }
             }
             MergeCountClicks(steps, scanner);
             // a fight roams every spot you killed those mobs at near it, not one spot where it camps the respawn
@@ -2711,10 +4686,30 @@ namespace QuestRecorder
                                                                                   .Replace("</UseItem>", "</UseQuestAbility>");
                         else
                             l = l.Replace(" ItemName=\"" + an + "\"", " AbilityName=\"" + an + "\"" + openAttr);
+                        // the way you faced when you used it (read only by the plain pass: never written into the profile)
+                        float facing;
+                        if (abilityHeading.TryGetValue(Attr(l, "XYZ"), out facing) || abilityHeading.TryGetValue(raw, out facing))
+                            l = l.Replace(" AbilityName=\"" + an + "\"", " AbilityName=\"" + an + "\" Heading=\"" + facing.ToString("0.#", CultureInfo.InvariantCulture) + "\"");
                         s.Lines[li] = l;
                     }
+            HoldLaterStages(steps, questTitles);
             if (trace != null)
             {
+                // the tracker shows the profile's own steps: the new core's, put in as for the profile
+                if (UseCore)
+                {
+                    List<CoreRender.Block> traced = CoreBefore(steps, loaded);
+                    List<string> keepChunks = _codeChunks;
+                    _codeChunks = new List<string>();
+                    try
+                    {
+                        CoreAfter(steps, traced, convos, dark > light ? "dark" : (light > dark ? "light" : null));
+                    }
+                    finally
+                    {
+                        _codeChunks = keepChunks;
+                    }
+                }
                 FillTrace(steps, trace);
                 return string.Empty;
             }
@@ -2727,7 +4722,7 @@ namespace QuestRecorder
                 for (int j = i + 1; j < steps.Count && mission == null; j++)
                 {
                     string title;
-                    if (steps[j].Quest != 0 && questTitles.TryGetValue(steps[j].Quest, out title) && title.StartsWith("[HEROIC", StringComparison.OrdinalIgnoreCase))
+                    if (steps[j].Quest != 0 && questTitles.TryGetValue(steps[j].Quest, out title) && IsHeroic(title))
                     {
                         int close = title.IndexOf(']');
                         mission = (close >= 0 ? title.Substring(close + 1) : title).Trim();
@@ -2742,8 +4737,341 @@ namespace QuestRecorder
                                                          .Replace(HeroicMark, A(full));
             }
             picked.RemoveAll(w => weeklies.Contains(w));
+            // 1.4: the mission steps come from the new core (the game's ids first, run by the step runner); the travel, the
+            // board pick-ups and the end checks come from the steps above
+            CoreWrite.Reset();
+            List<CoreRender.Block> core = UseCore ? CoreBefore(steps, loaded) : null;
             PlainSteps(steps);
+            if (core != null)
+                CoreAfter(steps, core, convos, dark > light ? "dark" : (light > dark ? "light" : null));
+            // Missions that were already in your log when you started recording (the game never said they were added) and
+            // that have steps here but no pick-up: the profile can't know where they come from. At the start, when none of
+            // them is in your log, a window asks you to pick them up and goes on by itself after 2 minutes. (Only when none
+            // is: a bonus the first one opens later isn't in your log yet on a fresh run, and must not hold the bot.)
+            {
+                // (every row as loaded: the rows this builder leaves out, a warzone's, still say a mission was added)
+                var added = new HashSet<ulong>();
+                var title = new Dictionary<ulong, string>();
+                foreach (RecEvent e in loaded)
+                {
+                    if (e.QuestId == 0)
+                        continue;
+                    if (e.Kind == EvKind.QuestAdded)
+                        added.Add(e.QuestId);
+                    if (!string.IsNullOrEmpty(e.QuestName) && !e.QuestName.StartsWith("#", StringComparison.Ordinal))
+                        title[e.QuestId] = e.QuestName;
+                }
+                var had = new List<ulong>();
+                foreach (Step s in steps)
+                {
+                    if (s.Kind == "Pickup")
+                        continue;
+                    ulong q = QuestOf(s);
+                    if (q != 0 && !added.Contains(q) && !weeklies.Contains(q) && !hiddenQuests.Contains(q) && !abandoned.Contains(q) && !had.Contains(q))
+                        had.Add(q);
+                }
+                had.RemoveAll(q => steps.Exists(p => p.Kind == "Pickup" && p.Lines.Exists(l => l.StartsWith("<PickUp", StringComparison.Ordinal) && Attr(l, "QuestId") == Fmt.Hex(q))));
+                if (had.Count > 0)
+                {
+                    var names = new List<string>();
+                    var missing = new List<string>();
+                    foreach (ulong q in had)
+                    {
+                        string nm;
+                        if ((!questTitles.TryGetValue(q, out nm) || string.IsNullOrEmpty(nm) || nm.StartsWith("#", StringComparison.Ordinal)) && !title.TryGetValue(q, out nm))
+                            nm = "a mission with no name";
+                        names.Add(nm);
+                        missing.Add("not HasQuest(" + Fmt.Hex(q) + ")");
+                    }
+                    var ask = new Step { Kind = "Qr", Raw = true, Comment = "Already in your log when you recorded: " + string.Join(", ", names), At = -1e9 };
+                    ask.Lines.Add("<If Condition=\"" + A(string.Join(" and ", missing)) + "\">");
+                    ask.Lines.Add("\t<UserDialog Title=\"Quest Recorder\" Message=\"" + A("Pick up " + string.Join(", ", names) + " first: " +
+                                  (had.Count == 1 ? "it was" : "they were") + " already in your log when you recorded, so this profile doesn't know where " +
+                                  (had.Count == 1 ? "it comes" : "they come") + " from. Press Continue once it's in your log. The bot goes on by itself after 2 minutes.") +
+                                  "\" IsBotContinueAllowed=\"True\" ExpiryTime=\"120\" ExpiryActionName=\"InputEnabled_Continue\" />");
+                    ask.Lines.Add("</If>");
+                    steps.Insert(0, ask);
+                }
+            }
+            // the end check: every mission you picked up and every mission that has a step here (the game's hidden helper
+            // missions and missions you already had when you started recording have steps but no pick-up); never a weekly
+            foreach (Step s in steps)
+            {
+                if (s.Kind == "Pickup")
+                    continue;
+                ulong q = QuestOf(s);
+                if (q != 0 && !picked.Contains(q) && !weeklies.Contains(q))
+                    picked.Add(q);
+            }
             return Render(steps, picked, profileName, fileName, recordingName, dark > light ? "Dark" : (light > dark ? "Light" : null), vendors, completedOrder);
+        }
+
+        /// <summary>The new core (1.4) writes the mission steps. Off: the old builder's own steps (kept for comparison only).</summary>
+        public static bool UseCore = true;
+
+        /// <summary>Where the combat logs are (null = the game's own CombatLogs folder in Documents).</summary>
+        public static string[] CoreLogFolders;
+
+        /// <summary>The last profile's coverage line ("52 mission steps, 47 of them tied to what you did by the game's own ids ...").</summary>
+        [ThreadStatic] public static string LastCoverage;
+
+        /// <summary>
+        /// The new core's mission steps, and the steps above that stay: travel (routes, doors, ships, lifts), board pick-ups
+        /// (BuddyCron's TakeFromBoard hook), and the old steps of any quest the new core has nothing for. Every other mission
+        /// step of the steps above is taken out (before PlainSteps, so they leave no code behind).
+        /// </summary>
+        private static List<CoreRender.Block> CoreBefore(List<Step> steps, IList<RecEvent> events)
+        {
+            CoreFacts c = CoreFacts.Build(new List<RecEvent>(events), CoreLogFolders ?? new[] { CombatLog.Folder() });
+            List<CoreStep> core = CoreSteps.Build(c);
+            CoreRender.RewardWaiting = RewardWaiting;
+            List<CoreRender.Block> blocks = CoreWrite.Blocks(c, core);
+            var coreQuests = new HashSet<ulong>();
+            var coreEnds = new HashSet<ulong>();
+            var corePickups = new HashSet<string>(StringComparer.Ordinal);
+            foreach (CoreRender.Block b in blocks)
+            {
+                coreQuests.Add(b.Quest);
+                StepKind k = b.Step.Kind;
+                if (k == StepKind.HandIn || k == StepKind.Reward || (k == StepKind.Holocom && b.Step.Task < 0))
+                    coreEnds.Add(b.Quest);
+                if (k == StepKind.Pickup)
+                    corePickups.Add(Fmt.Hex(b.Quest));
+            }
+            var boardQuests = new HashSet<string>(StringComparer.Ordinal);
+            steps.RemoveAll(s =>
+            {
+                switch (s.Kind)
+                {
+                    case "Route":
+                        return false;
+                    case "Ride":
+                        // a mission item hop: only the new core's (found by its use ability, tied to the mission step it was
+                        // used on, bounded). One the core did not make is not a mission's transport: a consumable used just
+                        // before you were moved (a Warzone Medpac before a warzone ended), or a hop with no mission at all.
+                        return s.Comment.StartsWith("Mission item:", StringComparison.Ordinal);
+                    case "Pickup":
+                    {
+                        string pl = s.Lines.Find(l => l.StartsWith("<PickUp", StringComparison.Ordinal) || l.StartsWith("<TalkAndReply", StringComparison.Ordinal));
+                        string q = pl != null ? Attr(pl, "QuestId") : string.Empty;
+                        if (pl != null && pl.StartsWith("<PickUp", StringComparison.Ordinal) && IsBoardPickUp(s, pl))
+                        {
+                            boardQuests.Add(q);
+                            return false; // kept: BuddyCron's TakeFromBoard hook at the board
+                        }
+                        return q.Length > 0 && corePickups.Contains(q);
+                    }
+                    case "Complete":
+                        return coreEnds.Contains(s.Quest); // (a quest end the new core did not see keeps the old reward step)
+                    default:
+                        ulong sq = QuestOf(s);
+                        return sq == 0 || coreQuests.Contains(sq); // (a quest the new core has nothing for keeps its old steps)
+                }
+            });
+            // a board pick-up the steps above have: theirs (it moves on when the board doesn't list the mission)
+            blocks.RemoveAll(b => b.Step.Kind == StepKind.Pickup && b.Board && boardQuests.Contains(Fmt.Hex(b.Quest)));
+            int no = 0;
+            foreach (CoreRender.Block b in blocks)
+                if (b.No > 0)
+                    b.No = ++no; // (numbered again without the board pick-ups taken out)
+            LastCoverage = CoreRender.Coverage(blocks);
+            if (LastCoverage.Length > 0 && c.Log.Count == 0)
+                LastCoverage += " No combat log was written while you recorded: turn on \"Enable Combat Logging\" in the game's Preferences (Combat Logging) for a better profile.";
+            return blocks;
+        }
+
+        /// <summary>The quest a step of the steps above is for (its own, else the first HasQuest of its gate); 0 = none.</summary>
+        private static ulong QuestOf(Step s)
+        {
+            if (s.Quest != 0)
+                return s.Quest;
+            Match m = Regex.Match(s.Gate ?? string.Empty, @"HasQuest\(0x([0-9A-F]+)\)");
+            ulong q;
+            return m.Success && ulong.TryParse(m.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out q) ? q : 0;
+        }
+
+        /// <summary>
+        /// The new core's steps put in among the steps that stayed, by the time you did them (travel first when they are close),
+        /// with your replies on the talks. Their board pick-ups, one-use items, item rows and abilities go through the plain
+        /// pass like the steps above (BuddyCron's own steps, and a Hook only for those three).
+        /// </summary>
+        private static void CoreAfter(List<Step> steps, List<CoreRender.Block> blocks, List<Convo> convos, string side)
+        {
+            var made = new List<Step>();
+            int replyNo = 900;
+            foreach (CoreRender.Block b in blocks)
+            {
+                bool pickup = b.Step.Kind == StepKind.Pickup;
+                var s = new Step { Kind = pickup ? "Pickup" : "Qr", Raw = true, Gate = b.No > 0 ? b.Gate : null, Quest = pickup ? 0 : b.Quest, At = b.At,
+                                   Board = b.Board, Comment = (b.No > 0 ? b.No.ToString(CultureInfo.InvariantCulture) + ". " : string.Empty) + b.Label };
+                foreach (string l in b.Run)
+                    s.Lines.Add(l.TrimStart('\t'));
+                foreach (string u in b.Unsure)
+                    AddNote(s, u);
+                s.Unsure = b.Yellow;
+                s.What = b.What;
+                if (b.Talk.Length > 0 && b.Run.Count > 0)
+                    CoreReplies(s, b, convos, side, ref replyNo);
+                foreach (string l in b.After)
+                    s.Lines.Add(l.TrimStart('\t'));
+                made.Add(s);
+            }
+            PlainSteps(made, false);
+            foreach (Step s in made)
+            {
+                // a walk inside a mission step is where you walked: never a quick travel (Shadow Spawn's 10 m that came back
+                // as a quick travel to Kaas City, Section X's 35 m one to Crag Outpost)
+                for (int i = 0; i < s.Lines.Count; i++)
+                    s.Lines[i] = Regex.Replace(s.Lines[i], "<MoveTo [^>]*>", m => m.Value.Contains("QuickTravel=") ? m.Value : m.Value.Replace(" XYZ=\"", " QuickTravel=\"False\" XYZ=\""));
+                Indent(s.Lines);
+            }
+            // the steps that stayed, each no later than any after it (a weekly pick-up put in next to its board keeps its place)
+            var eff = new double[steps.Count];
+            double min = double.MaxValue;
+            for (int i = steps.Count - 1; i >= 0; i--)
+            {
+                min = Math.Min(min, steps[i].At);
+                eff[i] = min;
+            }
+            var all = new List<Step>();
+            int k = 0;
+            for (int i = 0; i < steps.Count; i++)
+            {
+                while (k < made.Count && made[k].At < eff[i] - 1.5)
+                    all.Add(made[k++]);
+                all.Add(steps[i]);
+            }
+            while (k < made.Count)
+                all.Add(made[k++]);
+            steps.Clear();
+            steps.AddRange(all);
+        }
+
+        /// <summary>Each line inside an If or a While one tab further in (the lines are BuddyCron's own, one tag a line).</summary>
+        private static void Indent(List<string> lines)
+        {
+            int depth = 0;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                string l = lines[i].TrimStart('\t');
+                bool close = l.StartsWith("</If>", StringComparison.Ordinal) || l.StartsWith("</While>", StringComparison.Ordinal);
+                if (close && depth > 0)
+                    depth--;
+                lines[i] = new string('\t', depth) + l;
+                bool open = (l.StartsWith("<If ", StringComparison.Ordinal) && !l.EndsWith("</If>", StringComparison.Ordinal) && !l.EndsWith("/>", StringComparison.Ordinal)) ||
+                            (l.StartsWith("<While ", StringComparison.Ordinal) && !l.EndsWith("</While>", StringComparison.Ordinal) && !l.EndsWith("/>", StringComparison.Ordinal));
+                if (open)
+                    depth++;
+            }
+        }
+
+        /// <summary>
+        /// Every plain walk of the steps above (a MoveTo between the mission steps: to a board, off a lift, through a door)
+        /// becomes a runner walk (CoreRender.Walk): a time limit, a give-up when the way can't be found, the stuck watchdog
+        /// and the mount rule, where BuddyCron's MoveTo waits for ever. In a run of walks one after another, a walk back to
+        /// where an earlier one went (within 10 m) leaves out the round trip in between, and two walks to the same spot are
+        /// one (the later one's name).
+        /// </summary>
+        private static List<CoreRender.Block> CoreWalks(List<Step> steps, List<CoreRender.Block> blocks)
+        {
+            var walks = new List<CoreRender.Block>();
+            int no = 0;
+            foreach (CoreRender.Block b in blocks)
+                no = Math.Max(no, b.No);
+            foreach (Step s in steps)
+            {
+                if (s.Kind == "Qr")
+                    continue;
+                var outLines = new List<string>();
+                bool changed = false;
+                int i = 0;
+                while (i < s.Lines.Count)
+                {
+                    string indent, name, ind2, n2;
+                    Vec3 at, a2;
+                    if (!PlainWalk(s.Lines[i], out indent, out name, out at))
+                    {
+                        outLines.Add(s.Lines[i]);
+                        i++;
+                        continue;
+                    }
+                    var run = new List<KeyValuePair<string, Vec3>>();
+                    int j = i;
+                    while (j < s.Lines.Count && PlainWalk(s.Lines[j], out ind2, out n2, out a2) && ind2 == indent)
+                    {
+                        int back = run.FindIndex(r => r.Value.DistanceTo(a2) < 1f);
+                        if (back >= 0)
+                            run.RemoveRange(back, run.Count - back);
+                        run.Add(new KeyValuePair<string, Vec3>(n2, a2));
+                        j++;
+                    }
+                    foreach (KeyValuePair<string, Vec3> r in run)
+                    {
+                        CoreRender.Block w = CoreRender.Walk(++no, r.Key, r.Value);
+                        walks.Add(w);
+                        foreach (string l in w.Run)
+                            outLines.Add(indent + l);
+                    }
+                    changed = true;
+                    i = j;
+                }
+                if (changed)
+                {
+                    s.Lines.Clear();
+                    s.Lines.AddRange(outLines);
+                }
+            }
+            return walks;
+        }
+
+        /// <summary>A plain walk line: exactly &lt;MoveTo QuestId="1" Name="..." XYZ="x,y,z" /&gt; (any other MoveTo is left as it is).</summary>
+        private static bool PlainWalk(string line, out string indent, out string name, out Vec3 at)
+        {
+            indent = name = string.Empty;
+            at = default(Vec3);
+            Match m = Regex.Match(line ?? string.Empty, "^(\\t*)<MoveTo QuestId=\"1\" Name=\"([^\"]*)\" XYZ=\"([^\"]*)\" />$");
+            if (!m.Success || !FiniteXyz(m.Groups[3].Value) || !TryVec(m.Groups[3].Value, out at))
+                return false;
+            indent = m.Groups[1].Value;
+            name = System.Net.WebUtility.HtmlDecode(m.Groups[2].Value);
+            return true;
+        }
+
+        /// <summary>
+        /// Your replies in that talk: the bot answers by the profile's side (its ForceAlignment). Replies the bot would pick
+        /// the same need nothing; other picks are a reply hook when reply picks are on, else a note. (No TempConvoSkip: BuddyCron
+        /// never ends it, so nothing after it would run.)
+        /// </summary>
+        private static void CoreReplies(Step s, CoreRender.Block b, List<Convo> convos, string side, ref int replyNo)
+        {
+            Convo c = convos.FindLast(v => v.Partner == b.Talk && v.Start <= b.At + 1 && b.At - v.End <= 30);
+            if (c == null || c.Picks.Count == 0 || c.Picks.Contains("?"))
+                return; // no wheel, or a pick the recorder didn't see: the bot answers by the profile's side
+            var sides = new HashSet<string>();
+            bool asBot = true;
+            for (int i = 0; i < c.Picks.Count; i++)
+            {
+                string align = c.Picks[i].Substring(c.Picks[i].IndexOf(' ') + 1);
+                if (align == "light" || align == "dark")
+                    sides.Add(align);
+                if (i >= c.Wheels.Count || AutoPick(c.Wheels[i], align == "light" || align == "dark" ? align : side ?? "neutral") != c.Picks[i])
+                    asBot = false;
+            }
+            if (asBot && (sides.Count == 0 || (sides.Count == 1 && sides.Contains(side ?? string.Empty))))
+                return; // the bot picks the same (the profile's side)
+            var nums = c.Picks.ConvertAll(p => p.Substring(0, p.IndexOf(' ')));
+            string hook = ReplayReplyPicks ? ReplyHook(string.Join(",", nums.ToArray()), ++replyNo, X(b.TalkAt)) : null;
+            if (hook != null)
+            {
+                s.Lines.Insert(0, "<Hook Name=\"" + hook + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
+                s.Lines.Add("<Hook Name=\"" + hook + "\" Operation=\"R\" Location=\"TreeStart\" />");
+                AddNote(s, "your replies: " + string.Join(", ", c.Picks.ToArray()));
+            }
+            else
+            {
+                s.Unsure = true;
+                AddNote(s, "your replies (not kept, the bot answers by its side): " + string.Join(", ", c.Picks.ToArray()));
+            }
         }
 
         /// <summary>Walk points collected so far become a route step before what comes next.</summary>
@@ -2751,7 +5079,7 @@ namespace QuestRecorder
         {
             if (markers.Count == 0)
                 return;
-            var route = new Step { Kind = "Route", Comment = "Your route" };
+            var route = new Step { Kind = "Route", Comment = "Walk" };
             AddRoute(route, markers);
             steps.Add(route);
             markers.Clear();
@@ -2760,8 +5088,30 @@ namespace QuestRecorder
         /// <summary>Writes walk points as route lines (lift rides become UseTransport).</summary>
         private static void AddRoute(Step route, List<KeyValuePair<string, Vec3>> markers)
         {
-            foreach (KeyValuePair<string, Vec3> m in markers)
+            // a door / phase you went through: the route runs only while you're still on the side you came from
+            var doors = new List<KeyValuePair<int, string>>(); // the "Came out here" point of each door, and its "not through yet" test
+            for (int i = 0; i + 1 < markers.Count; i++)
+                if (markers[i].Key == "Before the door / phase" && markers[i + 1].Key == "Came out here")
+                    doors.Add(new KeyValuePair<int, string>(i + 1, DoorSide(markers[i].Value, markers[i + 1].Value)));
+            if (doors.Count > 0)
             {
+                var sides = new List<string>();
+                foreach (KeyValuePair<int, string> d in doors)
+                    sides.Add(d.Value);
+                route.Side = sides.Count == 1 ? sides[0] : "(" + string.Join(" or ", sides) + ")";
+                route.Comment = "Through the door";
+            }
+            // more than one door: each door's part of the walk runs only while you're still before that door
+            int door = 0;
+            bool inPart = false;
+            for (int mi = 0; mi < markers.Count; mi++)
+            {
+                KeyValuePair<string, Vec3> m = markers[mi];
+                if (doors.Count > 1 && door < doors.Count && !inPart)
+                {
+                    route.Lines.Add("<If Condition=\"" + doors[door].Value + "\">");
+                    inPart = true;
+                }
                 if (m.Key.StartsWith(RideKey, StringComparison.Ordinal))
                 {
                     string[] wd = m.Key.Substring(RideKey.Length).Split('|');
@@ -2769,6 +5119,12 @@ namespace QuestRecorder
                 }
                 else
                     route.Lines.Add("<MoveTo QuestId=\"1\" Name=\"" + A(m.Key) + "\" XYZ=\"" + X(m.Value) + "\" />");
+                if (inPart && mi == doors[door].Key)
+                {
+                    route.Lines.Add("</If>");
+                    inPart = false;
+                    door++;
+                }
             }
         }
 
@@ -2800,6 +5156,15 @@ namespace QuestRecorder
             if (_sameName == null || !_sameName.TryGetValue(name, out spots))
                 return false;
             return spots.Exists(p => p.DistanceTo(pos) > 0.1f && p.DistanceTo(pos) < 1f);
+        }
+
+        /// <summary>Another object with the same name was seen within this distance of this one (not that one itself).</summary>
+        private static bool TwinWithin(string name, Vec3 pos, float far)
+        {
+            List<Vec3> spots;
+            if (_sameName == null || !_sameName.TryGetValue(name, out spots))
+                return false;
+            return spots.Exists(p => p.DistanceTo(pos) > 0.01f && p.DistanceTo(pos) <= far);
         }
 
         private static List<string> UseAt(string name, Vec3 pos, Vec3 stand, string ids)
@@ -2834,6 +5199,13 @@ namespace QuestRecorder
                 string name = SingleUseObject(s);
                 if (name == null || s.Gate.IndexOf("IsTaskValueGreaterThan", StringComparison.Ordinal) < 0)
                     continue; // a run starts with a count
+                // that count's quest, step and task: a run is one task (two pylons of one name for two tasks of a step are
+                // two steps - one UseObject done by either would leave the other task undone; the next step's count of the
+                // same object is the next step)
+                Match tk = Regex.Match(s.Gate, @"IsTaskValueGreaterThan\((0x[0-9A-F]+), (\d+), (\d+), \d+\)");
+                if (!tk.Success)
+                    continue;
+                string sameTask = "IsTaskValueGreaterThan(" + tk.Groups[1].Value + ", " + tk.Groups[2].Value + ", " + tk.Groups[3].Value + ", ";
                 // the run of steps for the same quest clicking the same kind of object
                 var run = new List<Step> { s };
                 for (int j = i + 1; j < steps.Count; j++)
@@ -2843,9 +5215,17 @@ namespace QuestRecorder
                         continue;
                     if (n.Quest != s.Quest || SingleUseObject(n) != name)
                         break;
+                    // the click that finished this step ends the run (same step, and same branch when known)
+                    Match fin = Regex.Match(n.Gate, @"IsBranchStepComplete\((0x[0-9A-F]+), (\d+), (\d+)\)");
+                    bool ends = fin.Success && fin.Groups[1].Value == tk.Groups[1].Value && fin.Groups[3].Value == tk.Groups[2].Value &&
+                                (s.Branch == null || fin.Groups[2].Value == s.Branch);
+                    if (!ends && n.Gate.IndexOf(sameTask, StringComparison.Ordinal) < 0)
+                        break; // another task, or another step
+                    if (!ends && s.Branch != null && n.Branch != null && n.Branch != s.Branch)
+                        break; // the same numbers on another branch
                     run.Add(n);
-                    if (n.Gate.IndexOf("IsBranchStepComplete", StringComparison.Ordinal) >= 0)
-                        break; // the click that finished the step ends the run
+                    if (ends)
+                        break;
                 }
                 // only the spots you clicked: nothing added from elsewhere (no scanner spots)
                 var scanned = new List<Vec3>();
@@ -2911,6 +5291,186 @@ namespace QuestRecorder
             return true;
         }
 
+        /// <summary>An "x,y,z" of three plain finite numbers (a Hook's code writes them as float literals).</summary>
+        private static bool FiniteXyz(string xyz)
+        {
+            Vec3 v;
+            if (!TryVec(xyz, out v) || !float.IsFinite(v.X) || !float.IsFinite(v.Y) || !float.IsFinite(v.Z))
+                return false;
+            foreach (string p in xyz.Split(','))
+                if (!Regex.IsMatch(p.Trim(), @"^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$"))
+                    return false;
+            return true;
+        }
+
+        /// <summary>
+        /// Staged bonus missions ("Stage 1 - X", "Stage 2 - X", "Final Stage - X"): a later stage's steps wait until every
+        /// earlier stage is done (the Final Stage boss only comes out after Stage 2). When other steps come between the last
+        /// step of a stage and the last step of the next one, that last step is tried again right before it.
+        /// </summary>
+        private static void HoldLaterStages(List<Step> steps, Dictionary<ulong, string> titles)
+        {
+            var chains = new Dictionary<string, List<KeyValuePair<int, ulong>>>(StringComparer.OrdinalIgnoreCase);
+            foreach (KeyValuePair<ulong, string> kv in titles)
+            {
+                Match m = Regex.Match(kv.Value ?? string.Empty, @"^\s*(?:\[[^\]]*\]\s*)?(?:Stage\s+(\d+)|Final\s+Stage)\s*-\s*(.+?)\s*$", RegexOptions.IgnoreCase);
+                if (!m.Success)
+                    continue;
+                int no;
+                if (!m.Groups[1].Success || !int.TryParse(m.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out no))
+                    no = int.MaxValue; // the final stage
+                List<KeyValuePair<int, ulong>> chain;
+                if (!chains.TryGetValue(m.Groups[2].Value, out chain))
+                    chains[m.Groups[2].Value] = chain = new List<KeyValuePair<int, ulong>>();
+                chain.Add(new KeyValuePair<int, ulong>(no, kv.Key));
+            }
+            foreach (List<KeyValuePair<int, ulong>> chain in chains.Values)
+            {
+                if (chain.Count < 2)
+                    continue;
+                chain.Sort((a, b) => a.Key.CompareTo(b.Key));
+                string hold = string.Empty;
+                for (int k = 1; k < chain.Count; k++)
+                {
+                    ulong prev = chain[k - 1].Value, cur = chain[k].Value;
+                    string ph = Fmt.Hex(prev);
+                    hold += " and not (HasQuest(" + ph + ") and not IsQuestComplete(" + ph + "))";
+                    // other steps came between: the earlier stage's last step again, right before the later stage's last one
+                    int lastEarlier = steps.FindLastIndex(s => s.Quest == prev && s.Gate != null && s.Kind != "Pickup" && s.Kind != "Complete");
+                    int lastLater = steps.FindLastIndex(s => s.Quest == cur && s.Gate != null && s.Kind != "Pickup" && s.Kind != "Complete");
+                    if (lastEarlier >= 0 && lastLater > lastEarlier)
+                    {
+                        bool between = false;
+                        for (int j = lastEarlier + 1; j < lastLater; j++)
+                            if (steps[j].Quest != prev && steps[j].Quest != cur && steps[j].Kind != "Complete" && steps[j].Kind != "Route" && steps[j].Kind != "Ride")
+                                between = true;
+                        if (between)
+                        {
+                            Step src = steps[lastEarlier];
+                            var copy = new Step
+                            {
+                                Kind = src.Kind, Gate = src.Gate, Comment = src.Comment, Quest = src.Quest, Task = src.Task, Targets = src.Targets,
+                                Kills = src.Kills != null ? new List<Kill>(src.Kills) : null,
+                                Also = src.Also != null ? new Dictionary<ulong, string>(src.Also) : null,
+                                AlsoTasks = src.AlsoTasks != null ? new Dictionary<int, string>(src.AlsoTasks) : null,
+                                At = src.At, Note = src.Note, Unsure = src.Unsure, Area = src.Area, Side = src.Side, Branch = src.Branch, Weekly = src.Weekly, Board = src.Board,
+                                NotBoard = src.NotBoard
+                            };
+                            copy.Lines.AddRange(src.Lines);
+                            steps.Insert(lastLater, copy);
+                            lastEarlier = lastLater; // the copy is now the earlier stage's last step
+                        }
+                    }
+                    // the profile runs once, top to bottom: only the later stage's steps after the earlier stage's last step wait
+                    // for it (one held before it would be passed while the earlier stage is still on, and never come back)
+                    for (int si = lastEarlier + 1; si < steps.Count; si++)
+                    {
+                        Step s = steps[si];
+                        if (s.Quest == cur && s.Gate != null && s.Kind != "Pickup" && s.Kind != "Complete")
+                            s.Gate = (s.Gate.IndexOf(" or ", StringComparison.Ordinal) >= 0 ? "(" + s.Gate + ")" : s.Gate) + hold;
+                        if (s.Also != null && s.Also.ContainsKey(cur))
+                            s.Also[cur] = (s.Also[cur].IndexOf(" or ", StringComparison.Ordinal) >= 0 ? "(" + s.Also[cur] + ")" : s.Also[cur]) + hold;
+                        if (s.Quest == cur && s.Gate != null && s.AlsoTasks != null)
+                            foreach (int at in new List<int>(s.AlsoTasks.Keys))
+                                s.AlsoTasks[at] = (s.AlsoTasks[at].IndexOf(" or ", StringComparison.Ordinal) >= 0 ? "(" + s.AlsoTasks[at] + ")" : s.AlsoTasks[at]) + hold;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// A mission item used on NPCs for one count (Black Hole Identify Torvix's Spies): the spies change kind and place,
+        /// so every step of that count takes every NPC name and every spot you used it on, and the spots where the mob scanner
+        /// saw those NPCs nearby. Only when you used it at more spots than it counted, or at spots far apart: NPCs that stand
+        /// where they always do (Section X prisoners) keep one step each, as you did them.
+        /// </summary>
+        private static void ShareItemTargets(List<Step> steps, List<Kill> mobSeen, Dictionary<string, List<Vec3>> itemSpots)
+        {
+            var groups = new Dictionary<string, List<KeyValuePair<Step, int>>>(StringComparer.Ordinal);
+            foreach (Step s in steps)
+            {
+                if (s.Kind != "Item" || s.Gate == null)
+                    continue;
+                Match g = Regex.Match(s.Gate, @"IsTaskValueGreaterThan\((0x[0-9A-F]+), (\d+), (\d+), \d+\)");
+                if (!g.Success)
+                    continue;
+                for (int li = 0; li < s.Lines.Count; li++)
+                {
+                    string l = s.Lines[li];
+                    if (!l.StartsWith("<UseItem ", StringComparison.Ordinal) || l.IndexOf("<Npcs>", StringComparison.Ordinal) < 0)
+                        continue;
+                    string key = g.Groups[1].Value + "|" + g.Groups[2].Value + "|" + g.Groups[3].Value + "|" + Attr(l, "ItemName");
+                    List<KeyValuePair<Step, int>> list;
+                    if (!groups.TryGetValue(key, out list))
+                        groups[key] = list = new List<KeyValuePair<Step, int>>();
+                    list.Add(new KeyValuePair<Step, int>(s, li));
+                }
+            }
+            foreach (List<KeyValuePair<Step, int>> group in groups.Values)
+            {
+                var names = new List<string>(); // as written (XML-escaped)
+                var spots = new List<Vec3>();
+                foreach (KeyValuePair<Step, int> at in group)
+                {
+                    string l = at.Key.Lines[at.Value];
+                    foreach (Match n in Regex.Matches(l, "<Npc>([^<]+)</Npc>"))
+                        if (!names.Contains(n.Groups[1].Value))
+                            names.Add(n.Groups[1].Value);
+                    foreach (Match h in Regex.Matches(l, "<Hotspot [^>]*XYZ=\"([^\"]+)\""))
+                    {
+                        Vec3 v;
+                        if (TryVec(h.Groups[1].Value, out v) && !spots.Exists(p => p.DistanceTo(v) < 0.5f))
+                            spots.Add(v);
+                    }
+                }
+                if (spots.Count == 0)
+                    continue;
+                List<Vec3> usedAt;
+                bool moreUses = itemSpots.TryGetValue(System.Net.WebUtility.HtmlDecode(Attr(group[0].Key.Lines[group[0].Value], "ItemName")), out usedAt) && usedAt.Count > group.Count;
+                bool spread = spots.Exists(a => spots.Exists(b => a.DistanceTo(b) > 2f));
+                if (!moreUses && !spread)
+                    continue;
+                // the mob scanner: those NPCs seen near your spots (within ~150 m)
+                var own = new List<Vec3>(spots);
+                foreach (Kill m in mobSeen)
+                {
+                    if (spots.Count >= 12)
+                        break;
+                    if (names.Contains(A(m.Name)) && own.Exists(p => p.DistanceTo(m.Pos) <= 15f) && !spots.Exists(p => p.DistanceTo(m.Pos) < 0.5f))
+                        spots.Add(m.Pos);
+                }
+                var npcs = new StringBuilder("<Npcs>");
+                foreach (string n in names)
+                    npcs.Append("<Npc>").Append(n).Append("</Npc>");
+                npcs.Append("</Npcs>");
+                var hot = new StringBuilder("<Hotspots>");
+                foreach (Vec3 v in spots)
+                    hot.Append("<Hotspot Name=\"Where you used it\" XYZ=\"").Append(X(v)).Append("\" />");
+                hot.Append("</Hotspots>");
+                foreach (KeyValuePair<Step, int> at in group)
+                {
+                    string l = at.Key.Lines[at.Value];
+                    int ownNames = Regex.Matches(l, "<Npc>([^<]+)</Npc>").Count;
+                    int ownSpots = Regex.Matches(l, "<Hotspot ").Count;
+                    if (ownNames >= names.Count && ownSpots >= spots.Count)
+                        continue; // it already has them all
+                    l = ReplacePart(l, "<Npcs>", "</Npcs>", npcs.ToString());
+                    l = ReplacePart(l, "<Hotspots>", "</Hotspots>", hot.ToString());
+                    at.Key.Lines[at.Value] = l;
+                }
+            }
+        }
+
+        /// <summary>The line with the part from open to close (both included) replaced; unchanged when it has no such part.</summary>
+        private static string ReplacePart(string line, string open, string close, string with)
+        {
+            int a = line.IndexOf(open, StringComparison.Ordinal);
+            int b = a >= 0 ? line.IndexOf(close, a, StringComparison.Ordinal) : -1;
+            if (a < 0 || b < 0)
+                return line;
+            return line.Substring(0, a) + with + line.Substring(b + close.Length);
+        }
+
         /// <summary>
         /// A step done twice (a carried-on recording, or a daily done again) is written once: in the place it first
         /// came, with the best way you did it. One that only walks to where it ticked loses to one that does something;
@@ -2924,7 +5484,8 @@ namespace QuestRecorder
             {
                 if (s.Gate == null || s.Kind == "Route" || s.Kind == "Ride")
                     continue;
-                string key = s.Comment + "|" + s.Gate;
+                // (a walk's note says how long you waited or held the spot that run: two runs of it are still one step)
+                string key = s.Comment + "|" + (s.Kind == "Walk" ? string.Empty : s.Note) + "|" + s.Gate;
                 Step keep;
                 if (!first.TryGetValue(key, out keep))
                 {
@@ -2934,24 +5495,62 @@ namespace QuestRecorder
                 drop.Add(s);
                 bool keepDoesSomething = keep.Kind != "Walk";
                 bool thisDoesSomething = s.Kind != "Walk";
-                if (thisDoesSomething || !keepDoesSomething)
+                // two walks: one that waits or holds the spot there (it has a note) wins over one that only walks; else the newest
+                if (thisDoesSomething || (!keepDoesSomething && (s.Note.Length > 0 || keep.Note.Length == 0)))
                 {
                     keep.Kind = s.Kind;
                     keep.Lines.Clear();
                     keep.Lines.AddRange(s.Lines);
                     keep.Kills = s.Kills;
                     keep.Task = s.Task;
+                    // what goes with those lines: the fight's other tasks and quests, the mobs the game counts, the branch
+                    keep.Targets = s.Targets;
+                    keep.Also = s.Also;
+                    keep.AlsoTasks = s.AlsoTasks;
+                    keep.Area = s.Area;
+                    keep.Branch = s.Branch ?? keep.Branch;
+                    keep.Weekly = keep.Weekly || s.Weekly;
+                    keep.Board = s.Board || (keep.Board && s.Kind == "Pickup");
+                    keep.NotBoard = !keep.Board && (s.NotBoard || (keep.NotBoard && s.Kind == "Pickup"));
+                    keep.Note = s.Note;
+                    keep.Unsure = s.Unsure;
                 }
             }
             if (drop.Count > 0)
                 steps.RemoveAll(drop.Contains);
         }
 
-        private static void AddStep(List<Step> steps, string kind, string gate, string what, List<string> lines, ulong quest)
+        /// <summary>Adds to the step's note (shown in the recorder window only).</summary>
+        private static Step AddNote(Step s, string note)
+        {
+            s.Note = s.Note.Length > 0 ? s.Note + "; " + note : note;
+            return s;
+        }
+
+        private static Step AddStep(List<Step> steps, string kind, string gate, string what, List<string> lines, ulong quest)
         {
             var s = new Step { Kind = kind, Gate = gate, Comment = what, Quest = quest };
             s.Lines.AddRange(lines);
             steps.Add(s);
+            return s;
+        }
+
+        /// <summary>A fight area's name: the quest task (or the mob), short.</summary>
+        private static string AreaName(Step s)
+        {
+            string a = Fmt.OneLine(s.Area ?? s.Comment);
+            foreach (string cut in new[] { " + ", "; ", " - collect:", " (next: ", " (kill and loot)" })
+            {
+                int at = a.IndexOf(cut, StringComparison.Ordinal);
+                if (at > 0)
+                    a = a.Substring(0, at);
+            }
+            if (a.Length > 90)
+            {
+                int sp = a.LastIndexOf(' ', 90);
+                a = a.Substring(0, sp > 30 ? sp : 90);
+            }
+            return a.TrimEnd(' ', '-', ':', ',');
         }
 
         private static string Render(List<Step> steps, List<ulong> picked, string profileName, string fileName, string recordingName, string side,
@@ -2965,9 +5564,8 @@ namespace QuestRecorder
             if (by.Length > 0)
                 sb.Append("\t<!-- Recorded by ").Append(Fmt.XmlComment(by.Length > 60 ? by.Substring(0, 60) : by)).Append(" -->").Append(nl);
             sb.Append("\t<Name>").Append(Fmt.XmlAttr(profileName)).Append("</Name>").Append(nl);
-            if (side != null)
-                sb.Append("\t<!-- You mostly picked ").Append(side.ToLowerInvariant()).Append(" replies. -->").Append(nl)
-                  .Append("\t<ForceAlignment Type=\"").Append(side).Append("\" AutoSkip=\"True\" />").Append(nl);
+            // the side the bot answers by (yours; Neutral when you picked neither more), and cut scenes skipped
+            sb.Append("\t<ForceAlignment Type=\"").Append(side ?? "Neutral").Append("\" AutoSkip=\"True\" />").Append(nl);
             if (vendors.Count > 0)
             {
                 sb.Append("\t<Vendors>").Append(nl);
@@ -3018,12 +5616,26 @@ namespace QuestRecorder
             {
                 if (steps[i].Kind != "Route")
                     continue;
-                string next = null;
+                string next = null; // the next gated step
                 for (int j = i + 1; j < steps.Count && next == null; j++)
                 {
                     Step n = steps[j];
                     if (n.Gate != null && n.Kind != "Pickup" && n.Kind != "Route" && n.Kind != "Skip")
                         next = n.Gate;
+                }
+                // a door route: walk through only while you're still on the near side (not a lift's side test: Black Hole Glow
+                // walked out only once it was already outside), while any quest with a step after it is still open - like a ride
+                if (steps[i].Side != null)
+                {
+                    var open = new List<string>();
+                    var qs = new HashSet<ulong>();
+                    for (int j = i + 1; j < steps.Count; j++)
+                    {
+                        ulong q = steps[j].Quest;
+                        if (q != 0 && steps[j].Kind != "Skip" && qs.Add(q))
+                            open.Add(Fmt.Format("(HasQuest({0}) and not IsQuestComplete({0}))", Fmt.Hex(q)));
+                    }
+                    next = open.Count > 0 ? steps[i].Side + " and (" + string.Join(" or ", open) + ")" : null;
                 }
                 steps[i].Gate = next;
                 if (next == null)
@@ -3069,6 +5681,10 @@ namespace QuestRecorder
                         foreach (Kill k in s.Kills)
                         {
                             bool ok = k.Credit.Contains(mine);
+                            if (!ok && s.AlsoTasks != null)
+                                foreach (int at in s.AlsoTasks.Keys)
+                                    if (k.Credit.Contains(Fmt.Hex(s.Quest) + "|" + at))
+                                        ok = true;
                             if (!ok && s.Also != null)
                                 foreach (ulong aq in s.Also.Keys)
                                     foreach (string c in k.Credit)
@@ -3091,18 +5707,20 @@ namespace QuestRecorder
                             mobs = listed;
                     }
                     string fightGate = s.Gate;
-                    if (s.Also != null && s.Also.Count > 0)
+                    if ((s.Also != null && s.Also.Count > 0) || (s.AlsoTasks != null && s.AlsoTasks.Count > 0))
                     {
                         fightGate = "(" + s.Gate + ")";
-                        foreach (string g in s.Also.Values)
-                            fightGate += " or (" + g + ")";
+                        if (s.AlsoTasks != null)
+                            foreach (string g in s.AlsoTasks.Values)
+                                fightGate += " or (" + g + ")";
+                        if (s.Also != null)
+                            foreach (string g in s.Also.Values)
+                                fightGate += " or (" + g + ")";
                     }
                     // the fight's area goes in the header under a name of its own
-                    string area = Fmt.OneLine(s.Comment);
-                    if (area.Length > 90)
-                        area = area.Substring(0, 90).TrimEnd();
+                    string area = AreaName(s);
                     string baseArea = area;
-                    for (int n = 2; !areaNames.Add(area); n++)
+                    for (int n = 2; !areaNames.Add(area) || CoreWrite.AreaNameTaken(area); n++)
                         area = baseArea + " (" + n + ")";
                     areas.Append("\t\t<GrindArea Name=\"").Append(A(area)).Append("\">").Append(nl);
                     areas.Append("\t\t\t<MinLevel>1</MinLevel>").Append(nl).Append("\t\t\t<MaxLevel>100</MaxLevel>").Append(nl).Append("\t\t\t<Mobs>");
@@ -3117,6 +5735,11 @@ namespace QuestRecorder
                         sb.Append("\t\t\t").Append(l).Append(nl);
                     sb.Append("\t\t\t<Grind GrindRef=\"").Append(A(area)).Append("\" While=\"").Append(fightGate).Append("\" />").Append(nl);
                     sb.Append("\t\t</If>").Append(nl);
+                }
+                else if (s.Raw)
+                {
+                    foreach (string l in s.Lines)
+                        sb.Append("\t\t").Append(l).Append(nl);
                 }
                 else if (s.Gate != null)
                 {
@@ -3139,9 +5762,10 @@ namespace QuestRecorder
                 foreach (ulong q in completedOrder)
                     sb.Append("\t\t<CompleteQuest QuestId=\"").Append(Fmt.Hex(q)).Append("\" />").Append(nl);
             }
+            // the end, like the hand-made profiles: no reload loop. Something left over is said plainly, and "Done!" only
+            // when nothing is
             if (picked.Count > 0)
             {
-                // the end, like the hand-made profiles: no reload loop. Something left over is said plainly.
                 var conds = new List<string>();
                 foreach (ulong q in picked)
                 {
@@ -3150,13 +5774,18 @@ namespace QuestRecorder
                     if (!conds.Contains(c))
                         conds.Add(c);
                 }
-                sb.Append("\t\t<!-- Not finished? Say so instead of starting over -->").Append(nl);
-                sb.Append("\t\t<If Condition=\"").Append(string.Join(" or ", conds)).Append("\">").Append(nl);
+                string open = string.Join(" or ", conds);
+                sb.Append("\t\t<If Condition=\"").Append(open).Append("\">").Append(nl);
                 sb.Append("\t\t\t<UserDialog Title=\"Quest Recorder\" Message=\"A quest from this profile isn't finished. Finish it by hand, or start the profile again.\" />").Append(nl);
                 sb.Append("\t\t</If>").Append(nl);
+                sb.Append("\t\t<If Condition=\"not (").Append(open).Append(")\">").Append(nl);
+                sb.Append("\t\t\t<UserDialog Title=\"Done!\" Message=\"This profile is done.\" />").Append(nl);
+                sb.Append("\t\t</If>").Append(nl);
             }
-            sb.Append("\t\t<UserDialog Title=\"Done!\" Message=\"This profile is done.\" />").Append(nl);
+            else
+                sb.Append("\t\t<UserDialog Title=\"Done!\" Message=\"This profile is done.\" />").Append(nl);
             sb.Append("\t</Questing>").Append(nl).Append("</Profile>").Append(nl);
+            areas.Append(CoreWrite.AreasXml);
             if (areas.Length > 0)
                 head.Append("\t<GrindAreas>").Append(nl).Append(areas).Append("\t</GrindAreas>").Append(nl).Append(nl);
             return head.Append(sb).ToString();

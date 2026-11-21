@@ -292,6 +292,10 @@ namespace QuestRecorder
                     wait.Dispose();
                     try
                     {
+                        // nothing was recorded (your character was never in the world): no profile of this recording to
+                        // show - the last one's would look like this one's (the status line says what happened)
+                        if (!Recorder.IsRecording && Recorder.Status.BaseName.Length == 0)
+                            return;
                         ShowSummary();
                     }
                     catch (Exception ex)
@@ -351,6 +355,16 @@ namespace QuestRecorder
                 {
                     Updater.CheckInBackground();
                     await System.Threading.Tasks.Task.Delay(3000);
+                    // no answer yet (a slow connection: the check waits up to 20 s): wait for it rather than say "latest"
+                    for (int i = 0; i < 40 && !Updater.UpdateAvailable && Updater.LatestVersion.Length == 0 && Updater.Problem.Length == 0 && !Updater.IsGitClone(); i++)
+                        await System.Threading.Tasks.Task.Delay(500);
+                    if (Updater.UpdateAvailable)
+                        return; // the check that just finished shows the update pop-up itself (a second one here would ask twice)
+                    if (Updater.LatestVersion.Length == 0 && Updater.Problem.Length == 0 && !Updater.IsGitClone())
+                    {
+                        MessageBox.Show(this, "Still checking for updates - try again in a moment.", "Quest Recorder", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
                 }
                 if (!Updater.UpdateAvailable)
                 {
@@ -369,7 +383,10 @@ namespace QuestRecorder
             catch (Exception ex)
             {
                 RrLog.Exception("Updating Quest Recorder", ex);
-                MessageBox.Show(this, "The update did not work: " + ex.Message + "\r\nNothing was lost; your current version is still there.", "Quest Recorder update", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                // (when putting the old version back failed too, the message says where the backup is: then something was lost)
+                bool lost = ex.Message.IndexOf("failed too", StringComparison.Ordinal) >= 0;
+                MessageBox.Show(this, "The update did not work: " + ex.Message + (lost ? string.Empty : "\r\nNothing was lost; your current version is still there."),
+                                "Quest Recorder update", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -423,10 +440,19 @@ namespace QuestRecorder
                         return;
                     ReplayBuilder.CreditName = RrSettings.Instance.CreditName;
                     ReplayBuilder.WalkSpacing = RrSettings.Instance.WalkPointMeters;
-                    string path = RecordingLoader.MakeProfile(dlg.FileName, AppDomain.CurrentDomain.BaseDirectory, RrSettings.Instance.ProfileFolder);
+                    string[] problems;
+                    string path = RecordingLoader.MakeProfile(dlg.FileName, AppDomain.CurrentDomain.BaseDirectory, RrSettings.Instance.ProfileFolder, out problems);
+                    string coverage = ReplayBuilder.LastCoverage ?? string.Empty; // (made on this thread just now)
                     RrLog.Info("Made a profile from {0}: {1}", Path.GetFileName(dlg.FileName), path);
-                    MessageBox.Show(this, "Profile made from your recording:\r\n\r\n" + path + "\r\n\r\nLoad it in BuddyCron to run it.", "Quest Recorder",
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    if (coverage.Length > 0)
+                        RrLog.Info("How the steps were found: {0}", coverage);
+                    string found = coverage.Length > 0 ? "\r\n\r\n" + coverage : string.Empty;
+                    if (problems.Length > 0)
+                        MessageBox.Show(this, "Profile made but NOT finished: " + string.Join(", ", problems) + "\r\n\r\n" + path + found + "\r\n\r\nSend the recording to LethToxic.", "Quest Recorder",
+                            MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    else
+                        MessageBox.Show(this, "Profile made from your recording:\r\n\r\n" + path + found + "\r\n\r\nLoad it in BuddyCron to run it.", "Quest Recorder",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
             }
             catch (Exception ex)
@@ -444,12 +470,9 @@ namespace QuestRecorder
                 int line = _tracker.GetLineFromCharIndex(_tracker.SelectionStart);
                 if (line < 0 || line >= _tracker.Lines.Length)
                     return;
-                string text = _tracker.Lines[line];
-                int dot = text.IndexOf(". ", StringComparison.Ordinal);
-                int arrow = text.IndexOf("  ->  ", StringComparison.Ordinal);
-                if (dot < 0 || arrow <= dot)
+                string label = ReplayBuilder.TraceLabel(_tracker.Lines[line]);
+                if (label == null)
                     return;
-                string label = text.Substring(dot + 2, arrow - dot - 2).Trim();
                 string profile = RecordingSession.LiveProfile;
                 if (string.IsNullOrEmpty(profile) || !File.Exists(profile))
                 {
@@ -500,26 +523,39 @@ namespace QuestRecorder
         private void ShowSummary()
         {
             string profile = RecordingSession.LiveProfile;
+            string[] problems = RecordingSession.LiveProblems ?? new string[0];
             if (string.IsNullOrEmpty(profile) || !File.Exists(profile))
+            {
+                if (problems.Length > 0)
+                    MessageBox.Show(this, "The profile is NOT finished: " + string.Join(", ", problems) + "\r\n\r\nSend the recording to LethToxic.", "Quest Recorder",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
+            }
+            string notFinished = problems.Length > 0 ? "NOT FINISHED (" + string.Join(", ", problems) + ") - " : string.Empty;
             string[] trace = RecordingSession.LiveTrace ?? new string[0];
             var missed = new System.Collections.Generic.List<string>();
+            var unsure = new System.Collections.Generic.List<string>(); // steps the recorder isn't sure about (yellow)
             foreach (string line in trace)
             {
-                if (line.IndexOf("!!", StringComparison.Ordinal) < 0)
+                string label = ReplayBuilder.TraceLabel(line);
+                if (label != null && ReplayBuilder.TraceUnsure(line))
+                    unsure.Add(label);
+                if (line.IndexOf("  ->  !! ", StringComparison.Ordinal) < 0)
                     continue;
-                int dot = line.IndexOf(". ", StringComparison.Ordinal);
-                int arrow = line.IndexOf("  ->  ", StringComparison.Ordinal);
-                missed.Add(dot >= 0 && arrow > dot ? line.Substring(dot + 2, arrow - dot - 2).Trim() : line.Trim());
+                missed.Add(label ?? line.Trim());
             }
             int caught = trace.Length - missed.Count;
             // the review list: every step in plain words - untick, reorder, "do by hand", save
             try
             {
-                string head = missed.Count == 0
-                    ? "Nice - " + caught + " step(s) caught, nothing missed. Your profile: " + Path.GetFileName(profile)
-                    : caught + " step(s) caught, " + missed.Count + " with no proof (yellow). Your profile: " + Path.GetFileName(profile);
-                var review = new ReviewForm(profile, head);
+                // how the new core found the steps ("26 mission steps: 9 tied to what you did by the game's own ids, ...")
+                string coverage = RecordingSession.LiveCoverage ?? string.Empty;
+                string head = notFinished + (coverage.Length > 0
+                    ? coverage + " Your profile: " + Path.GetFileName(profile)
+                    : missed.Count == 0 && unsure.Count == 0 && notFinished.Length == 0
+                        ? "Nice - " + caught + " step(s) caught, nothing missed. Your profile: " + Path.GetFileName(profile)
+                        : caught + " step(s) caught, " + unsure.Count + " need a look (yellow). Your profile: " + Path.GetFileName(profile));
+                var review = new ReviewForm(profile, head, unsure);
                 review.Show(this);
                 return;
             }
@@ -528,6 +564,12 @@ namespace QuestRecorder
                 RrLog.Debug("Review list: {0}", ex.Message); // fall back to the old summary below
             }
             string where = "\r\n\r\nYour profile: " + profile;
+            if (notFinished.Length > 0)
+            {
+                MessageBox.Show(this, notFinished + caught + " step(s) caught, " + missed.Count + " missed." + where + "\r\n\r\nSend the recording to LethToxic.",
+                    "Quest Recorder", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
             if (missed.Count == 0)
             {
                 if (MessageBox.Show(this, "Nice - " + caught + " step(s) caught, nothing missed." + where + "\r\n\r\nLoad it in BuddyCron with Load Profile. Show you the file?",

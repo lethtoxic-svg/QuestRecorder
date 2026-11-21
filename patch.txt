@@ -1,6 +1,5 @@
-1.3
+1.4
 main
-- Profiles you record now run on plain BuddyCron: anyone can run them without Quest Recorder installed.
-- Mission pickups are pinned to the exact giver you clicked (Black Hole twin terminals).
-- Weeklies are taken from the terminal whenever it offers them.
-- Area missions the game hands you by itself no longer send the bot to the last enemy you targeted (Dreadtooth).
+- Profiles are written with BuddyCron's own steps, like a hand-made profile, from the game's own mission ids and the combat log.
+- Turn on Combat Logging in the game's Preferences before you record.
+- Fixes for pick-ups, mission items, talks, fights, lifts and hand-ins: see PATCHNOTES.txt.

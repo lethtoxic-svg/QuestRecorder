@@ -380,6 +380,7 @@ namespace QuestRecorder
             int notInWorldLooks = 0;
             long backoffUntil = 0;
             bool textWarned = false;
+            bool pauseSkipped = false;
             string why = null;
             LookState state = LookState.Starting;
 
@@ -400,9 +401,16 @@ namespace QuestRecorder
                     {
                         state = LookState.TooSlow;
                         sleep = (int)Math.Min(1000L, Math.Max(50L, _throttle.PauseLeftMs(loopStart)));
+                        pauseSkipped = true;
                     }
                     else if (loopStart >= backoffUntil)
                     {
+                        if (pauseSkipped && !markerLook)
+                        {
+                            // nothing was recorded during the pause: the combat log goes on from now, not from then
+                            pauseSkipped = false;
+                            reader.SkipCombatLog();
+                        }
                         Look look = null;
                         bool pulse = false;
                         try
@@ -443,6 +451,28 @@ namespace QuestRecorder
                                 case LookState.InWorld:
                                 {
                                     Snap snap = look.Snap;
+                                    if (session != null && det != null && last != null && snap.PlayerId != last.PlayerId)
+                                    {
+                                        // Another character logged in: the first one's recording ends here with its own profile,
+                                        // and this one gets its own (one profile with both characters' quests fits neither).
+                                        try
+                                        {
+                                            string done = FinishSession(session, det, last, reader, stats, totalFails, notInWorldLooks,
+                                                "another character logged in");
+                                            RrLog.Good("Another character logged in. {0} This character gets a recording of its own.", done);
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            RrLog.Exception("Finishing the first character's recording", ex);
+                                        }
+                                        session = null;
+                                        det = null;
+                                        last = null;
+                                        stats = new LockStats();
+                                        totalFails = 0;
+                                        notInWorldLooks = 0;
+                                        textWarned = false;
+                                    }
                                     long gapMs = last != null ? snap.Tick - last.Tick : 0;
                                     List<string> problems = reader.TakeProblems();
                                     if (session == null)
@@ -506,7 +536,7 @@ namespace QuestRecorder
                                     if (!gapBot)
                                     {
                                         gapBot = true;
-                                        reader.ResetCharacter();
+                                        reader.ResetCharacter(true);
                                         if (det != null && last != null)
                                             det.Paused(last, "the bot started; the recorder waits until it stops");
                                         RrLog.Info("Bot is running - recording paused until it stops.");
@@ -767,6 +797,29 @@ namespace QuestRecorder
             }
         }
 
+        /// <summary>The stop event, the footer and the profile of one recording; the text saying where it went.</summary>
+        private string FinishSession(RecordingSession session, Detector det, Snap last, GameReader reader, LockStats stats, int totalFails,
+            int notInWorldLooks, string why)
+        {
+            try
+            {
+                det.End(last, why);
+            }
+            catch (Exception ex)
+            {
+                RrLog.Debug("Writing the stop event failed: {0}", ex.Message);
+            }
+            var lines = new List<string>();
+            lines.Add(Fmt.Format("Looks       {0} in the world, {1} waiting (loading screen, character select or not attached), {2} failed",
+                stats.Count, notInWorldLooks, totalFails));
+            lines.Add(Fmt.Format("Frame lock  median {0} ms, 95% {1} ms, max {2} ms, {3} looks over 10 ms (the game waits only while one look is copied)",
+                Fmt.F1(stats.Percentile(0.5)), Fmt.F1(stats.Percentile(0.95)), Fmt.F1(stats.Max), stats.Over10));
+            lines.Add("Objectives  " + (reader.TextDisabled ? "objective texts were switched off during this recording (the game did not give them)" : "objective texts read when the game gave them"));
+            session.Finish(why, lines, !_quick);
+            return Fmt.Format("Saved {0} events to {1} (.txt, .csv).", session.Count,
+                System.IO.Path.Combine(session.Folder, session.BaseName));
+        }
+
         private void Finish(RecordingSession session, Detector det, Snap last, GameReader reader, LockStats stats, int totalFails,
             int notInWorldLooks, string why)
         {
@@ -782,23 +835,7 @@ namespace QuestRecorder
                         if (last != null)
                             det.Marker(last, (m.Note.Length > 0 ? m.Note + " " : string.Empty) + "(position of the last look)", m.Source);
                     }
-                    try
-                    {
-                        det.End(last, why);
-                    }
-                    catch (Exception ex)
-                    {
-                        RrLog.Debug("Writing the stop event failed: {0}", ex.Message);
-                    }
-                    var lines = new List<string>();
-                    lines.Add(Fmt.Format("Looks       {0} in the world, {1} waiting (loading screen, character select or not attached), {2} failed",
-                        stats.Count, notInWorldLooks, totalFails));
-                    lines.Add(Fmt.Format("Frame lock  median {0} ms, 95% {1} ms, max {2} ms, {3} looks over 10 ms (the game waits only while one look is copied)",
-                        Fmt.F1(stats.Percentile(0.5)), Fmt.F1(stats.Percentile(0.95)), Fmt.F1(stats.Max), stats.Over10));
-                    lines.Add("Objectives  " + (reader.TextDisabled ? "objective texts were switched off during this recording (the game did not give them)" : "objective texts read when the game gave them"));
-                    session.Finish(why, lines, !_quick);
-                    result = Fmt.Format("Saved {0} events to {1} (.txt, .csv).", session.Count,
-                        System.IO.Path.Combine(session.Folder, session.BaseName));
+                    result = FinishSession(session, det, last, reader, stats, totalFails, notInWorldLooks, why);
                     RrLog.Good("Recording stopped ({0}). {1}", why, result);
                 }
                 else
