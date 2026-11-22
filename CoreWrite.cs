@@ -203,6 +203,13 @@ namespace QuestRecorder
             b.Unsure.AddRange(s.Unsure);
             b.Yellow = s.Rank >= 3;
             string text = CoreRender.TaskText(c, s);
+            // (an action step with no count of its own, whose objective text is another task's that this profile does as
+            // its own step: the text is not this step's - Republic's Most Wanted showed "Defeat Chopper" when it came to
+            // the step Burnout's kill finished; the step is named after what you did, "Kill Burnout")
+            if (s.Task < 0 && text.Length > 0 && CoreRender.Action(s.Kind) &&
+                steps.Exists(n => n != s && n.Quest == s.Quest && n.Branch == s.Branch && n.Step == s.Step && n.Task >= 0 &&
+                                  string.Equals(CoreRender.TaskText(c, n), text, StringComparison.Ordinal)))
+                text = string.Empty;
             string on = CoreRender.TargetName(s);
             if (s.Task < 0 && !s.Merged && text.Length > 0 && on.Length > 0 && text.IndexOf(on, StringComparison.OrdinalIgnoreCase) < 0 &&
                 s.Kind != StepKind.Walk && s.Kind != StepKind.Hop && s.Kind != StepKind.Reward && s.Kind != StepKind.HandIn && s.Kind != StepKind.Pickup)
@@ -286,7 +293,9 @@ namespace QuestRecorder
                     }
                     string area = Area(b.Label, s, mobs, fightSpots);
                     run.Add(If(here));
-                    run.Add("\t<Grind GrindRef=\"" + A(area) + "\" While=\"" + A(hereWhile) + "\" />");
+                    // (kill and loot: LootFor names the mobs whose bodies the bot opens itself when your bags are full)
+                    run.Add("\t<Grind GrindRef=\"" + A(area) + "\" While=\"" + A(hereWhile) + "\"" +
+                            (s.Kind == StepKind.KillLoot || s.Loot ? LootFor(mobs) : string.Empty) + " />");
                     run.Add("</If>");
                     if (mobs.Count == 0)
                         Look(b, "no name for what this step counts: the bot walks your fight spots and fights what attacks it");
@@ -310,8 +319,14 @@ namespace QuestRecorder
                         // the step was a lift ride: walk to where you came out (BuddyCron's navigator rides the lift)
                         run.Add(If(b.Gate));
                         run.Add("\t<MoveTo QuestId=\"" + H(s.Quest) + "\" Name=\"Off the " + A(first.Target.Name) + "\" XYZ=\"" + X(exit) + "\" />");
+                        // then on to where it moved on, when you walked on after the ride (Black Hole Glow, 5 Nov: "Return to
+                        // Mission Terminal" ended at the terminal, well past the lift - the bot would wait at the lift)
+                        Vec3 moved = s.End > first.At ? c.PosAt(s.End) : default(Vec3);
+                        bool walkOn = !moved.IsZero && moved.DistanceTo(exit) >= 3f;
+                        if (walkOn)
+                            run.Add("\t<MoveTo QuestId=\"" + H(s.Quest) + "\" Name=\"Where it moved on\" XYZ=\"" + X(moved) + "\" />");
                         run.Add("</If>");
-                        b.What = "ride the " + first.Target.Name + " to where you came out";
+                        b.What = "ride the " + first.Target.Name + " to where you came out" + (walkOn ? ", then walk to where it moved on" : string.Empty);
                         break;
                     }
                     List<string> objects = ObjectNames(s, names);
@@ -357,7 +372,7 @@ namespace QuestRecorder
                             // (counted by what you looted only)
                             string ga = Area(b.Label, s, mobs, s.Spots);
                             run.Add(If(here));
-                            run.Add("\t<Grind GrindRef=\"" + A(ga) + "\" While=\"" + A(hereWhile) + "\" />");
+                            run.Add("\t<Grind GrindRef=\"" + A(ga) + "\" While=\"" + A(hereWhile) + "\"" + LootFor(mobs) + " />");
                             run.Add("</If>");
                             b.Gate = here;
                             b.What = "fight " + Join(mobs) + " (BuddyCron loots them)";
@@ -394,8 +409,13 @@ namespace QuestRecorder
                     // two objects of that name at one spot (Korriban's Red Engine, the upper and lower machine): the game can
                     // tie the mission to the one that isn't usable, so the bot takes the usable one of the name there
                     bool twin = one && first != null && Twin(c, first.Target);
+                    // an object that opened a conversation as you used it (Coruscant's Sealed Case): the game ties the talk to the
+                    // mission, not the object, so UseObject would stand next to it and never use it
+                    bool talks = !twin && s.Causes.Exists(f => f.Kind == FactKind.UseObject && f.OpensTalk && f.Target != null && objects.Contains(f.Target.Name));
                     if (twin)
                         sb.Append(" IgnoreQuestRelation=\"True\" IgnoreLOS=\"True\"");
+                    else if (talks)
+                        sb.Append(" IgnoreQuestRelation=\"True\"");
                     sb.Append('>');
                     if (objects.Count > 1)
                     {
@@ -415,7 +435,7 @@ namespace QuestRecorder
                     run.Add(sb.ToString());
                     run.Add("</If>");
                     b.What = "use " + Join(objects) + (one ? string.Empty : " at your " + spots.Count + " spots") + (mobs.Count > 0 ? ", fighting " + Join(mobs) + " there" : string.Empty) +
-                             (twin ? " (the usable one of the two there)" : string.Empty);
+                             (twin ? " (the usable one of the two there)" : string.Empty) + (talks ? " (it opens a talk)" : string.Empty);
                     break;
                 }
                 case StepKind.Talk:
@@ -447,6 +467,12 @@ namespace QuestRecorder
                         Look(b, "the mission item's name was not seen");
                         return null;
                     }
+                    List<Fact> scan = BinocCause(s);
+                    if (scan != null)
+                    {
+                        BinocLine(s, scan, true, run, b);
+                        break;
+                    }
                     if (once)
                     {
                         // used once before the step's last action: the plain pass's one-use (it waits for the cast to end)
@@ -467,6 +493,12 @@ namespace QuestRecorder
                     {
                         Look(b, "the combat log gave no name for this ability: the bot can't use it");
                         return null;
+                    }
+                    List<Fact> scanA = BinocCause(s);
+                    if (scanA != null)
+                    {
+                        BinocLine(s, scanA, false, run, b);
+                        break;
                     }
                     // a special-bar ability: the plain pass's ability step (code: it casts from the bar where you used it)
                     Fact f = s.Causes.Count > 0 ? s.Causes[0] : null;
@@ -538,11 +570,21 @@ namespace QuestRecorder
                     b.What = "take the reward";
                     // how long the reward window took after the mission's last step when you did it (the Glow's ~35 s after
                     // you walked out)
+                    // (from where that step ended, not where it began: Ancient Guardians' boss fight began two minutes
+                    // before its kill, and the bot waited three minutes for a reward that comes with the kill)
                     double last = double.MinValue;
                     foreach (CoreStep o in steps)
-                        if (o != s && o.Quest == s.Quest && o.Kind != StepKind.Reward && o.At <= s.At && o.At > last)
-                            last = o.At;
-                    Reward(b, s.Quest, last > double.MinValue ? Math.Max(4.0, Math.Min(120.0, s.At - last)) : 4.0);
+                    {
+                        if (o == s || o.Quest != s.Quest || o.Kind == StepKind.Reward || o.At > s.At)
+                            continue;
+                        double ended = o.End > o.At && o.End <= s.At ? o.End : o.At;
+                        last = Math.Max(last, ended);
+                    }
+                    // (done the moment another mission was: a weekly that counts it, or the mission that weekly counts -
+                    // its window comes with that one's)
+                    bool together = c.Tracks.Exists(t => t.Quest != s.Quest && (t.Kind == TrackKind.Completed || t.Kind == TrackKind.Reward) &&
+                                                         Math.Abs(t.At - s.At) <= 1.0);
+                    Reward(b, s.Quest, together || last <= double.MinValue ? 4.0 : Math.Max(4.0, Math.Min(120.0, s.At - last)));
                     return b;
                 }
                 case StepKind.Hop:
@@ -623,6 +665,71 @@ namespace QuestRecorder
                 sb.Append(" HealthPercent=\"").Append(((int)hp).ToString(Inv)).Append('"');
             sb.Append(once ? " Once=\"True\" />" : " />");
             run.Add(sb.ToString());
+        }
+
+        /// <summary>The binocular scans that did this step, in order (one a spot: the last there, one with where you aimed first), or null.</summary>
+        private static List<Fact> BinocCause(CoreStep s)
+        {
+            var scans = new List<Fact>();
+            foreach (Fact f in Sorted(s.Causes))
+            {
+                if (!f.Binoc)
+                    continue;
+                int same = scans.FindIndex(g => g.Me.DistanceTo(f.Me) < 0.3f && (g.Scanned == null || f.Scanned == null || g.Scanned.Name == f.Scanned.Name));
+                if (same < 0)
+                    scans.Add(f);
+                else if (f.HasAim || !scans[same].HasAim)
+                    scans[same] = f; // (scanned again from the same spot: the later one, unless only the first had its aim)
+            }
+            return scans.Count > 0 ? scans : null;
+        }
+
+        /// <summary>
+        /// A binocular scan (Macrobinoculars, a mission Scanner): the plain pass's code step. The bot stands where you stood,
+        /// uses it, and turns and tilts the camera to where you aimed (to the object the game said you scanned, when it is
+        /// there), zooms in, and waits for the scan; if the mission doesn't move on, a pop-up asks you to scan it yourself.
+        /// </summary>
+        private static void BinocLine(CoreStep s, List<Fact> scans, bool item, List<string> run, CoreRender.Block b)
+        {
+            string what = item ? s.Item : CoreRender.CastName(s.Cast);
+            run.Add(If(b.Gate));
+            var targets = new List<string>();
+            bool noAim = false, noSpot = false;
+            foreach (Fact f in scans)
+            {
+                Vec3 where = !f.Me.IsZero ? f.Me : (s.Spots.Count > 0 ? s.Spots[0] : default(Vec3));
+                if (where.IsZero)
+                    noSpot = true;
+                else
+                    run.Add("\t<MoveTo QuestId=\"1\" Name=\"Where you used " + A(what) + "\" XYZ=\"" + X(where) + "\" />");
+                var sb = new StringBuilder();
+                sb.Append(item ? "\t<UseMissionItemOnce ItemName=\"" : "\t<UseQuestAbility AbilityName=\"").Append(A(what)).Append('"');
+                sb.Append(" Binoculars=\"True\"");
+                if (f.HasAim)
+                    sb.Append(" AimYaw=\"").Append(Fmt.F3(f.AimYaw)).Append("\" AimPitch=\"").Append(Fmt.F3(f.AimPitch)).Append('"');
+                ObjRef t = f.Scanned;
+                if (t != null && t.HasPos && t.Name.Length > 0)
+                {
+                    sb.Append(" AimName=\"").Append(A(t.Name)).Append("\" AimAt=\"").Append(X(t.Pos)).Append('"');
+                    if (!targets.Contains(t.Name))
+                        targets.Add(t.Name);
+                }
+                else if (!f.HasAim)
+                    noAim = true;
+                if (s.InFight)
+                    sb.Append(" InCombat=\"True\"");
+                sb.Append(" />");
+                run.Add(sb.ToString());
+            }
+            run.Add("</If>");
+            b.What = "use " + what + (scans.Count > 1 ? " at " + scans.Count.ToString(Inv) + " spots" : string.Empty) + " and scan" +
+                     (targets.Count > 0 ? " the " + Join(targets) : string.Empty) + " (binoculars: the bot turns and tilts the camera to where you aimed" +
+                     (noAim ? ", which wasn't recorded" : string.Empty) + ")";
+            if (noSpot)
+                Look(b, "where you stood for the scan was not seen");
+            if (noAim)
+                Look(b, "where you aimed the binoculars was not recorded (recorded before Quest Recorder 1.4b): the bot uses it and zooms where it looks, then asks you to scan it yourself if that didn't do it");
+            Look(b, "binocular scans: the bot's turning, tilting and zooming haven't been tested in the game yet. If the scan doesn't happen, a pop-up asks you to scan it yourself, then press Continue");
         }
 
         /// <summary>
@@ -748,19 +855,51 @@ namespace QuestRecorder
                     prev = o.At;
             Vec3 then = prev >= 0 ? c.PosAt(prev) : default(Vec3);
             bool walk = !used.IsZero && !then.IsZero && then.DistanceTo(used) > 5f;
-            b.Gate = gate;
-            b.Run.Add(If(gate));
-            if (walk)
+            // Where the bot presses it. BuddyCron's UseItem first walks toward its XYZ until it stands level with it (within
+            // 4.5 m up or down; across, Range 100000 is any distance), and with no XYZ that is <0, 0, 0>: on the fleet 70 m
+            // below the deck, so the bot walked off and never pressed it (Tatooine, 22 Nov). So it is where you used it, in
+            // the area you used it in; in each other area of the recording (the bot started again there), where you stood
+            // in that area nearest the moment you used it.
+            Vec3 press = !used.IsZero ? used : then;
+            if (press.IsZero)
+                return null; // nowhere you stood is known: the travel builder's hop (which has where you used it) is kept
+            var elsewhere = new List<KeyValuePair<ulong, int>>();
+            if (s.Area != 0)
             {
-                if (s.Area != 0)
-                    b.Run.Add("\t" + If("Core.Player.AreaId == " + H(s.Area)));
-                b.Run.Add((s.Area != 0 ? "\t\t" : "\t") + "<MoveTo QuestId=\"1\" Name=\"Where you used " + A(s.Item) + "\" XYZ=\"" + X(used) + "\" />");
-                if (s.Area != 0)
-                    b.Run.Add("\t</If>");
+                var nearest = new Dictionary<ulong, int>();
+                for (int i = 0; i < c.Events.Count; i++)
+                {
+                    RecEvent e = c.Events[i];
+                    if (e.AreaId == 0 || e.AreaId == s.Area || e.Pos.IsZero)
+                        continue;
+                    int k;
+                    if (!nearest.TryGetValue(e.AreaId, out k) || Math.Abs(c.AtOf[i] - useAt) < Math.Abs(c.AtOf[k] - useAt))
+                        nearest[e.AreaId] = i;
+                }
+                elsewhere.AddRange(nearest);
+                elsewhere.Sort((x, y) => x.Value.CompareTo(y.Value));
             }
-            // (no hotspot and a range of 10 km: BuddyCron's UseItem presses it where the bot stands, every tick until the
-            // condition is false, which is once you have landed)
-            b.Run.Add("\t<UseItem ItemName=\"" + A(s.Item) + "\" Condition=\"" + A(gate) + "\" Range=\"100000\" WaitTime=\"3000\" />");
+            b.Gate = gate;
+            // (entered only when the transport is not on a long cooldown: started again after using it, the bot would
+            // press it until it can be used, up to an hour. The UseItem's own condition has no such check: its cooldown
+            // starting during the cast must not end it before it has taken you there.)
+            b.Run.Add(If(gate + " and " + ReplayBuilder.NoLongCooldown(s.Item)));
+            string use = "<UseItem ItemName=\"" + A(s.Item) + "\" Condition=\"" + A(gate) + "\" Range=\"100000\" WaitTime=\"3000\" XYZ=\"";
+            string tab = s.Area != 0 ? "\t\t" : "\t";
+            if (s.Area != 0)
+                b.Run.Add("\t" + If("Core.Player.AreaId == " + H(s.Area)));
+            if (walk)
+                b.Run.Add(tab + "<MoveTo QuestId=\"1\" Name=\"Where you used " + A(s.Item) + "\" XYZ=\"" + X(used) + "\" />");
+            // (pressed every tick until the condition is false, which is once you have landed)
+            b.Run.Add(tab + use + X(press) + "\" />");
+            if (s.Area != 0)
+                b.Run.Add("\t</If>");
+            foreach (KeyValuePair<ulong, int> o in elsewhere)
+            {
+                b.Run.Add("\t" + If("Core.Player.AreaId == " + H(o.Key)));
+                b.Run.Add("\t\t" + use + X(c.Events[o.Value].Pos) + "\" />");
+                b.Run.Add("\t</If>");
+            }
             b.Run.Add("</If>");
             b.What = "use " + s.Item + (walk ? " where you used it" : " where the bot stands") + " until it has taken you there";
             b.Gate = Fmt.XmlAttr(b.Gate);
@@ -853,6 +992,16 @@ namespace QuestRecorder
             if (!b.Unsure.Contains(why))
                 b.Unsure.Add(why);
             b.Yellow = true;
+        }
+
+        /// <summary>
+        /// The mobs of a kill-and-loot fight, for the plain pass's full-bags loot hook (taken off the Grind line there):
+        /// BuddyCron loots nothing when your bags are full, though a mission item needs no room.
+        /// </summary>
+        private static string LootFor(List<string> mobs)
+        {
+            var l = mobs.FindAll(m => !string.IsNullOrEmpty(m) && m.IndexOf('|') < 0);
+            return l.Count > 0 ? " LootFor=\"" + A(string.Join("|", l)) + "\"" : string.Empty;
         }
 
         /// <summary>Walk to where you stood for it first (the right one of two with one name; a spot that can be reached).</summary>
@@ -1238,7 +1387,8 @@ namespace QuestRecorder
 
         /// <summary>
         /// Every transport's site: its landing and the spots of that mission's steps after it in the landing's area (until
-        /// its next transport). A site reaches half way to the nearest other site in that area, and half way to where a
+        /// its next transport), and of the steps of missions with no transport of their own done there before the next
+        /// transport you used. A site reaches half way to the nearest other site in that area, and half way to where a
         /// transport inside one area was pressed, 10 units (100 m) at most.
         /// </summary>
         private static List<Site> Sites(CoreFacts c, List<CoreStep> steps)
@@ -1262,6 +1412,27 @@ namespace QuestRecorder
                     if (na != 0 && x.Area != 0 && na != x.Area)
                         continue;
                     x.Steps.Add(n);
+                    foreach (Vec3 p in n.Spots)
+                        AddSpot(x.Spots, p);
+                    foreach (Fact f in n.Causes)
+                        AddSpot(x.Spots, f.Me);
+                }
+                // Missions with no transport of their own that you did there, before you used the next transport (a
+                // heroic you reached on another one's transport, a bonus): their spots are the site too. Started again
+                // anywhere you worked there (Hutta: Hostage Situation's basement, 17 m from where Steel Voice's transport
+                // put you), the bot counts as there and doesn't press a transport it has just used.
+                double leave = double.MaxValue;
+                foreach (CoreStep n in steps)
+                    if (n != h && n.Kind == StepKind.Hop && n.At > h.At && n.At < leave)
+                        leave = n.At;
+                foreach (CoreStep n in steps)
+                {
+                    if (n.Quest == 0 || n.Quest == h.Quest || n.Kind == StepKind.Hop || n.Kind == StepKind.Reward || n.Kind == StepKind.Walk ||
+                        n.At < h.End - 0.5 || n.At >= leave || steps.Exists(o => o.Kind == StepKind.Hop && o.Quest == n.Quest))
+                        continue;
+                    ulong na = AreaOf(n);
+                    if (na == 0 || x.Area == 0 || na != x.Area)
+                        continue;
                     foreach (Vec3 p in n.Spots)
                         AddSpot(x.Spots, p);
                     foreach (Fact f in n.Causes)

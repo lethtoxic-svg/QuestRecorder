@@ -1,5 +1,82 @@
 Quest Recorder patch notes - LethToxic
 
+1.4b
+- Binoculars: when you scan with binoculars, the recorder saves where the camera was looking (left and right, and up
+  and down) and what you scanned. The profile turns and aims the camera the same way before it scans. Only binocular
+  scans are aimed; nothing else changes.
+- Transports: when several transports go on cooldown at the same moment, the last one is the one you pressed (Hutta's
+  Steel Voice transport was read as Factory Recall's).
+- Your own skills from the combat log are mission steps only when a mission item, a mission's special bar or a
+  mission's objective names them (Hutta's Holotraverse and Stealth were steps, and two talk steps were lost).
+- A step is named from the branch you took (Steel Voice's dark choice: "Apply Chemicals to the Filter Station").
+- Starting a heroic profile again partway: the bot knows it's already at a mission's site when it stands where you did
+  that site's other missions or bonuses. A transport with more than 5 minutes of cooldown left is skipped instead of
+  pressed forever.
+- A click on an NPC is a step only if it opened a conversation or made the mission move (Tatooine's Sand People
+  Clansman and Exchange Sentinel clicks were "talk to" steps).
+- A bar that ends as a mission moves is a use of an object when you stand next to an object one of your missions
+  counts right after a loot, or your mouse was on that object as the bar began (Tatooine's black box was read as
+  looting a Sand People Savage).
+- A kill that finishes a mission on the spot is its own fight (War on Spice's bonus boss Sindal Reed was missing).
+- A pop-up that asks you to do a binocular scan or a puzzle yourself has a working Continue button (BuddyCron greys it
+  out unless the profile turns it on, so you could only stop the bot).
+- "What you did": a binocular scan shows the mission step it did. The list looked only 10 s ahead and a scan can take
+  longer (Yavin 4's Chopping Block scan took 11 s and read as "nothing").
+- Binoculars: the profile turns, tilts and zooms the view with the binocular view's own keys first, then the camera's
+  and the mouse's, and only on the input layers the game has on while the view is open (on Yavin 4 the movement and
+  game layers are off then). It writes which keys it tried to BuddyCron's log as "[Binoculars]" lines.
+- A transport is pressed where you pressed it. A step with no spot made BuddyCron walk to <0, 0, 0> first (Tatooine's
+  heroics never left the fleet).
+- Two missions done at the same moment (a heroic's last boss and the weekly it counts for): the boss stays the heroic's
+  own step (Voss's Suvar-Ton and Guardian of Dark History, Nar Shaddaa's Vrblther Hive Guardian and CZ-198's second
+  Anti-Toxin were missing).
+- A medpac or adrenal you used in fights is never a mission step, even when the boss died right after it (Voss).
+  "What you did" says so on its line too (it said a medpac finished Voss's Ancient Guardians).
+- "What you did" shows a mission that ended right after a fight. It was left out (Voss's Ancient Guardians and the
+  weekly, the CZ-198 and Section X dailies, the Black Hole's Control the Battlefield).
+- A transport belongs to the mission you went for, not to a bonus the game still hid when you pressed it (Tython's
+  Speechless comes with The Chamber of Speech at the board but shows only at the site: the bot might never have pressed
+  the transport).
+- A bar that opens a conversation with a device, and the mission moves as that talk ends, is a use of the device under
+  your mouse, also without the combat log (Tython's Ancient Computer was read as a fight with the Lore Guardian).
+  "What you did" names the device you talked to.
+- The wait for a reward is timed from the end of the mission's last step, not its start (some waits were minutes long).
+- A walk through a door or phase runs only in the zone of that door (Voss-Ka's door walk could run on the fleet).
+- Your own skills (a heal-up like Channel Hatred, your mount) are never clicks on objects, even when you had just clicked
+  an object (Voss: every heal-up became a mission click without the combat log). New recordings mark them.
+- A step done by a lift ride and then a walk: the bot walks on to where the mission moved on (Black Hole's Glow ended
+  at the terminal, past the lift).
+- A mission whose last step is done by walking somewhere (Coruscant's Trouble in Deed: "Leave the Shop") gets that walk
+  before its reward. It was missing, so the bot would have stopped at the vault with "A quest from this profile isn't
+  finished". A weekly that ends at the same moment takes its reward after that mission's last step too (without the
+  combat log, Voss's two weekly rewards were waited for before their last boss fights).
+- A step with no count of its own is not named after another task that has its own step (Republic's Most Wanted's
+  Burnout fight was called "Defeat Chopper (Burnout)"; it is now "Kill Burnout").
+- "What you did" shows every mission that ended with nothing you did just before it: "you got there" when you had
+  walked on to that spot, else "it ended by itself" (Trouble in Deed and the Coruscant weekly were left out).
+- "What you did": an item that left your bags is never what moved a mission (it said the transport the game took as
+  Republic's Most Wanted ended had completed it; the line for the Burnout fight now says so). A mission you got that
+  no other line gave has its own line, with the board or NPC the recorder saw, or "no giver seen" (Voss's Protected
+  Writings, and missions taken one by one from a board you kept open).
+- A mission board is never the giver of a mission the game gave you in another zone (Ord Mantell's Savrip Skullcaver
+  came as you landed off the transport; the profile also had a step to take it from the fleet board).
+- A talk that moved nothing, followed right away by a talk with the same NPC that moved the mission, doesn't decide the
+  side the bot answers by (Ord Mantell's DK-9: you picked "Destroy it" and left, then talked again and took "I'll do
+  it"; the profile was set to light side, so the bot would have destroyed the shipment). "What you did" says so on
+  those reply lines.
+- "What you did": a click on your companion is never what moved a mission (Ord Mantell: a Savrip Chieftain kill read
+  as the click on your companion).
+- An object that opens a conversation when you use it is used even though the game doesn't tie it to the mission
+  (Coruscant's Sealed Case: the bot stood next to it and never clicked it). The talk is what moves the mission, so the
+  step now tells BuddyCron not to wait for that tie, like hand-made profiles do (Hutta's Cantina Holoterminal too).
+- Kill and loot with full bags: BuddyCron opens no bodies at all when your bags have 1 free slot or less, but a
+  mission item goes in the mission bag and needs no room (Tython's Power Cells: the bot fought the Sentinels and never
+  looted one). A fight whose count comes from looting now opens that mission's own bodies itself when your bags are
+  full, out of a fight, and takes what fits. With room in your bags BuddyCron loots as before.
+- A mission board you stood very close to: the bot walks to where you stood, not to the board's own spot, which it
+  can't stand in, so the walk never ended (Voss's Heroic Missions board; the Black Hole, Section X, CZ-198 and Nar
+  Shaddaa terminals had the same walk).
+
 1.4a
 - Every step runs only in the area you did it in: a mission board pick-up only on the fleet, a planet's step only on
   that planet (the bot no longer walks to a spot of another map).

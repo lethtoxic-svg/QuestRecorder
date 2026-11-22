@@ -68,6 +68,7 @@ namespace QuestRecorder
         private long _lastCastEndTick = long.MinValue / 2;
 
         private bool _castMounted;
+        private bool _castBinoc; // the cast is a binocular scan (its row is written when it ends, when the flag is off again)
         private bool _convoGroup;
         // The quest log the next looks compare against was taken at the start, after the bot or after a character change:
         // if the game had no quest list then, the first list it gives is the starting log, not a log full of pick-ups.
@@ -379,6 +380,7 @@ namespace QuestRecorder
                 _castArea = cur.AreaId;
                 _castInCombat = prev.InCombat || cur.InCombat;
                 _castMounted = cur.IsMounted;
+                _castBinoc = cur.Binoculars;
                 _castIsQuestItem = cur.QuestItemName != null;
                 _castTarget = cur.QuestItemName == null ? cur.CastTarget : null;
                 if (!_castIsQuestItem && _castTarget != null && _castTarget.Kind == ObjKind.Placeable)
@@ -389,6 +391,8 @@ namespace QuestRecorder
                     cs.Target = _castTarget;
                     Emit(cs);
                 }
+                // (written after every other item row of this look: the profile builder reads the last item of a look as
+                // the one you cast, and the ones before it as the cooldowns it started on items that share one)
                 if (cur.QuestItemName != null)
                 {
                     RecEvent e = New(EvKind.QuestItem, cur);
@@ -422,9 +426,11 @@ namespace QuestRecorder
                 e.Option = _castName;
                 e.DurationMs = ms;
                 e.Target = _castTarget;
+                e.Binoculars |= _castBinoc;
                 Emit(e);
             }
             _castSpec = 0;
+            _castBinoc = false;
             _castTarget = null;
         }
 
@@ -1156,6 +1162,12 @@ namespace QuestRecorder
                 e.Heading = s.Heading;
                 e.AreaId = s.AreaId;
                 e.AreaName = _reader.Area(s.AreaId).Label;
+                e.Binoculars = s.Binoculars;
+                e.HasCam = s.HasCam;
+                e.CamYaw = s.CamYaw;
+                e.CamPitch = s.CamPitch;
+                e.BinocState = s.BinocState ?? string.Empty;
+                e.ScanTarget = s.ScanTarget;
             }
             else
             {

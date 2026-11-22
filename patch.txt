@@ -1,5 +1,5 @@
-1.4a
+1.4b
 main
-- Each step runs only on the map you did it on, and transports that share a name (Korriban) land the bot at the right mission.
-- Tatooine: the Prison Labor transport is found, Call Down the Thunder is tied to the right mission, and Black Box's reward comes after the ambush.
-- Bonus missions the game ends with their heroic are done as far as you did them, and Korriban's slugs are one fight. See PATCHNOTES.txt.
+- Objects that start a talk when you use them are clicked (Coruscant's Sealed Case, Tython's Ancient Computer, Voss's door and last pyre).
+- Kill-and-loot steps pick up the mission item even when your bags are full (Tython's Power Cells), and the bot walks to where you stood at a mission board (Voss).
+- Binocular scans are aimed the way you aimed them, and transports, talks and bosses are read more exactly. See PATCHNOTES.txt.

@@ -195,6 +195,30 @@ namespace QuestRecorder
                     e.HasStand = true;
                     e.Stand = new Vec3(F(c("stand_x")), F(c("stand_y")), F(c("stand_z")));
                 }
+                // a binocular scan (recordings from 1.4b on): the cast is one, where the camera looked, what the game scanned
+                e.Binoculars = c("binoculars") == "yes";
+                if (c("cam_yaw").Length > 0 && c("cam_pitch").Length > 0)
+                {
+                    e.HasCam = true;
+                    e.CamYaw = F(c("cam_yaw"));
+                    e.CamPitch = F(c("cam_pitch"));
+                }
+                e.BinocState = c("binoc_state");
+                if (c("scan_name").Length > 0)
+                {
+                    var so = new ObjRef { Name = c("scan_name"), Kind = ObjKind.Placeable, How = "the game's binocular view picked it" };
+                    string sid = c("scan_id");
+                    ulong snid;
+                    if (sid.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
+                        ulong.TryParse(sid.Substring(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out snid))
+                        so.NodeId = snid;
+                    if (c("scan_x").Length > 0)
+                    {
+                        so.HasPos = true;
+                        so.Pos = new Vec3(F(c("scan_x")), F(c("scan_y")), F(c("scan_z")));
+                    }
+                    e.ScanTarget = so;
+                }
                 events.Add(e);
             }
 

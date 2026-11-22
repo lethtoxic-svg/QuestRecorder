@@ -290,6 +290,19 @@ namespace QuestRecorder
         public ulong CastSpec;
         public ulong TargetId;
 
+        /// <summary>A binocular scan (Macrobinoculars, a mission Scanner): this look's cast is one (its game look is the
+        /// macrobinoculars one).</summary>
+        public bool Binoculars;
+        /// <summary>Where the camera looked (yaw in the game's heading degrees, pitch in degrees up), read only around a
+        /// binocular scan.</summary>
+        public bool HasCam;
+        public float CamYaw;
+        public float CamPitch;
+        /// <summary>The game's binocular state as it says it (open, zoom, picked, scanned), around a binocular scan.</summary>
+        public string BinocState = string.Empty;
+        /// <summary>What the game says the binocular view picked or scanned (an object), or null.</summary>
+        public ObjRef ScanTarget;
+
         /// <summary>The last good quest list (carried over from the previous look when it could not be read now).</summary>
         public List<QSnap> Quests = new List<QSnap>();
         public bool QuestsAvailable;
@@ -447,6 +460,18 @@ namespace QuestRecorder
         public float Heading;
         public ulong AreaId;
         public string AreaName = string.Empty;
+
+        // a binocular scan (Macrobinoculars, a mission Scanner): read only around one
+        /// <summary>The cast of this row is a binocular scan.</summary>
+        public bool Binoculars;
+        /// <summary>Where the camera looked: yaw in the game's heading degrees, pitch in degrees up.</summary>
+        public bool HasCam;
+        public float CamYaw;
+        public float CamPitch;
+        /// <summary>The game's binocular state as it says it (open, zoom, picked, scanned).</summary>
+        public string BinocState = string.Empty;
+        /// <summary>What the game says the binocular view picked or scanned, or null.</summary>
+        public ObjRef ScanTarget;
 
         // quest
         public ulong QuestId;

@@ -338,7 +338,7 @@ namespace QuestRecorder
                     b.Yellow = true;
                     string what = s.Causes.Count > 0 && s.Causes[0].Target != null && s.Causes[0].Target.Name.Length > 0 ? s.Causes[0].Target.Name : "the controls";
                     b.After.Add("<If Condition=\"" + Fmt.XmlAttr(b.Gate) + "\">");
-                    b.After.Add("\t<UserDialog Title=\"Quest Recorder\" Message=\"" + Fmt.XmlAttr("Do the puzzle at " + what + " by hand, then press Continue.") + "\" />");
+                    b.After.Add("\t<UserDialog Title=\"Quest Recorder\" Message=\"" + Fmt.XmlAttr("Do the puzzle at " + what + " by hand, then press Continue.") + "\" IsBotContinueAllowed=\"True\" />");
                     b.After.Add("</If>");
                     break;
                 }
@@ -689,19 +689,27 @@ namespace QuestRecorder
         /// <summary>What the game's tracker says for that task ("Identify Torvix's Spies").</summary>
         internal static string TaskText(CoreFacts c, CoreStep s)
         {
+            // that step of that branch first: step 2 of branch 2 is another step than step 2 of branch 1 (Steel Voice:
+            // "Apply Chemicals to the Filter Station", not "Investigate the Filter Station")
+            string text = TaskText(c, s, true);
+            return text.Length > 0 ? text : TaskText(c, s, false);
+        }
+
+        private static string TaskText(CoreFacts c, CoreStep s, bool sameBranch)
+        {
             if (s.Task < 0)
             {
                 // the objective the tracker showed once the quest came to that step
                 foreach (Track t in c.Tracks)
-                    if (t.Quest == s.Quest && t.Step == s.Step && t.Ev != null && t.Ev.Text.Length > 0 && (t.Kind == TrackKind.Added || t.Kind == TrackKind.Step))
+                    if (t.Quest == s.Quest && t.Step == s.Step && (!sameBranch || t.Branch == s.Branch) && t.Ev != null && t.Ev.Text.Length > 0 && (t.Kind == TrackKind.Added || t.Kind == TrackKind.Step))
                         return Fmt.OneLine(t.Ev.Text);
                 foreach (Track t in c.Tracks)
-                    if (t.Quest == s.Quest && t.Step == s.Step && t.Ev != null && t.Ev.Text.Length > 0 && t.Kind == TrackKind.Task)
+                    if (t.Quest == s.Quest && t.Step == s.Step && (!sameBranch || t.Branch == s.Branch) && t.Ev != null && t.Ev.Text.Length > 0 && t.Kind == TrackKind.Task)
                         return Fmt.OneLine(t.Ev.Text);
                 return string.Empty;
             }
             foreach (Track t in c.Tracks)
-                if (t.Quest == s.Quest && t.Step == s.Step && t.Task == s.Task && t.Ev != null && t.Ev.Text.Length > 0)
+                if (t.Quest == s.Quest && t.Step == s.Step && (!sameBranch || t.Branch == s.Branch) && t.Task == s.Task && t.Ev != null && t.Ev.Text.Length > 0)
                     return Fmt.OneLine(t.Ev.Text);
             return string.Empty;
         }

@@ -643,7 +643,7 @@ namespace QuestRecorder
             if (cond == null)
                 // just once: walk to where you stood, use it there
                 return "<MoveTo QuestId=\"1\" Name=\"Where you used it\" XYZ=\"" + X(x, y, z) + "\" />" +
-                       "<UseItem ItemName=\"" + Esc(item) + "\" WaitTime=\"3000\" Range=\"2000\">" + spot + "</UseItem>";
+                       "<UseItem ItemName=\"" + Esc(item) + "\" WaitTime=\"3000\" Range=\"2000\" XYZ=\"" + X(x, y, z) + "\">" + spot + "</UseItem>";
             // at your spot until the step is done: the step ids tell BuddyCron's UseItem when it's done (like the recorder's own item uses)
             return Wrap(cond, "<UseItem ItemName=\"" + Esc(item) + "\"" + ids + " WaitTime=\"3000\" XYZ=\"" + X(x, y, z) + "\">" + spot + "</UseItem>");
         }

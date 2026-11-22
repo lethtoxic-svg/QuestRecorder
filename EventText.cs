@@ -295,6 +295,11 @@ namespace QuestRecorder
             }
             if (e.HasStand)
                 lines.Add(Indent + "you stood at " + Fmt.Xyz(e.Stand));
+            if (e.Binoculars || e.HasCam || e.ScanTarget != null)
+                lines.Add(Indent + (e.Binoculars ? "binocular scan; " : "binoculars: ") +
+                          (e.HasCam ? Fmt.Format("camera looked at heading {0} deg, {1} deg up", Fmt.F1(e.CamYaw), Fmt.F1(e.CamPitch)) : "camera not read") +
+                          (e.ScanTarget != null ? "; the game says it picked " + Describe(e.ScanTarget) : string.Empty) +
+                          (string.IsNullOrEmpty(e.BinocState) ? string.Empty : "  [" + e.BinocState + "]"));
             if (e.Target != null)
                 lines.Add(Indent + Describe(e.Target));
             if (e.QuestFqn.Length > 0 && e.Kind != EvKind.QuestTask)
@@ -334,7 +339,8 @@ namespace QuestRecorder
             "old_branch,old_step,task_index,task_id,count,max,objective,target_kind,target_name,target_id,target_x,target_y," +
             "target_z,target_marker,target_how,before_x,before_y,before_z,before_area_id,before_area_name,stand_x,stand_y," +
             "stand_z,option,note,live_check,live_check_failed,duration_ms,summary," +
-            "target_dead,target_anchor,target_level,target_toughness,target_use_range,target_quest_usable,target_spec,task_targets,target_health";
+            "target_dead,target_anchor,target_level,target_toughness,target_use_range,target_quest_usable,target_spec,task_targets,target_health," +
+            "binoculars,cam_yaw,cam_pitch,binoc_state,scan_name,scan_id,scan_x,scan_y,scan_z";
 
         public static string CsvRow(RecEvent e)
         {
@@ -400,6 +406,17 @@ namespace QuestRecorder
                     tt.Add(Fmt.Hex(id));
             f.Add(string.Join(" ", tt.ToArray()));
             f.Add(t != null && t.Health >= 0f ? Fmt.F3(t.Health) : string.Empty);
+            // a binocular scan: the cast is one, where the camera looked, the game's binocular state, what it scanned
+            f.Add(e.Binoculars ? "yes" : string.Empty);
+            f.Add(e.HasCam ? Fmt.F3(e.CamYaw) : string.Empty);
+            f.Add(e.HasCam ? Fmt.F3(e.CamPitch) : string.Empty);
+            f.Add(e.BinocState ?? string.Empty);
+            ObjRef sc = e.ScanTarget;
+            f.Add(sc != null ? sc.Name : string.Empty);
+            f.Add(sc != null && sc.NodeId != 0 ? Fmt.Hex(sc.NodeId) : string.Empty);
+            f.Add(sc != null && sc.HasPos ? Fmt.F3(sc.Pos.X) : string.Empty);
+            f.Add(sc != null && sc.HasPos ? Fmt.F3(sc.Pos.Y) : string.Empty);
+            f.Add(sc != null && sc.HasPos ? Fmt.F3(sc.Pos.Z) : string.Empty);
 
             var sb = new StringBuilder(256);
             for (int i = 0; i < f.Count; i++)

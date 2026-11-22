@@ -174,7 +174,8 @@ namespace QuestRecorder
             Hops(c, steps);
             Fmt.StableSort(steps, (x, y) => x.At != y.At ? x.At.CompareTo(y.At) : x.End.CompareTo(y.End));
             // a mission's reward (or hand-in) never before a step of that mission done at the same moment (Black Box: the
-            // ambush's last kill and the reward window came together)
+            // ambush's last kill and the reward window came together), nor before a same-moment step of a mission that ended
+            // with it (the weekly that Trouble in Deed's end completed: its reward comes after the walk out of the shop)
             for (int i = 0; i < steps.Count; i++)
             {
                 CoreStep r = steps[i];
@@ -182,7 +183,8 @@ namespace QuestRecorder
                     continue;
                 int last = -1;
                 for (int j = i + 1; j < steps.Count && steps[j].At <= r.At + 0.01; j++)
-                    if (steps[j].Quest == r.Quest && steps[j].Kind != StepKind.Reward && steps[j].Kind != StepKind.HandIn)
+                    if ((steps[j].Quest == r.Quest || EndedTogether(c, r.Quest, steps[j].Quest, r.At)) &&
+                        steps[j].Kind != StepKind.Reward && steps[j].Kind != StepKind.HandIn)
                         last = j;
                 if (last > i)
                 {
@@ -293,14 +295,19 @@ namespace QuestRecorder
             }
             // the first mission you had when you pressed it that moved on after you landed (a count, a step, its end):
             // what you went there for
+            // (a mission the game still hid when you pressed it - a heroic's bonus, given with it at the board and shown only
+            // at the site - only when no shown one moved on: Tython's Speechless counted first, and the bot never saw it on
+            // the fleet)
             ulong next = 0;
             double nextAt = double.MaxValue;
-            foreach (Track t in c.Tracks)
-                if (t.Kind != TrackKind.Added && t.Kind != TrackKind.Removed && t.At > hop.End && t.At - hop.End < 600 && t.At < nextAt && HadAt(c, t.Quest, hop.At))
-                {
-                    next = t.Quest;
-                    nextAt = t.At;
-                }
+            for (int pass = 0; pass < 2 && next == 0; pass++)
+                foreach (Track t in c.Tracks)
+                    if (t.Kind != TrackKind.Added && t.Kind != TrackKind.Removed && t.At > hop.End && t.At - hop.End < 600 && t.At < nextAt && HadAt(c, t.Quest, hop.At) &&
+                        (pass == 1 || !HiddenAt(c, t.Quest, hop.At)))
+                    {
+                        next = t.Quest;
+                        nextAt = t.At;
+                    }
             // another transport of the same name took you somewhere else (Korriban's two "Heroic Transport"s): the item's
             // end can be the other one's, where you landed is yours
             bool shared = c.Facts.Exists(o => o != hop && o.Kind == FactKind.Hop && o.Item == hop.Item &&
@@ -332,6 +339,16 @@ namespace QuestRecorder
             }
             how = "no mission could be tied to it";
             return 0;
+        }
+
+        /// <summary>The game still hid the mission at that moment (its last row before it said so).</summary>
+        private static bool HiddenAt(CoreFacts c, ulong q, double t)
+        {
+            bool hidden = false;
+            for (int i = 0; i < c.Events.Count && c.AtOf[i] <= t + 0.5; i++)
+                if (c.Events[i].QuestId == q)
+                    hidden = c.Events[i].QuestHidden;
+            return hidden;
         }
 
         /// <summary>The mission was in your log at that moment (added before it, or there from the start).</summary>
@@ -710,8 +727,46 @@ namespace QuestRecorder
                         foreach (Fact f in Window(ctx.C, ch, ch.At - 10))
                             if (f.Spec != 0 && ch.Targets.Contains(f.Spec))
                                 return false; // its own action, tied by ids
+                    // (two missions done in one look: the one that counts the other follows from it, not the other way
+                    // round - Voss's weekly Heroic Missions counts the heroics by their ids, and Cleanse the Corrupted's last
+                    // boss was lost as "done when the weekly was")
+                    if (Leads(ctx, q, d.Value))
+                        continue;
                     return true;
                 }
+            return false;
+        }
+
+        /// <summary>
+        /// Of two missions done in one look, <paramref name="q"/> is the one that did it: the other counts it by its id;
+        /// or, when neither names the other, q moved on its own before (a step or count in a look where no other mission
+        /// was done) and the other never did (a weekly that only counts other missions: Defending Voss-Ka).
+        /// </summary>
+        private static bool Leads(Ctx ctx, ulong q, ulong other)
+        {
+            bool otherNamesQ = false, qNamesOther = false;
+            foreach (Track t in ctx.C.Tracks)
+            {
+                if (t.Quest == other && t.Targets.Contains(q))
+                    otherNamesQ = true;
+                if (t.Quest == q && t.Targets.Contains(other))
+                    qNamesOther = true;
+            }
+            if (otherNamesQ != qNamesOther)
+                return otherNamesQ;
+            return OwnMoves(ctx, q) && !OwnMoves(ctx, other);
+        }
+
+        /// <summary>A step or count of the mission in a look where no other mission was done.</summary>
+        private static bool OwnMoves(Ctx ctx, ulong q)
+        {
+            foreach (Track t in ctx.C.Tracks)
+            {
+                if (t.Quest != q || (t.Kind != TrackKind.Task && t.Kind != TrackKind.Step))
+                    continue;
+                if (!ctx.DoneLooks.Exists(d => d.Value != q && Math.Abs(d.Key - t.Look) <= 1))
+                    return true;
+            }
             return false;
         }
 
@@ -732,6 +787,22 @@ namespace QuestRecorder
             // did on its own: nothing you did then made that)
             if (ch.Kind == TrackKind.Completed && building.Count == 0 && ch.At - ch.Since < 2.5)
                 return;
+            // (the counts it showed were full, and a mob the mission counts - the task scanner saw it - died the moment the
+            // step ended: a count the recorder never saw tick, the boss that finished it, Exchange of Violence's Sindal
+            // Reed; its fight goes with that step's other fights)
+            Fact last = FinishingKill(ctx, q, ch, building, used);
+            if (last != null)
+            {
+                used.Add(last);
+                ctx.Claim(last, q, ch.At, 3);
+                double after = double.MinValue;
+                foreach (CoreStep b in building)
+                    after = Math.Max(after, b.At);
+                CoreStep k = OpenFor(open, steps, ch, last, qname, -1, false);
+                k.At = after + 0.001;
+                Add(c, k, last, ch, 2, null);
+                return;
+            }
             int rank;
             string why;
             Fact cause = Cause(ctx, q, ch, from, used, out rank, out why);
@@ -767,8 +838,13 @@ namespace QuestRecorder
             List<Fact> acts = Actions(ctx, q, ch, from, used, cause);
             if (acts.Count == 0)
             {
-                if (ch.Kind == TrackKind.Completed)
-                    return; // the end itself (a hand-in, a reward) is the step
+                // the end itself (a hand-in, a reward) is the step; but a mission that ended where you went after your last
+                // action, long after it and away from it, with no one to hand in to and no call, was done by getting there:
+                // Trouble in Deed's "Leave the Shop", done at the shop's door 20 units from the vault - the bot walks there,
+                // then waits for the reward (it would wait at the vault for a mission that never ends)
+                if (ch.Kind == TrackKind.Completed &&
+                    !(why != null && why.StartsWith("it changed where you went after your last action", StringComparison.Ordinal) && !HandInOrCall(ctx, q, ch, from, used)))
+                    return;
                 CoreStep w = OpenFor(open, steps, ch, null, qname, -1, false);
                 w.Came = ch.Since;
                 Add(c, w, null, ch, 3, why ?? "nothing you did was seen before the step changed (a walk, a cutscene or an area)");
@@ -782,6 +858,23 @@ namespace QuestRecorder
                 CoreStep n = OpenFor(open, steps, ch, f, qname, -1, false);
                 Add(c, n, f, ch, f == cause ? rank : 2, f == cause ? why : "tied by time: done for this step before it changed");
             }
+        }
+
+        /// <summary>Two missions that both completed within 1 s of this moment (a weekly and the heroic that completed it).</summary>
+        private static bool EndedTogether(CoreFacts c, ulong a, ulong b, double at)
+        {
+            return a != b && c.Tracks.Exists(t => t.Quest == a && t.Kind == TrackKind.Completed && Math.Abs(t.At - at) <= 1.0) &&
+                   c.Tracks.Exists(t => t.Quest == b && t.Kind == TrackKind.Completed && Math.Abs(t.At - at) <= 1.0);
+        }
+
+        /// <summary>The mission's end has a hand-in (the talk the end would take) or a holocom call.</summary>
+        private static bool HandInOrCall(Ctx ctx, ulong q, Change ch, double from, HashSet<Fact> used)
+        {
+            CoreFacts c = ctx.C;
+            foreach (Fact f in Window(c, ch, Math.Max(from, ch.At - 15)))
+                if (f.Kind == FactKind.Talk && !used.Contains(f) && ch.At - f.End < 15)
+                    return true;
+            return c.Tracks.Exists(t => t.Quest == q && t.Kind == TrackKind.Holocom && Math.Abs(t.At - ch.At) < 30);
         }
 
         /// <summary>
@@ -799,8 +892,10 @@ namespace QuestRecorder
                     continue;
                 if (used.Contains(f) || TakenByOther(ctx, q, f))
                     continue;
+                // (a click on an NPC that opened no conversation and did nothing - a mob you right-clicked on the way to the
+                // object - is not an action of the step; it still is when it is the cause, the only thing that moved it)
                 bool strong = f.Kind == FactKind.UseObject || f.Kind == FactKind.Item || (f.Kind == FactKind.Ability && !f.InFight && f.Cast.Length > 0) ||
-                              (f.Kind == FactKind.Talk && ch.Kind != TrackKind.Completed);
+                              (f.Kind == FactKind.Talk && ch.Kind != TrackKind.Completed && (f.Convo || f.Did));
                 bool lastLoot = f.Kind == FactKind.Loot && ch.At - f.At <= 10;
                 if (!(strong || lastLoot || f == cause))
                     continue;
@@ -819,6 +914,39 @@ namespace QuestRecorder
                 list.Add(cause);
             Fmt.StableSort(list, (x, y) => x.At.CompareTo(y.At));
             return list;
+        }
+
+        /// <summary>
+        /// The kill that finished a step whose counts were all full: a mob the mission counts (the recorder's task scanner
+        /// saw that kind) that none of the step's counts had, died at most 1.5 s before the step ended; or null.
+        /// </summary>
+        private static Fact FinishingKill(Ctx ctx, ulong q, Change ch, List<CoreStep> building, HashSet<Fact> used)
+        {
+            if (building.Count == 0 || building.Exists(b => b.Max == 0 || b.CountTo < b.Max))
+                return null;
+            CoreFacts c = ctx.C;
+            Fact best = null;
+            foreach (Fact f in c.Facts)
+            {
+                if (f.Kind != FactKind.Kill || f.Target == null || f.Target.Spec == 0 || used.Contains(f) || TakenByOther(ctx, q, f))
+                    continue;
+                if (ch.At - f.At < -0.05 || ch.At - f.At > 1.5)
+                    continue;
+                ulong spec = f.Target.Spec;
+                if (ch.Targets.Contains(spec) || building.Exists(b => b.Specs.Contains(spec) || b.Accepts.Contains(spec)))
+                    continue;
+                bool counted = false;
+                foreach (RecEvent e in c.Events)
+                    if (e.Target != null && e.Target.Spec == spec && e.Target.How != null &&
+                        e.Target.How.IndexOf("a mob one of your tasks counts", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        counted = true;
+                        break;
+                    }
+                if (counted && (best == null || f.At >= best.At))
+                    best = f;
+            }
+            return best;
         }
 
         private static bool UsedNode(HashSet<Fact> used, ulong node)
@@ -1277,7 +1405,13 @@ namespace QuestRecorder
                 if (f.FirstLook > t.Look || f.At > t.At + 0.6 || f.At < t.At - 60)
                     continue;
                 if (f.Kind == FactKind.Board)
+                {
+                    // (a board in another area than the one the mission came in is not its giver: Ord Mantell's Savrip
+                    // Skullcaver came as you landed off the transport, 23 s after the Republic Fleet board you had used)
+                    if (t.Ev != null && t.Ev.AreaId != 0 && f.Area != 0 && t.Ev.AreaId != f.Area)
+                        continue;
                     board = f;
+                }
                 else if (f.Kind == FactKind.Talk && t.At - f.End < 20)
                     talk = f;
                 else if ((f.Kind == FactKind.Loot || f.Kind == FactKind.UseObject || f.Kind == FactKind.Kill || f.Kind == FactKind.Item) && t.Look - f.Look <= 1)

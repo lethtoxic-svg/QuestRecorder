@@ -147,6 +147,10 @@ namespace QuestRecorder
         /// recording began, so a quest ability you got before or during the bot run is still new afterwards.</param>
         public void ResetCharacter(bool keepAbilityBaseline)
         {
+            _binocUntil = NeverRead;
+            _scanRef = IntPtr.Zero;
+            _scanRefId = 0;
+            _scanObj = null;
             _tracked.Clear();
             _lastClick = null;
             _taxiPending = false;
@@ -303,6 +307,7 @@ namespace QuestRecorder
             Part("interaction", () => ReadInteraction(prev, s));
             Part("combat", () => ReadCombat(me, prev, s));
             Part("casts", () => ReadCast(me, prev, s));
+            Part("binoculars", () => ReadBinoculars(me, s));
             Part("items", () => ReadInstantItems(me, s));
             Part("task scan", () => ScanTaskObjects(s));
             Part("combat log", () => ReadCombatLog(s));
@@ -1103,6 +1108,231 @@ namespace QuestRecorder
             {
                 return null;
             }
+        }
+
+        // ------------------------------------------------------------------ binocular scans
+
+        // Game files: every binocular scan ability (Macrobinoculars, Yavin 4's mission Scanner, Ziost's Life Scanner...) has
+        // the macrobinoculars cast look, and what it scans is a mission object the game marks for binoculars.
+        private readonly Dictionary<ulong, bool> _binocCast = new Dictionary<ulong, bool>(); // cast id -> a binocular scan
+        private long _binocUntil = NeverRead; // the camera and the game's binocular state are read until then
+        private CameraReader _camera;
+        private IntPtr _scanRef; // the view's pick last looked up
+        private ulong _scanRefId;
+        private ObjRef _scanObj;
+        private bool _binocLayersLogged; // the game's input layers and binocular calls: written once a recording
+        private int _binocFails;
+        private bool _binocOff;
+
+        private static readonly GomFieldId[] BinocFields =
+        {
+            GomFieldId.mbnBinocularsActive, GomFieldId.mbnZoomState, GomFieldId.mbnScannedPlaceable, GomFieldId.mbnSelectedProp,
+            GomFieldId.mbnScanTimer, GomFieldId.mbnScannedBinocularsObjectFqn, GomFieldId.mbnBinocularsAbility
+        };
+
+        /// <summary>
+        /// A binocular scan: the cast's game look is the macrobinoculars one. From that cast to 45 s after (and as long as the
+        /// game says the view is open) every look also reads where the camera looks and the game's binocular state, so the
+        /// profile can face and aim the way you did. Read only: nothing is changed in the game.
+        /// </summary>
+        private void ReadBinoculars(HeroLocalPlayer me, Snap s)
+        {
+            if (_binocOff)
+                return;
+            if (s.CastSpec != 0 && IsBinocularCast(me, s.CastSpec))
+            {
+                s.Binoculars = true;
+                _binocUntil = s.Tick + 45000;
+            }
+            if (s.Tick > _binocUntil)
+            {
+                _scanRef = IntPtr.Zero;
+                _scanRefId = 0;
+                _scanObj = null;
+                return;
+            }
+            bool trouble = false;
+            try
+            {
+                ReadCamera(s);
+            }
+            catch
+            {
+                trouble = true;
+            }
+            bool open = false;
+            try
+            {
+                open = ReadBinocState(me, s);
+            }
+            catch
+            {
+                trouble = true;
+            }
+            if (open)
+                _binocUntil = Math.Max(_binocUntil, s.Tick + 10000);
+            // the game keeps refusing: stop asking for the rest of this recording (everything else carries on)
+            _binocFails = trouble ? _binocFails + 1 : 0;
+            if (_binocFails >= 20)
+            {
+                _binocOff = true;
+                RrLog.Info("The game won't say where the camera looks: binocular aim isn't recorded this time (everything else is).");
+            }
+        }
+
+        private bool IsBinocularCast(HeroLocalPlayer me, ulong spec)
+        {
+            bool b;
+            if (_binocCast.TryGetValue(spec, out b))
+                return b;
+            b = false;
+            try
+            {
+                HeroAbility a = me.CastingAbility;
+                string look = a != null ? (a.AppearanceSpec ?? string.Empty) : string.Empty;
+                b = look.IndexOf("binoculars_standard", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    look.IndexOf(".binoculars.", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch
+            {
+                b = false; // the game gave no look for it: not a binocular scan
+            }
+            if (_binocCast.Count < 500)
+                _binocCast[spec] = b;
+            return b;
+        }
+
+        private void ReadCamera(Snap s)
+        {
+            if (_camera == null)
+                _camera = new CameraReader();
+            CameraSnapshot snap;
+            if (!_camera.TryGetSnapshot(out snap))
+                return;
+            Vector3 f;
+            if (!CamForward(snap.View, out f))
+                return;
+            float yaw = BuddyCron.Helpers.HeroMath.MungeHeadingDegrees(BuddyCron.Helpers.HeroMath.VectorToHeading(f));
+            float pitch = (float)(Math.Asin(Math.Max(-1.0, Math.Min(1.0, (double)f.Y))) * 180.0 / Math.PI);
+            if (float.IsNaN(yaw) || float.IsNaN(pitch) || float.IsInfinity(yaw) || float.IsInfinity(pitch))
+                return;
+            s.CamYaw = yaw;
+            s.CamPitch = pitch;
+            s.HasCam = true;
+        }
+
+        /// <summary>The way the camera looks, as a unit vector: a view matrix's third column is its back axis (BuddyCron's own
+        /// screen maths takes the view as right-handed).</summary>
+        internal static bool CamForward(Matrix4x4 v, out Vector3 f)
+        {
+            f = new Vector3(-v.M13, -v.M23, -v.M33);
+            float len = f.Length();
+            if (!(len > 0.5f && len < 2f))
+                return false; // not a view
+            f /= len;
+            return true;
+        }
+
+        /// <summary>The game's binocular state as it says it (true = the view is open), and what the view picked or scanned.</summary>
+        private bool ReadBinocState(HeroLocalPlayer me, Snap s)
+        {
+            IntPtr node = me.Pointer;
+            if (node == IntPtr.Zero)
+                return false;
+            var parts = new List<string>();
+            bool open = false;
+            IntPtr pick = IntPtr.Zero;
+            ulong pickId = 0;
+            foreach (GomFieldId fid in BinocFields)
+            {
+                try
+                {
+                    GomFieldRef fr;
+                    if (!Gom.TryResolveField(node, fid, out fr))
+                        continue;
+                    parts.Add(fid.ToString().Substring(3) + "=" + Fmt.OneLine(HeroValueDecoder.Decode(fr.Dom, fr.Address)));
+                    if (fid == GomFieldId.mbnBinocularsActive && fr.Dom == HeroDomType.Boolean)
+                        open = HeroValueDecoder.Read<bool>(fr.Dom, fr.Address);
+                    else if ((fid == GomFieldId.mbnScannedPlaceable || fid == GomFieldId.mbnSelectedProp) && pick == IntPtr.Zero && pickId == 0)
+                    {
+                        if (fr.Dom == HeroDomType.NodeRef)
+                        {
+                            IntPtr view = HeroValueDecoder.Read<IntPtr>(fr.Dom, fr.Address);
+                            if (view != IntPtr.Zero)
+                                pick = Gom.NodeFromNodeRefView(view);
+                        }
+                        else if (fr.Dom == HeroDomType.Id)
+                            pickId = HeroValueDecoder.Read<ulong>(fr.Dom, fr.Address);
+                    }
+                }
+                catch
+                {
+                    // this one can't be read: the others still are
+                }
+            }
+            if (open && !_binocLayersLogged)
+            {
+                // once a recording: the game's input layers and its binocular calls (to check the bot's aiming against)
+                _binocLayersLogged = true;
+                try
+                {
+                    var layers = new List<string>();
+                    foreach (KeyValuePair<string, HeroInputLayer> kv in ExtraNodeManager.InputLayers)
+                        if (kv.Value != null && layers.Count < 40)
+                            layers.Add(kv.Key + (kv.Value.IsValid && kv.Value.IsActive ? " (on)" : string.Empty));
+                    var calls = new List<string>();
+                    foreach (var m in me.ScriptMethods)
+                    {
+                        string mn = m.name ?? string.Empty;
+                        if (calls.Count < 40 && (mn.IndexOf("mbn", StringComparison.OrdinalIgnoreCase) >= 0 || mn.IndexOf("binoc", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                 mn.IndexOf("zoom", StringComparison.OrdinalIgnoreCase) >= 0 || mn.IndexOf("macro", StringComparison.OrdinalIgnoreCase) >= 0))
+                            calls.Add(mn);
+                    }
+                    string info = "input layers: " + string.Join(" / ", layers.ToArray()) + "; binocular calls: " + string.Join(" / ", calls.ToArray());
+                    parts.Add(info);
+                    RrLog.Info("Binoculars open. The game's {0}", info);
+                }
+                catch
+                {
+                    // not needed for the recording
+                }
+            }
+            s.BinocState = string.Join(" ", parts.ToArray());
+            // what it picked or scanned: looked up once each time it changes
+            if (pick != _scanRef || pickId != _scanRefId)
+            {
+                _scanRef = pick;
+                _scanRefId = pickId;
+                _scanObj = pick == IntPtr.Zero && pickId == 0 ? null : FindPicked(pick, pickId);
+            }
+            if (_scanObj != null)
+                s.ScanTarget = _scanObj;
+            return open;
+        }
+
+        private ObjRef FindPicked(IntPtr pick, ulong pickId)
+        {
+            foreach (HeroPlaceable p in HeroObjectManager.GetObjects<HeroPlaceable>())
+            {
+                try
+                {
+                    if (p == null || !((pick != IntPtr.Zero && p.Pointer == pick) || (pickId != 0 && p.NodeId == pickId)))
+                        continue;
+                    var r = new ObjRef { Name = Fmt.OneLine(p.Name), NodeId = p.NodeId, Kind = ObjKind.Placeable, How = "the game's binocular view picked it" };
+                    Vec3 pos = V(p.Location);
+                    r.Pos = pos;
+                    r.HasPos = !pos.IsZero;
+                    ulong spec;
+                    if (p.TryGetField<ulong>(GomFieldId.spnSpawnedSpec, out spec))
+                        r.Spec = spec;
+                    return r;
+                }
+                catch
+                {
+                    // skip this one
+                }
+            }
+            return null;
         }
 
         // ------------------------------------------------------------------ quest abilities, equipped items
@@ -2029,10 +2259,15 @@ namespace QuestRecorder
                     bool own = name.Length > 0 && ((_baseAbilities != null ? _baseAbilities.Contains(name) : known) || _mountCasts.Contains(name));
                     ObjRef body = RecentClick(s, 3000, "you clicked it");
                     bool loot = name == "Loot" || name == "Looting" || (body != null && body.Kind == ObjKind.Npc && body.Dead);
-                    s.CastTarget = CastObject(s, own || loot);
+                    // (your own ability on an object you had just clicked says so: the maker never takes that ability for a
+                    // use of objects - Voss, 22 Nov: a heal-up "Channel Hatred" just after a scan was made a mission click)
+                    s.CastTarget = CastObject(s, own || loot, own && !loot);
                 }
             }
         }
+
+        /// <summary>The "how" of a cast of your own ability (a class skill, Recuperate) on an object you had just clicked.</summary>
+        internal const string OwnAbilityHow = "you clicked it, then one of your own abilities was cast";
 
         /// <summary>BuddyCron's "you have this ability" (false when it can't say).</summary>
         private static bool KnowsAbility(string name)
@@ -2116,9 +2351,9 @@ namespace QuestRecorder
         }
 
         /// <summary>The object an out-of-combat cast was most likely used on.</summary>
-        private ObjRef CastObject(Snap s, bool clickOnly)
+        private ObjRef CastObject(Snap s, bool clickOnly, bool ownAbility = false)
         {
-            ObjRef click = RecentClick(s, 3000, "you clicked it, then the cast started");
+            ObjRef click = RecentClick(s, 3000, ownAbility ? OwnAbilityHow : "you clicked it, then the cast started");
             if (click != null && click.Kind == ObjKind.Placeable)
                 return click;
             if (clickOnly)

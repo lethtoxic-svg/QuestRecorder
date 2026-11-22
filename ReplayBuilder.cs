@@ -1093,6 +1093,70 @@ namespace QuestRecorder
             }
         }
 
+        /// <summary>
+        /// Talks you redid: a conversation that moved no mission, then a talk with the same NPC within 30 s that did. The
+        /// first one didn't count in the game (Ord Mantell's DK-9: you picked "Destroy it" (light) and the talk ended before
+        /// the line that runs the mission's part; the second talk took "I'll do it", the game file's "deliver" branch that
+        /// Buying Loyalty went to). The rows of the first talk: its replies are not what you played, so they don't decide
+        /// the side the bot answers by.
+        /// </summary>
+        internal static HashSet<RecEvent> RedoneTalkRows(IList<RecEvent> events)
+        {
+            var rows = new HashSet<RecEvent>();
+            for (int i = 0; i < events.Count; i++)
+            {
+                RecEvent a = events[i];
+                if (a.Kind != EvKind.ConvoStart || a.Target == null || a.Target.Name.Length == 0 || a.Note == How.HolocomCall)
+                    continue;
+                int end = TalkEnd(events, i);
+                if (end < 0 || TalkMoved(events, i, end))
+                    continue;
+                for (int j = end + 1; j < events.Count && events[j].Elapsed - events[end].Elapsed <= 30; j++)
+                {
+                    RecEvent b = events[j];
+                    if (b.Kind != EvKind.ConvoStart)
+                        continue;
+                    if (b.Target != null && b.Target.Name == a.Target.Name && b.Note != How.HolocomCall)
+                    {
+                        int bend = TalkEnd(events, j);
+                        if (bend >= 0 && TalkMoved(events, j, bend))
+                            for (int k = i; k <= end; k++)
+                                rows.Add(events[k]);
+                    }
+                    break; // (only the next talk: someone else in between, or that one moved nothing either - kept)
+                }
+            }
+            return rows;
+        }
+
+        /// <summary>The ConvoEnd row of the talk that starts at row <paramref name="start"/>; -1 when it has none.</summary>
+        private static int TalkEnd(IList<RecEvent> events, int start)
+        {
+            for (int j = start + 1; j < events.Count; j++)
+            {
+                if (events[j].Kind == EvKind.ConvoEnd)
+                    return j;
+                if (events[j].Kind == EvKind.ConvoStart)
+                    return -1;
+            }
+            return -1;
+        }
+
+        /// <summary>Any mission (a hidden one too) changed during that talk or 1.5 s after its end, before your next click.</summary>
+        private static bool TalkMoved(IList<RecEvent> events, int start, int end)
+        {
+            double until = events[end].Elapsed + 1.5;
+            for (int k = start + 1; k < events.Count && events[k].Elapsed <= until; k++)
+            {
+                EvKind q = events[k].Kind;
+                if (k > end && (q == EvKind.ConvoStart || q == EvKind.NpcClick || q == EvKind.ObjectClick))
+                    break;
+                if (q == EvKind.QuestAdded || q == EvKind.QuestTask || q == EvKind.QuestStep || q == EvKind.QuestCompleted || q == EvKind.QuestRemoved)
+                    return true;
+            }
+            return false;
+        }
+
         /// <summary>What the bot picks on a wheel for a side: that side's reply, else the first neutral, else the first.</summary>
         private static string AutoPick(List<string> wheel, string side)
         {
@@ -1254,6 +1318,446 @@ namespace QuestRecorder
         /// <summary>The plain pass's hook numbers so far (a second pass on more steps goes on from them).</summary>
         [ThreadStatic] private static int _hookNo;
         [ThreadStatic] private static bool _faceAdded;
+        [ThreadStatic] private static bool _binocAdded;
+
+        /// <summary>
+        /// The code a binocular scan's hook calls (one copy a profile): after the cast it turns and tilts the camera to where you
+        /// aimed, checking each move by reading where the game's camera looks, zooms in, and waits for the scan.
+        /// </summary>
+        private const string BinocCode = @"// Binocular scans (Macrobinoculars, a mission Scanner): turn and tilt the camera to where you aimed, zoom in, wait for the
+// scan. Each move is checked by reading where the game's camera looks; what moved it goes to BuddyCron's log (""[Binoculars]"").
+static int _bnState; // 0 not started, 1 waiting for the view to open, 2 aiming, 3 zooming / waiting for the scan
+static System.DateTime _bnAt, _bnZoomAt;
+static float _bnWantYaw = float.NaN, _bnWantPitch = float.NaN;
+static int _bnPulses, _bnZoomTries, _bnTurnMode, _bnPending, _bnLastMs;
+static bool _bnZoomTook;
+static int _bnYawLayer, _bnPitchLayer; // which of _bnOrder's layers moves it (past its end = none does)
+static int[] _bnOrder, _bnZoomOrder; // the input layers to try, in turn (BinocOrder)
+static float _bnYawGain, _bnPitchGain; // how far the camera moved per ms a key was held (signed; 0 = not learned yet)
+static float _bnLastYaw, _bnLastPitch, _bnLastCmd;
+static BuddyCron.sysInputEvent _bnLastKey;
+static BuddyCron.CameraReader _bnCam;
+
+static void BinocLog(string m)
+{
+    try { Reborn.Utilities.Logging.Write(""[Binoculars] "" + m); } catch { }
+}
+
+static string BinocF(float v)
+{
+    return float.IsNaN(v) ? ""?"" : v.ToString(""0.0"", System.Globalization.CultureInfo.InvariantCulture);
+}
+
+// where the game's camera looks: yaw in BuddyCron's heading degrees, pitch in degrees up
+static bool BinocCamera(out float yaw, out float pitch)
+{
+    yaw = float.NaN;
+    pitch = float.NaN;
+    try
+    {
+        if (_bnCam == null)
+            _bnCam = new BuddyCron.CameraReader();
+        BuddyCron.CameraSnapshot snap;
+        if (!_bnCam.TryGetSnapshot(out snap))
+            return false;
+        System.Numerics.Matrix4x4 v = snap.View;
+        var f = new System.Numerics.Vector3(-v.M13, -v.M23, -v.M33);
+        float len = f.Length();
+        if (!(len > 0.5f && len < 2f))
+            return false;
+        f /= len;
+        yaw = BuddyCron.Helpers.HeroMath.MungeHeadingDegrees(BuddyCron.Helpers.HeroMath.VectorToHeading(f));
+        pitch = (float)(System.Math.Asin(System.Math.Max(-1.0, System.Math.Min(1.0, (double)f.Y))) * 180.0 / System.Math.PI);
+        return !float.IsNaN(yaw) && !float.IsNaN(pitch);
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+static float BinocDiff(float a, float b)
+{
+    float d = (a - b) % 360f;
+    if (d > 180f) d -= 360f;
+    if (d < -180f) d += 360f;
+    return d;
+}
+
+static void BinocDir(System.Numerics.Vector3 from, System.Numerics.Vector3 to, out float yaw, out float pitch)
+{
+    System.Numerics.Vector3 d = to - from;
+    float flat = (float)System.Math.Sqrt(d.X * d.X + d.Z * d.Z);
+    yaw = BuddyCron.Helpers.HeroMath.MungeHeadingDegrees(BuddyCron.Helpers.HeroMath.VectorToHeading(d));
+    pitch = (float)(System.Math.Atan2(d.Y, flat) * 180.0 / System.Math.PI);
+}
+
+// the game's binocular view: 1 open, 0 closed, -1 the game doesn't say
+static int BinocOpen()
+{
+    try
+    {
+        bool on;
+        var me = BuddyCron.Core.Me;
+        if (me != null && me.TryGetField<bool>(BuddyCron.GomFieldId.mbnBinocularsActive, out on))
+            return on ? 1 : 0;
+    }
+    catch { }
+    return -1;
+}
+
+// the game's zoom: 1 off, 2 zooming in, 3 zooming out, 4 zoomed in; -1 the game doesn't say
+static int BinocZoom()
+{
+    try
+    {
+        long z;
+        var me = BuddyCron.Core.Me;
+        if (me != null && me.TryGetField<long>(BuddyCron.GomFieldId.mbnZoomState, out z))
+            return (int)z;
+    }
+    catch { }
+    return -1;
+}
+
+static BuddyCron.Objects.HeroInputLayer BinocLayer(int n)
+{
+    try
+    {
+        switch (n)
+        {
+            case 0: return BuddyCron.Managers.InputManager.Movement;
+            case 1: return BuddyCron.Managers.InputManager.Camera;
+            case 2: return BuddyCron.Managers.InputManager.Game;
+            case 3: return BuddyCron.Managers.InputManager.Mouse;
+            case 4: return BuddyCron.Managers.InputManager.UI;
+            case 5: return BuddyCron.Managers.InputManager.Targetting;
+            case 6: return BuddyCron.Managers.InputManager.Layer(""ctlInputMacroBinoculars"");
+        }
+    }
+    catch { }
+    return null;
+}
+
+static string BinocLayerName(int n)
+{
+    switch (n)
+    {
+        case 0: return ""movement"";
+        case 1: return ""camera"";
+        case 2: return ""game"";
+        case 3: return ""mouse"";
+        case 4: return ""UI"";
+        case 5: return ""targeting"";
+        case 6: return ""binoculars"";
+    }
+    return ""no"";
+}
+
+// the layers to try, in turn, for turning and tilting: the binocular view's own, the camera's, the mouse's, then the old
+// ones - only those the game has on while the view is open (Yavin 4, 22 Nov: binoculars, camera, mouse, UI and targeting
+// on; movement and game off). For the zoom key, UI and targeting too. When the game doesn't say: camera, movement, game.
+static void BinocOrder()
+{
+    var order = new System.Collections.Generic.List<int>();
+    var zoom = new System.Collections.Generic.List<int>();
+    foreach (int n in new[] { 6, 1, 3, 0, 2, 4, 5 })
+    {
+        bool on = false;
+        try
+        {
+            var l = BinocLayer(n);
+            on = l != null && l.IsValid && l.IsActive;
+        }
+        catch { }
+        if (!on)
+            continue;
+        if (n != 4 && n != 5)
+            order.Add(n);
+        zoom.Add(n);
+    }
+    if (order.Count == 0)
+        order.AddRange(new[] { 1, 0, 2 });
+    if (zoom.Count == 0)
+        zoom.AddRange(new[] { 1, 2, 0, 3, 4, 5 });
+    bool same = _bnOrder != null && string.Join("","", _bnOrder) == string.Join("","", order);
+    if (!same)
+    {
+        // (another set of layers than the last scan's: learn the keys again)
+        _bnYawLayer = 0;
+        _bnPitchLayer = 0;
+        _bnYawGain = 0f;
+        _bnPitchGain = 0f;
+    }
+    _bnOrder = order.ToArray();
+    _bnZoomOrder = zoom.ToArray();
+    var names = new System.Collections.Generic.List<string>();
+    foreach (int n in _bnOrder)
+        names.Add(BinocLayerName(n));
+    BinocLog(""keys tried on the "" + string.Join("", then "", names) + "" layer"");
+}
+
+// the n-th layer to try (-1 past the end)
+static int BinocAt(int i)
+{
+    int[] o = _bnOrder ?? new[] { 1, 0, 2 };
+    return i >= 0 && i < o.Length ? o[i] : -1;
+}
+
+static int BinocCount()
+{
+    return _bnOrder != null ? _bnOrder.Length : 3;
+}
+
+// holds one of the game's own keys for ms on one input layer (the way BuddyCron walks), then lets go: true = the layer took it
+static bool BinocHold(int layer, BuddyCron.sysInputEvent key, int ms)
+{
+    var l = BinocLayer(layer);
+    if (l == null)
+        return false;
+    bool took = false;
+    try
+    {
+        took = l.RaiseInputEvent(key, true);
+        if (took)
+            System.Threading.Thread.Sleep(ms);
+    }
+    catch
+    {
+        took = false;
+    }
+    finally
+    {
+        try { l.RaiseInputEvent(key, false); } catch { }
+    }
+    return took;
+}
+
+// where to aim from where the bot stands: at the object you scanned (found again by its name near where it was), corrected
+// by how you aimed at it from where you stood; without it, the way you aimed
+static void BinocWant(System.Numerics.Vector3 spot, float recYaw, float recPitch, bool hasAt, System.Numerics.Vector3 at, string atName)
+{
+    _bnWantYaw = recYaw;
+    _bnWantPitch = recPitch;
+    var me = BuddyCron.Core.Player;
+    if (!hasAt || me == null)
+        return;
+    System.Numerics.Vector3 tgt = at;
+    float best = 3f;
+    try
+    {
+        foreach (var p in BuddyCron.Managers.HeroObjectManager.GetObjects<BuddyCron.Objects.HeroPlaceable>())
+            if (p != null && p.IsValid && p.Name == atName)
+            {
+                float d = System.Numerics.Vector3.Distance(p.Location, at);
+                if (d < best) { best = d; tgt = p.Location; }
+            }
+    }
+    catch { }
+    var eye = new System.Numerics.Vector3(0f, 0.17f, 0f);
+    float ny, np, ry, rp;
+    BinocDir(me.Location + eye, tgt, out ny, out np);
+    BinocDir(spot + eye, at, out ry, out rp);
+    if (!float.IsNaN(recYaw) && !float.IsNaN(recPitch))
+    {
+        _bnWantYaw = BuddyCron.Helpers.HeroMath.MungeHeadingDegrees(ny + BinocDiff(recYaw, ry));
+        _bnWantPitch = np + (recPitch - rp);
+    }
+    else
+    {
+        _bnWantYaw = ny;
+        _bnWantPitch = np;
+    }
+}
+
+// before the cast: start this scan, and face the way to aim (BuddyCron's own turn)
+static void BinocStart(System.Numerics.Vector3 spot, float recYaw, float recPitch, bool hasAt, System.Numerics.Vector3 at, string atName)
+{
+    _bnState = 0;
+    _bnPulses = 0;
+    _bnZoomTries = 0;
+    _bnZoomTook = false;
+    _bnTurnMode = 0;
+    _bnPending = 0;
+    BinocWant(spot, recYaw, recPitch, hasAt, at, atName);
+    float cy, cp;
+    bool cam = BinocCamera(out cy, out cp);
+    BinocLog(""aim at heading "" + BinocF(_bnWantYaw) + "", "" + BinocF(_bnWantPitch) + "" up"" + (hasAt ? "" ("" + atName + "")"" : string.Empty) +
+             ""; the camera looks at "" + (cam ? BinocF(cy) + "", "" + BinocF(cp) + "" up"" : ""(not read)""));
+    try
+    {
+        if (!float.IsNaN(_bnWantYaw))
+            BuddyCron.Managers.MovementManager.Rotate(_bnWantYaw);
+    }
+    catch { }
+}
+
+// one key press toward the wanted angle on one axis, learning from the press before how far a press moves the camera
+static void BinocPress(bool yawAxis, float err)
+{
+    BuddyCron.sysInputEvent a = yawAxis ? BuddyCron.sysInputEvent.RotateLeft : BuddyCron.sysInputEvent.RotateCameraUp;
+    BuddyCron.sysInputEvent b = yawAxis ? BuddyCron.sysInputEvent.RotateRight : BuddyCron.sysInputEvent.RotateCameraDown;
+    float gain = yawAxis ? _bnYawGain : _bnPitchGain;
+    int layer = BinocAt(yawAxis ? _bnYawLayer : _bnPitchLayer);
+    BuddyCron.sysInputEvent key;
+    int ms;
+    if (gain == 0f)
+    {
+        key = a; // not learned yet: a short press to see which way and how far it goes
+        ms = 60;
+    }
+    else
+    {
+        key = (err > 0f) == (gain > 0f) ? a : b;
+        ms = (int)System.Math.Max(10.0, System.Math.Min(400.0, System.Math.Abs(err / gain)));
+    }
+    bool took = BinocHold(layer, key, ms);
+    _bnPending = yawAxis ? 1 : 2;
+    _bnLastKey = key;
+    _bnLastMs = took ? ms : 0;
+}
+
+// after the cast: 0 = still working (the hook waits), 1 = done (zoomed in and waited for the scan, or it couldn't)
+static int BinocAim()
+{
+    var now = System.DateTime.Now;
+    if (_bnState == 0)
+    {
+        _bnState = 1;
+        _bnAt = now;
+    }
+    if (_bnState == 1)
+    {
+        int open = BinocOpen();
+        double waited = (now - _bnAt).TotalSeconds;
+        if (open == 1 || (open == -1 && waited > 0.8))
+        {
+            _bnState = 2;
+            _bnAt = now;
+            BinocLog(open == 1 ? ""the view is open"" : ""the game doesn't say if the view is open: aiming anyway"");
+            BinocOrder();
+            return 0;
+        }
+        if (waited < 4)
+            return 0;
+        BinocLog(""the view didn't open after the cast"");
+        _bnState = 0;
+        return 1;
+    }
+    if (_bnState == 2)
+    {
+        float cy, cp;
+        if (float.IsNaN(_bnWantYaw) || float.IsNaN(_bnWantPitch) || !BinocCamera(out cy, out cp))
+        {
+            BinocLog(float.IsNaN(_bnWantYaw) ? ""no aim recorded: zooming where it looks"" : ""the camera can't be read: zooming where it looks"");
+            _bnState = 3;
+            return 0;
+        }
+        // what the last press did
+        if (_bnPending == 1 || _bnPending == 3)
+        {
+            float moved = BinocDiff(cy, _bnLastYaw);
+            if (_bnPending == 3)
+            {
+                // BuddyCron's own turn: the view follows it, or keys are needed
+                if (System.Math.Abs(moved) < 0.3f * System.Math.Abs(_bnLastCmd))
+                {
+                    _bnTurnMode = 2;
+                    BinocLog(""turning the character doesn't turn the view: using the turn keys"");
+                }
+                else
+                    _bnTurnMode = 1;
+            }
+            else if (_bnLastMs > 0 && System.Math.Abs(moved) >= 0.2f)
+            {
+                float g = moved / _bnLastMs;
+                _bnYawGain = _bnLastKey == BuddyCron.sysInputEvent.RotateLeft ? g : -g;
+            }
+            else if (_bnYawGain == 0f)
+            {
+                BinocLog(""the "" + BinocLayerName(BinocAt(_bnYawLayer)) + "" layer's turn key didn't turn the view"");
+                _bnYawLayer++;
+            }
+        }
+        else if (_bnPending == 2)
+        {
+            float moved = cp - _bnLastPitch;
+            if (_bnLastMs > 0 && System.Math.Abs(moved) >= 0.2f)
+            {
+                float g = moved / _bnLastMs;
+                _bnPitchGain = _bnLastKey == BuddyCron.sysInputEvent.RotateCameraUp ? g : -g;
+            }
+            else if (_bnPitchGain == 0f)
+            {
+                BinocLog(""the "" + BinocLayerName(BinocAt(_bnPitchLayer)) + "" layer's camera up key didn't tilt the view"");
+                _bnPitchLayer++;
+            }
+        }
+        _bnPending = 0;
+        float ey = BinocDiff(_bnWantYaw, cy), ep = _bnWantPitch - cp;
+        bool yawOk = System.Math.Abs(ey) <= 1.2f || (_bnTurnMode == 2 && _bnYawLayer >= BinocCount());
+        bool pitchOk = System.Math.Abs(ep) <= 1.2f || _bnPitchLayer >= BinocCount();
+        if ((yawOk && pitchOk) || _bnPulses >= 30 || (now - _bnAt).TotalSeconds > 15)
+        {
+            bool aimed = System.Math.Abs(ey) <= 1.2f && System.Math.Abs(ep) <= 1.2f;
+            BinocLog((aimed ? ""aimed"" : ""couldn't aim all the way"") + "": the camera looks at "" + BinocF(cy) + "", "" + BinocF(cp) + "" up (off by "" +
+                     BinocF(ey) + "" and "" + BinocF(ep) + "") after "" + _bnPulses + "" moves"" +
+                     (_bnTurnMode == 1 ? ""; turned by BuddyCron's turn"" : _bnYawGain != 0f ? ""; turned by the "" + BinocLayerName(BinocAt(_bnYawLayer)) + "" layer's keys"" : string.Empty) +
+                     (_bnPitchGain != 0f ? ""; tilted by the "" + BinocLayerName(BinocAt(_bnPitchLayer)) + "" layer's keys"" : string.Empty));
+            _bnState = 3;
+            return 0;
+        }
+        _bnPulses++;
+        _bnLastYaw = cy;
+        _bnLastPitch = cp;
+        if (!yawOk)
+        {
+            if (_bnTurnMode != 2)
+            {
+                // BuddyCron's own turn first (exact, when the view follows the character)
+                _bnLastCmd = ey;
+                _bnPending = 3;
+                try
+                {
+                    var me = BuddyCron.Core.Me;
+                    BuddyCron.Managers.MovementManager.Rotate(BuddyCron.Helpers.HeroMath.MungeHeadingDegrees(me.Heading + ey));
+                }
+                catch { _bnTurnMode = 2; }
+                return 0;
+            }
+            BinocPress(true, ey);
+            return 0;
+        }
+        BinocPress(false, ep);
+        return 0;
+    }
+    if (_bnState == 3)
+    {
+        int z = BinocZoom();
+        bool zooming = z == 2 || z == 4;
+        // the zoom key on the layers in turn, until the game says it zooms (or a layer takes it, when the game doesn't say)
+        int[] zo = _bnZoomOrder ?? new[] { 1, 2, 0, 3, 4, 5 };
+        if (!zooming && _bnZoomTries < zo.Length && (_bnZoomTries == 0 || ((now - _bnZoomAt).TotalSeconds > 1.5 && (z == 1 || (z == -1 && !_bnZoomTook)))))
+        {
+            int layer = zo[_bnZoomTries];
+            bool took = BinocHold(layer, BuddyCron.sysInputEvent.MacroBinocularsZoomIn, 120);
+            _bnZoomTook = took;
+            _bnZoomTries++;
+            _bnZoomAt = now;
+            BinocLog(""zoom in on the "" + BinocLayerName(layer) + "" layer: "" + (took ? ""taken"" : ""not taken"") + "" (zoom was "" + z + "")"");
+            return 0;
+        }
+        // the scan takes a few seconds once zoomed in
+        if ((now - _bnZoomAt).TotalSeconds < 7)
+            return 0;
+        BinocLog(""waited for the scan (zoom "" + z + "", view "" + BinocOpen() + "")"");
+        _bnState = 0;
+        return 1;
+    }
+    _bnState = 0;
+    return 1;
+}
+";
 
         /// <summary>
         /// Turns every step only Quest Recorder knows into BuddyCron's own:
@@ -1268,6 +1772,7 @@ namespace QuestRecorder
                 _codeChunks = new List<string>();
                 _hookNo = 0;
                 _faceAdded = false;
+                _binocAdded = false;
             }
             foreach (Step s in steps)
             {
@@ -1368,6 +1873,22 @@ namespace QuestRecorder
                         lastSpot = to;
                         continue;
                     }
+                    if (l.StartsWith("<Grind ", StringComparison.Ordinal) && Attr(l, "LootFor").Length > 0)
+                    {
+                        // kill and loot: BuddyCron loots nothing when your bags have 1 free slot or less, but a mission item
+                        // goes in the mission bag - a BuddyCron Hook opens this step's own bodies then (Tython's Power Cells)
+                        string lootHook = LootHook(System.Net.WebUtility.HtmlDecode(Attr(l, "LootFor")).Split('|'), ++_hookNo);
+                        string grind = Regex.Replace(l, " LootFor=\"[^\"]*\"", string.Empty);
+                        if (lootHook == null)
+                        {
+                            outLines.Add(grind);
+                            continue;
+                        }
+                        outLines.Add("<Hook Name=\"" + lootHook + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
+                        outLines.Add(grind);
+                        outLines.Add("<Hook Name=\"" + lootHook + "\" Operation=\"R\" Location=\"TreeStart\" />");
+                        continue;
+                    }
                     bool once = l.StartsWith("<UseMissionItemOnce ", StringComparison.Ordinal);
                     bool ability = l.StartsWith("<UseQuestAbility ", StringComparison.Ordinal);
                     if (!once && !ability)
@@ -1386,10 +1907,16 @@ namespace QuestRecorder
                     var pending = new List<string>();
                     string usedAt = null;
                     int lj = li + 1, lastUse = li;
+                    // (binocular scans of one step - several spots to scan - join one run of their own; a binocular scan never
+                    // joins a run of other uses, nor other uses a binocular run)
+                    bool firstBin = Attr(l, "Binoculars") == "True";
+                    string binTag = once ? "<UseMissionItemOnce " : "<UseQuestAbility ";
                     while (lj < s.Lines.Count)
                     {
                         string n = s.Lines[lj];
-                        if (n.StartsWith("<UseMissionItemOnce ", StringComparison.Ordinal))
+                        bool nBin = Attr(n, "Binoculars") == "True";
+                        if (firstBin ? n.StartsWith(binTag, StringComparison.Ordinal) && nBin
+                                     : n.StartsWith("<UseMissionItemOnce ", StringComparison.Ordinal) && !nBin)
                         {
                             foreach (string pm in pending)
                                 if (Attr(pm, "XYZ").Length > 0)
@@ -1424,7 +1951,12 @@ namespace QuestRecorder
                     // used once, before the step's last action (Once="True"): the step doesn't move on by it, so neither a UseItem
                     // until it does nor a row tried again until it does
                     bool onceOnly = Attr(l, "Once") == "True";
-                    bool simple = run.Count == 1 && once && !beforeFight && !onceOnly && Attr(l, "Npc").Length == 0 && Attr(l, "AbilityName").Length == 0;
+                    // a binocular scan: always the hook (it aims and zooms after the cast)
+                    bool bin = Attr(l, "Binoculars") == "True";
+                    // (only where you used it is known: BuddyCron's UseItem with no spot walks to <0, 0, 0>; the hook presses it
+                    // where the bot stands)
+                    bool simple = run.Count == 1 && once && !beforeFight && !onceOnly && !bin && Attr(l, "Npc").Length == 0 && Attr(l, "AbilityName").Length == 0 &&
+                                  usedAt != null;
                     if (simple)
                     {
                         // one mission item on yourself, once: BuddyCron's UseItem until the step moves on (Vny's Heroic Transport way)
@@ -1433,8 +1965,9 @@ namespace QuestRecorder
                         string py = Fmt.PyStr(System.Net.WebUtility.HtmlDecode(item));
                         string has = A("(any(i.Name == " + py + " for i in Me.QuestItems) or any(i.Name == " + py + " for i in Me.Backpack))");
                         string cond = has + (s.Gate != null && s.Gate.Length > 0 ? " and (" + s.Gate + ")" : string.Empty);
-                        outLines.Add("<UseItem ItemName=\"" + item + "\" Condition=\"" + cond + "\" WaitTime=\"3000\" Range=\"100000\"><Hotspots><Hotspot Name=\"Where you used it\" XYZ=\"" +
-                                     (lastSpot ?? "0,0,0") + "\" /></Hotspots></UseItem>");
+                        // (XYZ too: once its hotspot is passed, UseItem walks to its XYZ)
+                        outLines.Add("<UseItem ItemName=\"" + item + "\" Condition=\"" + cond + "\" WaitTime=\"3000\" Range=\"100000\" XYZ=\"" + lastSpot +
+                                     "\"><Hotspots><Hotspot Name=\"Where you used it\" XYZ=\"" + lastSpot + "\" /></Hotspots></UseItem>");
                         continue;
                     }
                     if (walks.Count > 0)
@@ -1454,6 +1987,12 @@ namespace QuestRecorder
                     var hps = new List<string>(); // used on it once its health was down to this (0 = any)
                     var hasAt = new List<string>();
                     var spots = new List<string>(); // where you used it
+                    var bins = new List<string>(); // a binocular scan: aimed and zoomed after the cast
+                    var aimYaws = new List<string>();
+                    var aimPitches = new List<string>();
+                    var aimHas = new List<string>();
+                    var aimAts = new List<string>();
+                    var aimNames = new List<string>();
                     bool face = false;
                     for (int ri = 0; ri < run.Count; ri++)
                     {
@@ -1488,6 +2027,27 @@ namespace QuestRecorder
                         int hp;
                         hps.Add(int.TryParse(Attr(r, "HealthPercent"), NumberStyles.Integer, CultureInfo.InvariantCulture, out hp) && hp > 0 && hp < 100
                                 ? hp.ToString(CultureInfo.InvariantCulture) + "f" : "0f");
+                        bool rb = Attr(r, "Binoculars") == "True";
+                        bins.Add(rb ? "true" : "false");
+                        float ay = float.NaN, ap = float.NaN;
+                        bool hasAim = rb && float.TryParse(Attr(r, "AimYaw"), NumberStyles.Float, CultureInfo.InvariantCulture, out ay) &&
+                                      float.TryParse(Attr(r, "AimPitch"), NumberStyles.Float, CultureInfo.InvariantCulture, out ap) &&
+                                      !float.IsNaN(ay + ap) && !float.IsInfinity(ay + ap);
+                        aimYaws.Add(hasAim ? ay.ToString("0.###", CultureInfo.InvariantCulture) + "f" : "float.NaN");
+                        aimPitches.Add(hasAim ? ap.ToString("0.###", CultureInfo.InvariantCulture) + "f" : "float.NaN");
+                        Vec3 atv;
+                        string an2 = System.Net.WebUtility.HtmlDecode(Attr(r, "AimName"));
+                        if (rb && an2.Length > 0 && TryVec(Attr(r, "AimAt"), out atv) && !float.IsNaN(atv.X + atv.Y + atv.Z) && !float.IsInfinity(atv.X + atv.Y + atv.Z))
+                        {
+                            aimHas.Add("true");
+                            aimAts.Add(string.Format(CultureInfo.InvariantCulture, "new System.Numerics.Vector3({0:0.###}f, {1:0.###}f, {2:0.###}f)", atv.X, atv.Y, atv.Z));
+                        }
+                        else
+                        {
+                            aimHas.Add("false");
+                            aimAts.Add("new System.Numerics.Vector3(0f, 0f, 0f)");
+                        }
+                        aimNames.Add(CsString(rb ? an2 : string.Empty));
                         string spotXyz = runAt[ri] ?? (baseMove != null ? Attr(baseMove, "XYZ") : null);
                         Vec3 wv;
                         if (spotXyz != null && TryVec(spotXyz, out wv) && !float.IsNaN(wv.X + wv.Y + wv.Z) && !float.IsInfinity(wv.X + wv.Y + wv.Z))
@@ -1502,6 +2062,17 @@ namespace QuestRecorder
                         }
                     }
                     string nl = "\r\n";
+                    bool anyBin = bins.Contains("true");
+                    if (anyBin && !_binocAdded)
+                    {
+                        var bc = new StringBuilder();
+                        bc.Append("\t\t<CodeChunk Name=\"Binoculars\" Type=\"Definition\"><![CDATA[").Append(nl);
+                        foreach (string bl in BinocCode.Split('\n'))
+                            bc.Append("\t\t\t").Append(bl.TrimEnd('\r')).Append(nl);
+                        bc.Append("\t\t]]></CodeChunk>");
+                        _codeChunks.Add(bc.ToString());
+                        _binocAdded = true;
+                    }
                     if (face && !_faceAdded)
                     {
                         _codeChunks.Add("\t\t<CodeChunk Name=\"FaceHeading\" Type=\"Definition\"><![CDATA[" + nl +
@@ -1518,7 +2089,7 @@ namespace QuestRecorder
                     // with the step's gate the row is tried again 8 s after it ends, until the step moves on; without one (or
                     // before a fight) it is done once while the profile waits
                     bool looped = s.Gate != null && s.Gate.Length > 0 && !beforeFight && !onceOnly;
-                    int wait = run.Count * 6 + 4;
+                    int wait = run.Count * 6 + 4 + (anyBin ? 30 : 0); // (a binocular scan: up to ~30 s to aim, zoom and scan)
                     string again = (looped ? 8 : wait + 5).ToString(CultureInfo.InvariantCulture);
                     string body =
                         "var names = new[] { " + string.Join(", ", names) + " };" + nl +
@@ -1532,16 +2103,25 @@ namespace QuestRecorder
                         "var hasSpot = new[] { " + string.Join(", ", hasAt) + " };" + nl +
                         "var spots = new[] { " + string.Join(", ", spots) + " };" + nl +
                         (face ? "var headings = new[] { " + string.Join(", ", heads) + " };" + nl : string.Empty) +
+                        (anyBin ? "var binoc = new[] { " + string.Join(", ", bins) + " };" + nl +
+                                  "var aimYaw = new[] { " + string.Join(", ", aimYaws) + " };" + nl +
+                                  "var aimPitch = new[] { " + string.Join(", ", aimPitches) + " };" + nl +
+                                  "var hasAimAt = new[] { " + string.Join(", ", aimHas) + " };" + nl +
+                                  "var aimAt = new[] { " + string.Join(", ", aimAts) + " };" + nl +
+                                  "var aimName = new[] { " + string.Join(", ", aimNames) + " };" + nl : string.Empty) +
                         "var me = BuddyCron.Core.Player;" + nl +
                         "var now = System.DateTime.Now;" + nl +
                         "if ((now - " + v + "_last).TotalSeconds > 60) { " + v + "_i = 0; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_wi = -1; " + v + "_next = now; }" + nl +
                         v + "_last = now;" + nl +
                         "if (" + v + "_i >= names.Length) { if ((now - " + v + "_done).TotalSeconds > " + again + ") { " + v + "_i = 0; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_wi = -1; " + v + "_next = now; } return false; }" + nl +
                         "if (me.IsCasting) { if (" + v + "_p) " + v + "_s = true; return true; }" + nl +
+                        // a binocular scan: once its cast is over, aim and zoom (a fight or a death first: the cast is done again after)
+                        (anyBin ? "if (" + v + "_p && " + v + "_s && binoc[" + v + "_i]) { if (me.IsDead || me.InCombat) { " + v + "_p = false; " + v + "_s = false; return false; } if (BinocAim() == 0) return true; }" + nl : string.Empty) +
                         "if (" + v + "_p && " + v + "_s) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
                         "if (now < " + v + "_next) return true;" + nl +
                         "if (" + v + "_p && (now - " + v + "_at).TotalSeconds < 1.5) return true;" + nl +
                         // pressed and taken, and no cast bar came: an instant use, done (not pressed 4 times)
+                        (anyBin ? "if (" + v + "_p && " + v + "_ok && binoc[" + v + "_i]) { " + v + "_s = true; return true; }" + nl : string.Empty) +
                         "if (" + v + "_p && " + v + "_ok) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
                         // dead, or in a fight this use wasn't part of: BuddyCron's own death handling and combat routine run first
                         // (and the walk-back wait starts over once alive and out of the fight: a long fight or corpse run never
@@ -1551,6 +2131,8 @@ namespace QuestRecorder
                         "if (" + v + "_wi != " + v + "_i) { " + v + "_wi = " + v + "_i; " + v + "_ws = now; " + v + "_tw = System.DateTime.MinValue; }" + nl +
                         // away from where you used it (after a death, or the next place of the row): the profile's own MoveTo walks there
                         "if (hasSpot[" + v + "_i] && " + v + "_tw == System.DateTime.MinValue && (now - " + v + "_ws).TotalSeconds < 120 && System.Numerics.Vector3.Distance(me.Location, spots[" + v + "_i]) > 1.5f) { " + v + "_w = true; return false; }" + nl +
+                        // a binocular scan aims from where you stood: the last few metres to it
+                        (anyBin ? "if (binoc[" + v + "_i] && hasSpot[" + v + "_i] && (now - " + v + "_ws).TotalSeconds < 30 && System.Numerics.Vector3.Distance(me.Location, spots[" + v + "_i]) > 0.25f) { " + v + "_w = true; " + mover + ".MoveTowards(spots[" + v + "_i]); return true; }" + nl : string.Empty) +
                         "BuddyCron.Objects.HeroCharacter target = null;" + nl +
                         "if (npcs[" + v + "_i].Length > 0)" + nl +
                         "    foreach (var c in BuddyCron.Managers.HeroObjectManager.GetObjects<BuddyCron.Objects.HeroCharacter>())" + nl +
@@ -1567,6 +2149,7 @@ namespace QuestRecorder
                         mover + ".MoveStop();" + nl +
                         v + "_w = false;" + nl +
                         v + "_ok = false;" + nl +
+                        (anyBin ? "if (binoc[" + v + "_i]) { BinocStart(spots[" + v + "_i], aimYaw[" + v + "_i], aimPitch[" + v + "_i], hasAimAt[" + v + "_i], aimAt[" + v + "_i], aimName[" + v + "_i]); if (BinocOpen() == 1) { " + v + "_p = true; " + v + "_s = true; " + v + "_at = now; " + v + "_t++; return true; } }" + nl : string.Empty) +
                         "if (isAbility[" + v + "_i])" + nl +
                         "{" + nl +
                         "    if (openWith[" + v + "_i].Length > 0 && !BuddyCron.Managers.AbilityManager.HasAbility(names[" + v + "_i]))" + nl +
@@ -1607,9 +2190,11 @@ namespace QuestRecorder
                             back.Append(WhenAway(w));
                         // (bounded: about three rounds of the row, ~8 s an item and the hook's 8 s before it starts again,
                         // then the profile goes on and the end says the mission isn't finished)
-                        int most = Math.Min(180, 3 * (names.Count * 8 + 8));
+                        int most = Math.Min(180, 3 * (names.Count * 8 + (anyBin ? 30 : 8)));
                         for (int sofar = 0; sofar < most; sofar += 5)
                             outLines.Add("<If Condition=\"" + s.Gate + "\">" + back.ToString() + "<WaitTimer QuestId=\"1\" WaitTime=\"5\" /></If>");
+                        if (anyBin)
+                            outLines.Add(BinocAsk(l, s.Gate));
                     }
                     else
                     {
@@ -1626,6 +2211,15 @@ namespace QuestRecorder
                 s.Lines.Clear();
                 s.Lines.AddRange(outLines);
             }
+        }
+
+        /// <summary>A binocular scan the bot couldn't finish (the mission didn't move on): a pop-up asks you to scan it yourself.</summary>
+        private static string BinocAsk(string line, string gate)
+        {
+            string what = Attr(line, "ItemName").Length > 0 ? Attr(line, "ItemName") : Attr(line, "AbilityName");
+            string at = Attr(line, "AimName");
+            return "<If Condition=\"" + gate + "\"><UserDialog Title=\"Binoculars\" Message=\"The bot couldn't finish the scan. Use " + what +
+                   " yourself" + (at.Length > 0 ? ", aim at the " + at : string.Empty) + " and scan it, then press Continue.\" IsBotContinueAllowed=\"True\" /></If>";
         }
 
         /// <summary>
@@ -1732,6 +2326,78 @@ namespace QuestRecorder
             lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"1\" />");
             lines.Add("<Hook Name=\"" + hook + "\" Operation=\"R\" Location=\"TreeStart\" />");
             return lines;
+        }
+
+        /// <summary>
+        /// The loot of a kill-and-loot step when your bags are full: BuddyCron loots no body when your bags have 1 free slot or
+        /// less (its loot targeting), though a mission item goes in the mission bag and needs no room (Tython's Power Cells:
+        /// the bot fought the Sentinels and never opened one). Out of a fight, with 1 free slot or less, it opens the nearest
+        /// body (within 40 m) of this step's own mobs that holds loot for you, takes what fits, and leaves each body alone for 5
+        /// minutes after (a window with things that don't fit is left after 4 s; a body it can't get to in 15 s is left too).
+        /// With room in your bags it does nothing: BuddyCron loots as always. Null when no mob has a name.
+        /// </summary>
+        private static string LootHook(IList<string> names, int no)
+        {
+            var test = new StringBuilder();
+            foreach (string n in names)
+            {
+                if (string.IsNullOrEmpty(n))
+                    continue;
+                if (test.Length > 0)
+                    test.Append(" || ");
+                test.Append("n.Name == ").Append(CsString(n));
+            }
+            if (test.Length == 0)
+                return null;
+            string hook = "LootFullBags" + no, v = "_l" + no;
+            string nl = "\r\n";
+            string stop = "if (" + v + "_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); " + v + "_mv = false; }";
+            string body =
+                "var me = BuddyCron.Core.Player;" + nl +
+                "var now = System.DateTime.Now;" + nl +
+                // (a fight or room in the bags starts each body's 15 s over: a body chosen before a fight is still tried after it)
+                "if (me == null || me.InCombat || me.IsDead || me.FreeBackpackSlots > 1) { " + stop + " " + v + "_open = System.DateTime.MinValue; " + v + "_node = 0; return false; }" + nl +
+                "bool open = false;" + nl +
+                "try { open = BuddyCron.Objects.HeroGuiApiGfx.Instance.IsLootWindowOpen; } catch { }" + nl +
+                "if (open)" + nl +
+                "{" + nl +
+                "    " + stop + nl +
+                "    if (" + v + "_open == System.DateTime.MinValue) " + v + "_open = now;" + nl +
+                "    double w = (now - " + v + "_open).TotalSeconds;" + nl +
+                "    if (w > 4) return false;" + nl +
+                "    if (w >= 0.4 && (now - " + v + "_take).TotalSeconds >= 1) { try { BuddyCron.HeroScrpt.Automaton.PlayerTakeAllLoot(); } catch { } " + v + "_take = now; }" + nl +
+                "    return true;" + nl +
+                "}" + nl +
+                v + "_open = System.DateTime.MinValue;" + nl +
+                "if ((now - " + v + "_click).TotalSeconds < 2) return true;" + nl +
+                "BuddyCron.Objects.HeroNPC best = null;" + nl +
+                "foreach (var n in BuddyCron.Managers.HeroObjectManager.GetObjectsOfType<BuddyCron.Objects.HeroNPC>())" + nl +
+                "{" + nl +
+                "    if (n == null || !n.IsValid || !n.IsDead || n.Distance > 4f || !(" + test + ")) continue;" + nl +
+                "    if (BuddyCron.Helpers.Blacklist.Contains(n.NodeId, BuddyCron.Helpers.BlacklistFlags.Loot) || !n.IsLootable) continue;" + nl +
+                "    if (best == null || n.Distance < best.Distance) best = n;" + nl +
+                "}" + nl +
+                "if (best == null) { " + stop + " " + v + "_node = 0; return false; }" + nl +
+                "if (best.NodeId != " + v + "_node) { " + v + "_node = best.NodeId; " + v + "_since = now; }" + nl +
+                "if ((now - " + v + "_since).TotalSeconds > 15) { " + stop + " BuddyCron.Helpers.Blacklist.Add(best.NodeId, BuddyCron.Helpers.BlacklistFlags.Loot, System.TimeSpan.FromMinutes(5)); return false; }" + nl +
+                "if (!best.IsWithinInteractRange) { BuddyCron.Navigation.Navigator.PlayerMover.MoveTowards(best.Location); " + v + "_mv = true; return true; }" + nl +
+                stop + nl +
+                "best.Interact(); " + v + "_click = now;" + nl +
+                "BuddyCron.Helpers.Blacklist.Add(best.NodeId, BuddyCron.Helpers.BlacklistFlags.Loot, System.TimeSpan.FromMinutes(5));" + nl +
+                "try { Reborn.Utilities.Logging.Write(\"[Loot] Bags full: opening \" + best.Name + \" for the mission's item\"); } catch { }" + nl +
+                "return true;";
+            _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl +
+                            "\t\t\tstatic System.DateTime " + v + "_click, " + v + "_take, " + v + "_open, " + v + "_since;" + nl +
+                            "\t\t\tstatic ulong " + v + "_node;" + nl +
+                            "\t\t\tstatic bool " + v + "_mv;" + nl +
+                            "\t\t]]></CodeChunk>");
+            var sbh = new StringBuilder();
+            sbh.Append("\t\t<CodeChunk Name=\"").Append(hook).Append("\" Type=\"Hook\"><![CDATA[").Append(nl);
+            foreach (string bl in body.Split(new[] { nl }, StringSplitOptions.None))
+                sbh.Append("\t\t\t").Append(bl).Append(nl);
+            sbh.Append("\t\t]]></CodeChunk>");
+            _codeChunks.Add(sbh.ToString());
+            return hook;
         }
 
         /// <summary>
@@ -1890,21 +2556,51 @@ namespace QuestRecorder
         }
 
         /// <summary>
-        /// The item whose use came just before this one (within 2 s, neither on a target): items that share a cooldown
-        /// (every Heroic Transport) all show it when you press one of them, so the later rows are most likely that press.
+        /// The item you pressed when this one only went on cooldown with it: items that share a cooldown (every Heroic
+        /// Transport) all show it when you press one of them. In one look the recorder writes those cooldowns first and
+        /// the item you cast last, so a later item row of the same look is the press; else an item row up to 2 s before
+        /// this one (neither on a target) is.
         /// </summary>
         private static string SharedCooldownWith(IList<RecEvent> events, int i)
         {
             RecEvent e = events[i];
-            if (e.Target != null || e.Note.Length > 0)
+            if (e.Note.Length > 0)
                 return null;
+            string cast = null;
+            for (int j = i + 1; j < events.Count && SameLook(events[j], e); j++)
+            {
+                RecEvent d = events[j];
+                if (d.Kind == EvKind.QuestItem && d.Option.Length > 0 && d.Option != e.Option && d.Note.Length == 0)
+                    cast = d.Option;
+            }
+            if (cast != null || e.Target != null)
+                return cast;
             for (int j = i - 1; j >= 0 && e.Elapsed - events[j].Elapsed <= 2; j--)
             {
                 RecEvent d = events[j];
-                if (d.Kind == EvKind.QuestItem && d.Option.Length > 0 && d.Option != e.Option && d.Target == null && d.Note.Length == 0)
+                if (d.Kind == EvKind.QuestItem && d.Option.Length > 0 && d.Option != e.Option && d.Target == null && d.Note.Length == 0 && !SameLook(d, e))
                     return d.Option;
             }
             return null;
+        }
+
+        /// <summary>
+        /// Python for "the item BuddyCron's UseItem would press (the first of that name in your mission items, else in your
+        /// bags) has no more than 5 minutes of cooldown left". A transport has an hour once used (game files: 3600 s);
+        /// pressing one puts the others on a short shared cooldown only (every press you made came under 2 minutes after
+        /// another), so a step reached right after landing still waits for it, as before.
+        /// </summary>
+        internal static string NoLongCooldown(string item)
+        {
+            string n = Fmt.PyStr(item);
+            string cd = "(i.Ability.CooldownRemaining if i.Ability is not None else 0)";
+            return "max(([" + cd + " for i in Me.QuestItems if i.Name == " + n + "] + [" + cd + " for i in Me.Backpack if i.Name == " + n + "])[:1] + [0]) <= 300";
+        }
+
+        /// <summary>Two rows the recorder wrote at one look (the same moment).</summary>
+        private static bool SameLook(RecEvent a, RecEvent b)
+        {
+            return a.Time != default(DateTime) ? a.Time == b.Time : a.Elapsed == b.Elapsed;
         }
 
         /// <summary>The step names only Quest Recorder knows (a profile must have none of them).</summary>
@@ -1923,6 +2619,64 @@ namespace QuestRecorder
         /// The same list, each line marked: OK = the bot does this itself; !! = it can't (and why), so you know while
         /// you're still standing there. Quest log changes nothing you did caused are listed too (the bot only walks there).
         /// </summary>
+        /// <summary>
+        /// Your own consumables (medpacs, adrenals), the way the profile maker finds them: an item used in fights at least
+        /// twice, on more than one kind of mob or with nothing selected, that never left your bags and that no objective
+        /// names. The list never says one moved a mission (Voss, 22 Nov: a medpac read as finishing Ancient Guardians).
+        /// </summary>
+        internal static HashSet<string> OwnConsumables(IList<RecEvent> events)
+        {
+            var own = new HashSet<string>(StringComparer.Ordinal);
+            var kinds = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+            var uses = new Dictionary<string, int>(StringComparer.Ordinal);
+            var gone = new HashSet<string>(StringComparer.Ordinal);
+            var texts = new List<string>();
+            int count = events.Count; // (index loops: the live list can grow while this runs)
+            for (int i = 0; i < count; i++)
+            {
+                RecEvent e = events[i];
+                if ((e.Kind == EvKind.QuestAdded || e.Kind == EvKind.QuestStep || e.Kind == EvKind.QuestTask) && e.Text.Length > 0 && texts.Count < 2000)
+                    texts.Add(e.Text);
+                if (e.Kind != EvKind.QuestItem || e.Option.Length == 0)
+                    continue;
+                if (e.Note == "item gone")
+                {
+                    gone.Add(e.Option);
+                    continue;
+                }
+                if (e.Note == "ability" || e.Note == "equipped" || e.Binoculars)
+                    continue;
+                bool fight = false;
+                for (int j = i; j >= 0 && e.Elapsed - events[j].Elapsed < 600; j--)
+                {
+                    if (events[j].Kind == EvKind.CombatEnd && j < i)
+                        break;
+                    if (events[j].Kind == EvKind.CombatStart)
+                    {
+                        fight = true;
+                        break;
+                    }
+                }
+                if (!fight)
+                    continue;
+                HashSet<string> k;
+                if (!kinds.TryGetValue(e.Option, out k))
+                    kinds[e.Option] = k = new HashSet<string>(StringComparer.Ordinal);
+                k.Add(e.Target != null && e.Target.Kind == ObjKind.Npc ? e.Target.Name : string.Empty);
+                int n;
+                uses.TryGetValue(e.Option, out n);
+                uses[e.Option] = n + 1;
+            }
+            foreach (KeyValuePair<string, int> u in uses)
+            {
+                if (u.Value < 2 || kinds[u.Key].Count < 2 || gone.Contains(u.Key))
+                    continue;
+                if (!texts.Exists(t => t.IndexOf(u.Key, StringComparison.OrdinalIgnoreCase) >= 0))
+                    own.Add(u.Key);
+            }
+            return own;
+        }
+
         public static List<string> Interactions(IList<RecEvent> events, bool header)
         {
             var list = new List<string>();
@@ -1930,6 +2684,8 @@ namespace QuestRecorder
                 list.AddRange(new[] { "What you did - Quest Recorder (LethToxic)", "OK = the bot does this by itself.  !! = it can't - the reason is on the line.", "" });
             var explained = new HashSet<RecEvent>();
             HashSet<string> meta = MetaTasks(events);
+            HashSet<string> own = OwnConsumables(events);
+            HashSet<RecEvent> redone = RedoneTalkRows(events);
             for (int i = 0; i < events.Count; i++)
             {
                 RecEvent e = events[i];
@@ -1950,20 +2706,87 @@ namespace QuestRecorder
                              (cause ? "  (after a fight / cast / ride)" : arrived ? "  (you got there - the bot walks here)" : "  - nothing you clicked caused it: the bot will only walk here"));
                     continue;
                 }
+                // a mission no line above gave: from the giver the recorder saw (a board you kept open while you took them one
+                // by one), else the game gave it (a bonus at its site)
+                if (e.Kind == EvKind.QuestAdded && !e.QuestHidden && e.QuestId != 0 && !explained.Contains(e) &&
+                    !(e.QuestName.Length > 0 && char.IsLower(e.QuestName[0])) && !IsSystemQuest(e))
+                {
+                    bool giver = e.Target != null && e.Target.Name.Length > 0;
+                    list.Add("OK " + Fmt.Duration(e.Elapsed).PadRight(10) + "got \"" + e.QuestName + "\"" +
+                             (giver ? " from \"" + e.Target.Name + "\"" + (e.Note.Length > 0 ? " (" + e.Note + ")" : string.Empty)
+                                    : "  at " + X(e.Pos) + "  (no giver seen: the game gave it)"));
+                    continue;
+                }
+                if (e.Kind == EvKind.QuestCompleted && !e.QuestHidden && e.QuestId != 0 && !explained.Contains(e) &&
+                    !(e.QuestName.Length > 0 && char.IsLower(e.QuestName[0])) && !IsSystemQuest(e))
+                {
+                    // (a kill or the end of a fight in the last 5 s: an arena match, a boss)
+                    bool fought = false;
+                    for (int j = i - 1; j >= 0 && e.Elapsed - events[j].Elapsed <= 5 && !fought; j--)
+                        fought = events[j].Kind == EvKind.Kill || events[j].Kind == EvKind.CombatEnd;
+                    if (fought)
+                    {
+                        list.Add("OK " + Fmt.Duration(e.Elapsed).PadRight(10) + "\"" + e.QuestName + "\" completed  at " + X(e.Pos) + "  (after a fight)");
+                        continue;
+                    }
+                    // (nothing you did just before: it ended where you went after your last action - more than 15 s on and
+                    // 3 units away, no one talked to, and not a moment after it came to its last step (that step's own line
+                    // says where you went) - so getting there did it, like Trouble in Deed's "Leave the Shop"; else it ended
+                    // by itself where you stood)
+                    RecEvent lastAct = null;
+                    bool talked = false, justCame = false;
+                    for (int j = i - 1; j >= 0 && e.Elapsed - events[j].Elapsed < 2.5; j--)
+                        if (events[j].QuestId == e.QuestId && (events[j].Kind == EvKind.QuestStep || events[j].Kind == EvKind.QuestAdded))
+                            justCame = true;
+                    for (int j = i - 1; j >= 0 && !justCame; j--)
+                    {
+                        EvKind k = events[j].Kind;
+                        if (k == EvKind.ConvoEnd && e.Elapsed - events[j].Elapsed < 15)
+                            talked = true;
+                        if (k == EvKind.ObjectClick || k == EvKind.NpcClick || k == EvKind.QuestItem || k == EvKind.Cast || k == EvKind.ConvoEnd ||
+                            k == EvKind.Kill || k == EvKind.Loot || k == EvKind.HolocomAnswered || k == EvKind.ElevatorRide || k == EvKind.Command)
+                        {
+                            lastAct = events[j];
+                            break;
+                        }
+                    }
+                    bool walked = !talked && lastAct != null && e.Elapsed - lastAct.Elapsed > 15 && !e.Pos.IsZero && !lastAct.Pos.IsZero &&
+                                  e.Pos.DistanceTo(lastAct.Pos) > 3f;
+                    list.Add("OK " + Fmt.Duration(e.Elapsed).PadRight(10) + "\"" + e.QuestName + "\" completed  at " + X(e.Pos) +
+                             (walked ? "  (you got there - the bot walks here)" : "  (it ended by itself - the bot waits here for it)"));
+                    continue;
+                }
                 string what;
+                bool ownItem = false, itemGone = false, companion = false;
                 switch (e.Kind)
                 {
                     case EvKind.ObjectClick: what = "clicked object \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
-                    case EvKind.NpcClick: what = "clicked NPC \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
+                    case EvKind.NpcClick:
+                        // (your companion: a click on it never moves a mission - the kill just after it did)
+                        companion = e.Target != null && string.Equals(e.Target.Toughness, "companion", StringComparison.OrdinalIgnoreCase);
+                        what = (companion ? "clicked your companion \"" : "clicked NPC \"") + (e.Target != null ? e.Target.Name : "?") + "\"";
+                        break;
                     case EvKind.Loot: what = "looted \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
                     case EvKind.BoardOpen: what = "mission board \"" + e.Option + "\" opened"; break;
                     case EvKind.InteractionOpen: what = e.Option + " window with \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
-                    case EvKind.ConvoStart: what = "talked to \"" + (e.Target != null ? e.Target.Name : "?") + "\""; break;
+                    case EvKind.ConvoStart:
+                    {
+                        // (nobody the recorder could name: the object under your mouse just before, Tython's Ancient Computer)
+                        string talkedTo = e.Target != null ? e.Target.Name : null;
+                        for (int j = i - 1; talkedTo == null && j >= 0 && e.Elapsed - events[j].Elapsed <= 5; j--)
+                            if (events[j].Kind == EvKind.Command && events[j].Target != null && events[j].Target.Kind == ObjKind.Placeable && events[j].Target.Name.Length > 0)
+                                talkedTo = events[j].Target.Name;
+                        what = "talked to \"" + (talkedTo ?? "?") + "\"";
+                        break;
+                    }
                     case EvKind.ConvoChoice: what = "reply " + (e.OptionGuessed ? "? (not seen)" : e.Option) + (e.Choices != null ? " of [" + string.Join(" | ", e.Choices.ToArray()) + "]" : string.Empty); break;
                     case EvKind.QuestItem:
                         if (e.Note == "item gone")
                         {
+                            // (what the game did, not you: the transport it took as Republic's Most Wanted ended is not what
+                            // ended it - the mission's own line says what did)
                             what = "item \"" + e.Option + "\" left your bags (used up, or the game took it)";
+                            itemGone = true;
                             break;
                         }
                         if (SameUseLanded(events, i))
@@ -1971,6 +2794,7 @@ namespace QuestRecorder
                         string with = SharedCooldownWith(events, i);
                         what = with != null ? "item \"" + e.Option + "\" went on cooldown with \"" + with + "\" (they share one: most likely not pressed)"
                                             : "used item \"" + e.Option + "\"" + (e.Target != null ? " on \"" + e.Target.Name + "\"" : string.Empty);
+                        ownItem = with == null && own.Contains(e.Option) && e.Note != "ability" && e.Note != "equipped" && !e.Binoculars;
                         break;
                     case EvKind.ElevatorRide: what = "rode \"" + (e.Target != null ? e.Target.Name : "?") + "\" to " + (e.Option.Length > 0 ? e.Option : "?"); break;
                     case EvKind.TaxiStart: what = "took a taxi"; break;
@@ -1980,13 +2804,23 @@ namespace QuestRecorder
                 }
                 Vec3 where = e.Target != null && e.Target.HasPos ? e.Target.Pos : e.Pos;
                 var after = new List<string>();
-                for (int j = i + 1; j < events.Count && events[j].Elapsed - e.Elapsed <= 10; j++)
+                // a binocular scan moves the mission only once you've aimed and zoomed in: up to 45 s after the use (the
+                // window the profile maker reads it in), and only the first mission change (a fight or the next scan is
+                // something else)
+                bool binoc = e.Kind == EvKind.QuestItem && e.Binoculars;
+                double firstAt = double.NaN;
+                for (int j = i + 1; !ownItem && !itemGone && !companion && j < events.Count && events[j].Elapsed - e.Elapsed <= (binoc ? 45 : 10); j++)
                 {
                     RecEvent q = events[j];
                     if (q.Kind == EvKind.ObjectClick || q.Kind == EvKind.NpcClick)
                         break; // the next thing you did
+                    if (binoc && ((q.Kind == EvKind.QuestItem && q.Binoculars) || q.Kind == EvKind.Kill || q.Kind == EvKind.CombatStart ||
+                                  (!double.IsNaN(firstAt) && q.Elapsed > firstAt)))
+                        break;
                     if (q.QuestHidden)
                         continue;
+                    if (binoc && double.IsNaN(firstAt) && (q.Kind == EvKind.QuestAdded || q.Kind == EvKind.QuestTask || q.Kind == EvKind.QuestStep || q.Kind == EvKind.QuestCompleted))
+                        firstAt = q.Elapsed;
                     if (q.Kind == EvKind.QuestAdded || q.Kind == EvKind.QuestTask || q.Kind == EvKind.QuestStep || q.Kind == EvKind.QuestCompleted)
                         explained.Add(q); // this action caused it
                     if (q.Kind == EvKind.QuestAdded) after.Add("got \"" + q.QuestName + "\"");
@@ -2001,7 +2835,10 @@ namespace QuestRecorder
                 if (e.Kind == EvKind.Command && after.Count == 0)
                     continue; // a key over something that did nothing: not worth a line
                 list.Add((why != null ? "!! " : "OK ") + Fmt.Duration(e.Elapsed).PadRight(10) + (what + " ").PadRight(47) + (X(where) + " ").PadRight(27) + "-> " +
-                         (after.Count > 0 ? string.Join("; ", after.ToArray()) : "nothing") + (why != null ? "  - " + why : string.Empty));
+                         (after.Count > 0 ? string.Join("; ", after.ToArray()) : "nothing") + (why != null ? "  - " + why : string.Empty) +
+                         (ownItem ? "  (your own medpac or adrenal: never a mission step)" : string.Empty) +
+                         (companion ? "  (your companion: never a mission step)" : string.Empty) +
+                         (e.Kind == EvKind.ConvoChoice && redone.Contains(e) ? "  (this talk moved nothing and you talked to them again right after: this reply isn't used)" : string.Empty));
             }
             return list;
         }
@@ -2484,6 +3321,7 @@ namespace QuestRecorder
 
             var steps = new List<Step>();
             var markers = new List<KeyValuePair<string, Vec3>>();
+            _doorArea = new Dictionary<string, ulong>(StringComparer.Ordinal);
             var uses = new List<Use>();
             var fightUses = new List<Use>(); // objects you used or attacked in a fight (one may bring out the mob that ends it)
             string fightMobs = string.Empty; // the mobs that started the last fight, as the recorder listed them
@@ -2559,6 +3397,7 @@ namespace QuestRecorder
             var finalAt = new Dictionary<ulong, double>();
             double lastWalkAt = -1e9;
             int dark = 0, light = 0;
+            HashSet<RecEvent> redoneTalk = RedoneTalkRows(events);
             var vendors = new Dictionary<string, Vec3>(StringComparer.Ordinal);
             double lastProgressAt = -1e9;
             ulong lastProgressQuest = 0;
@@ -2993,7 +3832,11 @@ namespace QuestRecorder
                         }
                         break;
                     case EvKind.ConvoChoice:
-                        if (!e.OptionGuessed && e.Option.EndsWith(" dark", StringComparison.Ordinal))
+                        // (a talk you redid right after: its replies are not what you played)
+                        if (redoneTalk.Contains(e))
+                        {
+                        }
+                        else if (!e.OptionGuessed && e.Option.EndsWith(" dark", StringComparison.Ordinal))
                             dark++;
                         else if (!e.OptionGuessed && e.Option.EndsWith(" light", StringComparison.Ordinal))
                             light++;
@@ -3094,18 +3937,21 @@ namespace QuestRecorder
                             bool heroic = useName.StartsWith("Heroic Transport: ", StringComparison.Ordinal);
                             // the whole step (waits too) only runs when a shuttle can actually be used from here
                             var hop = new Step { Kind = "Ride", Comment = "Mission item: " + useName, Gate = away + " and " + A(heroic ? "(" + have + " or " + shortHave + ")" : have) };
-                            string where = "<Hotspots><Hotspot Name=\"Where you used it\" XYZ=\"" + X(itemPos.IsZero ? e.FromPos : itemPos) + "\" /></Hotspots>";
+                            // (XYZ too: once its hotspot is passed, UseItem walks to its XYZ, <0, 0, 0> when it has none)
+                            string usedSpot = X(itemPos.IsZero ? e.FromPos : itemPos);
+                            string where = " XYZ=\"" + usedSpot + "\"><Hotspots><Hotspot Name=\"Where you used it\" XYZ=\"" + usedSpot + "\" /></Hotspots>";
                             string cond = away + " and " + A(have);
-                            hop.Lines.Add("<If Condition=\"" + cond + "\">");
-                            hop.Lines.Add("<UseItem ItemName=\"" + A(useName) + "\" Condition=\"" + cond + "\" WaitTime=\"3000\" Range=\"100000\">" + where + "</UseItem>");
+                            // (not entered when it has a long cooldown left: see NoLongCooldown)
+                            hop.Lines.Add("<If Condition=\"" + cond + " and " + A(NoLongCooldown(useName)) + "\">");
+                            hop.Lines.Add("<UseItem ItemName=\"" + A(useName) + "\" Condition=\"" + cond + "\" WaitTime=\"3000\" Range=\"100000\"" + where + "</UseItem>");
                             hop.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"5\" />");
                             hop.Lines.Add("</If>");
                             if (heroic)
                             {
                                 // The Korriban way: UseItem "Heroic Transport" took the shuttle there.
                                 string shortCond = away + " and " + A(shortHave);
-                                hop.Lines.Add("<If Condition=\"" + shortCond + "\">");
-                                hop.Lines.Add("<UseItem ItemName=\"Heroic Transport\" Condition=\"" + shortCond + "\" WaitTime=\"3000\" Range=\"100000\">" + where + "</UseItem>");
+                                hop.Lines.Add("<If Condition=\"" + shortCond + " and " + A(NoLongCooldown("Heroic Transport")) + "\">");
+                                hop.Lines.Add("<UseItem ItemName=\"Heroic Transport\" Condition=\"" + shortCond + "\" WaitTime=\"3000\" Range=\"100000\"" + where + "</UseItem>");
                                 hop.Lines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"5\" />");
                                 hop.Lines.Add("</If>");
                             }                            steps.Add(hop);
@@ -3159,6 +4005,10 @@ namespace QuestRecorder
                         {
                             markers.Add(new KeyValuePair<string, Vec3>("Before the " + (e.Kind == EvKind.AreaChange ? "area change" : "door / phase"), e.FromPos));
                             markers.Add(new KeyValuePair<string, Vec3>("Came out here", e.Pos));
+                            // (the zone of the door: its walk runs only there, not wherever else you stand on that side of it)
+                            ulong doorArea = e.FromArea != 0 ? e.FromArea : e.AreaId;
+                            if (e.Kind != EvKind.AreaChange && doorArea != 0)
+                                _doorArea[X(e.FromPos) + "|" + X(e.Pos)] = doorArea;
                         }
                         break;
                     }
@@ -3290,7 +4140,10 @@ namespace QuestRecorder
                             if (giver.Kind == ObjKind.Placeable && giver.HasPos && !stand.IsZero)
                             {
                                 float d = stand.DistanceTo(gp);
-                                if (d >= 0.3f && d < 10f)
+                                // (a mission board always: the bot's walk to it can't end on the board's own spot - it can't
+                                // stand inside it - so Voss's walk to a board you stood 0.26 from never ended)
+                                bool atBoard = e.Note == How.Board && e.Target != null && e.Target.Name == giver.Name;
+                                if ((d >= 0.3f || (atBoard && d > 0.001f)) && d < 10f)
                                 {
                                     s.Lines.Add("<MoveTo QuestId=\"1\" Name=\"Stand for " + A(giver.Name) + "\" XYZ=\"" + X(stand) + "\" />");
                                     range = Math.Max(20, (int)Math.Ceiling((d + 1f) * 10f)).ToString(CultureInfo.InvariantCulture);
@@ -5204,6 +6057,9 @@ namespace QuestRecorder
             markers.Clear();
         }
 
+        /// <summary>The zone of each door / phase you went through, by its two walk points (X of before + "|" + X of after).</summary>
+        [ThreadStatic] private static Dictionary<string, ulong> _doorArea;
+
         /// <summary>Writes walk points as route lines (lift rides become UseTransport).</summary>
         private static void AddRoute(Step route, List<KeyValuePair<string, Vec3>> markers)
         {
@@ -5211,7 +6067,15 @@ namespace QuestRecorder
             var doors = new List<KeyValuePair<int, string>>(); // the "Came out here" point of each door, and its "not through yet" test
             for (int i = 0; i + 1 < markers.Count; i++)
                 if (markers[i].Key == "Before the door / phase" && markers[i + 1].Key == "Came out here")
-                    doors.Add(new KeyValuePair<int, string>(i + 1, DoorSide(markers[i].Value, markers[i + 1].Value)));
+                {
+                    string side = DoorSide(markers[i].Value, markers[i + 1].Value);
+                    // only in the zone of the door: the side test alone is true in most of any other zone too (Voss, 22 Nov:
+                    // the Voss-Ka door walk would have run on the fleet)
+                    ulong da;
+                    if (_doorArea != null && _doorArea.TryGetValue(X(markers[i].Value) + "|" + X(markers[i + 1].Value), out da))
+                        side = "((Core.Player.AreaId == " + Fmt.Hex(da) + ") and " + side + ")";
+                    doors.Add(new KeyValuePair<int, string>(i + 1, side));
+                }
             if (doors.Count > 0)
             {
                 var sides = new List<string>();
