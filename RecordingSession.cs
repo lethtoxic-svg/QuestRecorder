@@ -690,6 +690,18 @@ namespace QuestRecorder
                 {
                     // every interaction you made, where, and what your quest log did right after
                     List<string> did = ReplayBuilder.Interactions(_events);
+                    List<string> checks = ReplayBuilder.LastChecks;
+                    if (did.Count > 0)
+                    {
+                        // the checks of this profile first: what keeps it from running, then what to look at
+                        var top = new List<string>();
+                        top.Add(checks != null && checks.Count > 0 ? "Checks of this profile (" + checks.Count + "):" : "Checks of this profile: nothing to look at.");
+                        if (checks != null)
+                            foreach (string ch in checks)
+                                top.Add("  " + ch);
+                        top.Add(string.Empty);
+                        did.InsertRange(Math.Min(3, did.Count), top);
+                    }
                     WriteWhole(Path.Combine(Folder, BaseName + " (what you did).txt"), did.Count > 0 ? string.Join("\r\n", did.ToArray()) + "\r\n" : string.Empty);
                 }
                 catch (Exception ex)

@@ -42,6 +42,11 @@ namespace QuestRecorder
             public bool Yellow;
             /// <summary>What the bot does for it, in plain words (the task tracker's line; never in the profile).</summary>
             public string What = string.Empty;
+            /// <summary>
+            /// Not while the bot stands at another open mission's site (missions whose transports share a name), or null: what
+            /// the step's gate adds for that. A door or lift walk before the step takes it too.
+            /// </summary>
+            public string Away;
             /// <summary>Of missions whose transports share one name (0 = none): their steps go round again, as the game picks the transport.</summary>
             public int Group;
         }

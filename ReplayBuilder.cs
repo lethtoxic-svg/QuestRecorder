@@ -1021,6 +1021,10 @@ namespace QuestRecorder
             public string What = string.Empty;
             /// <summary>Of missions whose transports share one name (0 = none): see <see cref="RepeatShared"/>.</summary>
             public int Group;
+            /// <summary>The new core's "not at another open mission's site" test for this step (null = none): see CoreRender.Block.Away.</summary>
+            public string Away;
+            /// <summary>A transport (a mission item that takes you to the mission's site): the missions after it are done there.</summary>
+            public bool Hop;
         }
 
         /// <summary>A conversation and the replies you picked ("2 dark"; "?" when not seen).</summary>
@@ -1319,24 +1323,44 @@ namespace QuestRecorder
         [ThreadStatic] private static int _hookNo;
         [ThreadStatic] private static bool _faceAdded;
         [ThreadStatic] private static bool _binocAdded;
+        [ThreadStatic] private static bool _restAdded;
 
         /// <summary>
-        /// The code a binocular scan's hook calls (one copy a profile): after the cast it turns and tilts the camera to where you
-        /// aimed, checking each move by reading where the game's camera looks, zooms in, and waits for the scan.
+        /// The code a binocular scan's hook calls (one copy a profile): after the cast it turns and tilts the view to where you
+        /// aimed with small mouse moves (only while the game is the front window; the view only follows the mouse), checking
+        /// each move by reading where the game's camera looks, zooms in, and waits for the scan.
         /// </summary>
-        private const string BinocCode = @"// Binocular scans (Macrobinoculars, a mission Scanner): turn and tilt the camera to where you aimed, zoom in, wait for the
-// scan. Each move is checked by reading where the game's camera looks; what moved it goes to BuddyCron's log (""[Binoculars]"").
-static int _bnState; // 0 not started, 1 waiting for the view to open, 2 aiming, 3 zooming / waiting for the scan
-static System.DateTime _bnAt, _bnZoomAt;
+        private const string BinocCode = @"// Binocular scans (Macrobinoculars, a mission Scanner): from where you stood the bot faces the way you aimed and uses the
+// item. The view opens where the camera looks, and only the mouse turns it, so the bot then turns and tilts it onto what
+// you scanned with small mouse moves (only while the game is the front window; each move is checked by reading where the
+// game's camera looks), zooms in and waits for the scan. Once the scan counts it lets go of the zoom and leaves the view
+// (checked by the game: if the view stays, Escape on the view's own controls, then the Escape key). What it did goes to
+// BuddyCron's log (""[Binoculars]"").
+static int _bnState; // 0 not started, 1 waiting for the view to open, 2 aiming, 3 zooming in, 4 waiting for the scan, 5 leaving the view
+static ulong _bnQ; // the mission the scan is for (0 = not known)
+static ulong _bnQStep, _bnQSum; // where the mission stood when the scan started (its step, and its counts added up)
+static bool _bnQHad;
+static int _bnLeave; static System.DateTime _bnLeaveAt; static string _bnLeaveHow;
+static System.DateTime _bnAt, _bnStepAt, _bnMoveAt, _bnZoomAt;
 static float _bnWantYaw = float.NaN, _bnWantPitch = float.NaN;
-static int _bnPulses, _bnZoomTries, _bnTurnMode, _bnPending, _bnLastMs;
-static bool _bnZoomTook;
-static int _bnYawLayer, _bnPitchLayer; // which of _bnOrder's layers moves it (past its end = none does)
-static int[] _bnOrder, _bnZoomOrder; // the input layers to try, in turn (BinocOrder)
-static float _bnYawGain, _bnPitchGain; // how far the camera moved per ms a key was held (signed; 0 = not learned yet)
-static float _bnLastYaw, _bnLastPitch, _bnLastCmd;
-static BuddyCron.sysInputEvent _bnLastKey;
+static int _bnMoves, _bnMode, _bnZoomTry, _bnLastDx, _bnLastDy, _bnNoMove, _bnHeld;
+static float _bnGainX, _bnGainY; // how far the view turns / tilts per mouse count (signed; 0 = not learned yet)
+static float _bnLastYaw, _bnLastPitch;
+static bool _bnLeftDown, _bnRightDown, _bnKeyDown, _bnFront, _bnLayerLooked;
+static BuddyCron.Objects.HeroInputLayer _bnLayer;
 static BuddyCron.CameraReader _bnCam;
+
+[System.Runtime.InteropServices.DllImport(""user32.dll"", EntryPoint = ""mouse_event"")]
+static extern void BinocMouseEvent(uint flags, int dx, int dy, uint data, System.UIntPtr extra);
+
+[System.Runtime.InteropServices.DllImport(""user32.dll"", EntryPoint = ""keybd_event"")]
+static extern void BinocKeybd(byte vk, byte scan, uint flags, System.UIntPtr extra);
+
+[System.Runtime.InteropServices.DllImport(""user32.dll"", EntryPoint = ""GetForegroundWindow"")]
+static extern System.IntPtr BinocForeground();
+
+[System.Runtime.InteropServices.DllImport(""user32.dll"", EntryPoint = ""GetWindowThreadProcessId"")]
+static extern uint BinocWindowPid(System.IntPtr window, out uint pid);
 
 static void BinocLog(string m)
 {
@@ -1420,117 +1444,200 @@ static int BinocZoom()
     return -1;
 }
 
-static BuddyCron.Objects.HeroInputLayer BinocLayer(int n)
+// the game window is the one in front (mouse moves go to the window in front, so the bot only moves the mouse then)
+static bool BinocGameInFront()
 {
     try
     {
-        switch (n)
+        System.IntPtr w = BinocForeground();
+        if (w == System.IntPtr.Zero)
+            return false;
+        uint pid;
+        BinocWindowPid(w, out pid);
+        if (pid == 0)
+            return false;
+        System.Diagnostics.Process game = null;
+        try { game = BuddyCron.Core.Memory.Process; } catch { }
+        if (game != null)
+            return pid == (uint)game.Id;
+        using (var p = System.Diagnostics.Process.GetProcessById((int)pid))
+            return string.Equals(p.ProcessName, ""swtor"", System.StringComparison.OrdinalIgnoreCase);
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+// the binocular view's own input layer: BuddyCron keeps 14 of the game's input layers, so when it isn't one of them the bot
+// looks for it among the game's objects the way BuddyCron does, keeping up to 64 (once a scan, before the item is used)
+static BuddyCron.Objects.HeroInputLayer BinocLayer()
+{
+    try
+    {
+        var l = BuddyCron.Managers.InputManager.Layer(""ctlInputMacroBinoculars"");
+        if (l != null && l.IsValid)
+            return l;
+        if (_bnLayer != null && _bnLayer.IsValid)
+            return _bnLayer;
+        if (_bnLayerLooked)
+            return null;
+        _bnLayerLooked = true;
+        var make = typeof(BuddyCron.Objects.HeroInputLayer).GetConstructor(
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public,
+            null, new[] { typeof(ulong), typeof(System.IntPtr) }, null);
+        if (make == null)
+            return null;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var want = new[] { BuddyCron.GomClassId.sysInputLayer };
+        var most = new System.Collections.Generic.Dictionary<BuddyCron.GomClassId, int> { { BuddyCron.GomClassId.sysInputLayer, 64 } };
+        int seen = 0;
+        foreach (var n in BuddyCron.Gom.FindNodesByClasses(want, most))
         {
-            case 0: return BuddyCron.Managers.InputManager.Movement;
-            case 1: return BuddyCron.Managers.InputManager.Camera;
-            case 2: return BuddyCron.Managers.InputManager.Game;
-            case 3: return BuddyCron.Managers.InputManager.Mouse;
-            case 4: return BuddyCron.Managers.InputManager.UI;
-            case 5: return BuddyCron.Managers.InputManager.Targetting;
-            case 6: return BuddyCron.Managers.InputManager.Layer(""ctlInputMacroBinoculars"");
+            if (n.Item1 != BuddyCron.GomClassId.sysInputLayer)
+                continue;
+            seen++;
+            var c = make.Invoke(new object[] { n.Item2, n.Item3 }) as BuddyCron.Objects.HeroInputLayer;
+            if (c != null && c.ScriptName == ""ctlInputMacroBinoculars"")
+            {
+                _bnLayer = c;
+                BinocLog(""found the binoculars' own controls among "" + seen + "" input layers ("" + sw.ElapsedMilliseconds + "" ms)"");
+                return c;
+            }
         }
+        BinocLog(""the binoculars' own controls aren't among the game's "" + seen + "" input layers ("" + sw.ElapsedMilliseconds + "" ms)"");
     }
     catch { }
     return null;
 }
 
-static string BinocLayerName(int n)
+// a key on the binocular view's own layer: true = the layer took it
+static bool BinocKey(BuddyCron.sysInputEvent key, bool down)
 {
-    switch (n)
-    {
-        case 0: return ""movement"";
-        case 1: return ""camera"";
-        case 2: return ""game"";
-        case 3: return ""mouse"";
-        case 4: return ""UI"";
-        case 5: return ""targeting"";
-        case 6: return ""binoculars"";
-    }
-    return ""no"";
-}
-
-// the layers to try, in turn, for turning and tilting: the binocular view's own, the camera's, the mouse's, then the old
-// ones - only those the game has on while the view is open (Yavin 4, 22 Nov: binoculars, camera, mouse, UI and targeting
-// on; movement and game off). For the zoom key, UI and targeting too. When the game doesn't say: camera, movement, game.
-static void BinocOrder()
-{
-    var order = new System.Collections.Generic.List<int>();
-    var zoom = new System.Collections.Generic.List<int>();
-    foreach (int n in new[] { 6, 1, 3, 0, 2, 4, 5 })
-    {
-        bool on = false;
-        try
-        {
-            var l = BinocLayer(n);
-            on = l != null && l.IsValid && l.IsActive;
-        }
-        catch { }
-        if (!on)
-            continue;
-        if (n != 4 && n != 5)
-            order.Add(n);
-        zoom.Add(n);
-    }
-    if (order.Count == 0)
-        order.AddRange(new[] { 1, 0, 2 });
-    if (zoom.Count == 0)
-        zoom.AddRange(new[] { 1, 2, 0, 3, 4, 5 });
-    bool same = _bnOrder != null && string.Join("","", _bnOrder) == string.Join("","", order);
-    if (!same)
-    {
-        // (another set of layers than the last scan's: learn the keys again)
-        _bnYawLayer = 0;
-        _bnPitchLayer = 0;
-        _bnYawGain = 0f;
-        _bnPitchGain = 0f;
-    }
-    _bnOrder = order.ToArray();
-    _bnZoomOrder = zoom.ToArray();
-    var names = new System.Collections.Generic.List<string>();
-    foreach (int n in _bnOrder)
-        names.Add(BinocLayerName(n));
-    BinocLog(""keys tried on the "" + string.Join("", then "", names) + "" layer"");
-}
-
-// the n-th layer to try (-1 past the end)
-static int BinocAt(int i)
-{
-    int[] o = _bnOrder ?? new[] { 1, 0, 2 };
-    return i >= 0 && i < o.Length ? o[i] : -1;
-}
-
-static int BinocCount()
-{
-    return _bnOrder != null ? _bnOrder.Length : 3;
-}
-
-// holds one of the game's own keys for ms on one input layer (the way BuddyCron walks), then lets go: true = the layer took it
-static bool BinocHold(int layer, BuddyCron.sysInputEvent key, int ms)
-{
-    var l = BinocLayer(layer);
-    if (l == null)
-        return false;
-    bool took = false;
     try
     {
-        took = l.RaiseInputEvent(key, true);
-        if (took)
-            System.Threading.Thread.Sleep(ms);
+        var l = BinocLayer();
+        return l != null && l.RaiseInputEvent(key, down);
     }
     catch
     {
-        took = false;
+        return false;
     }
-    finally
+}
+
+static void BinocMouse(int dx, int dy)
+{
+    try { BinocMouseEvent(0x0001u, dx, dy, 0u, System.UIntPtr.Zero); } catch { }
+}
+
+// a mouse button down or up; a button held down is let go after 20 s whatever happens (a fight, a stop)
+static void BinocButton(bool left, bool down)
+{
+    try
     {
-        try { l.RaiseInputEvent(key, false); } catch { }
+        if (down)
+        {
+            BinocMouseEvent(left ? 0x0002u : 0x0008u, 0, 0, 0u, System.UIntPtr.Zero);
+            if (left) _bnLeftDown = true; else _bnRightDown = true;
+            int mine = ++_bnHeld;
+            System.Threading.Tasks.Task.Delay(20000).ContinueWith(t => { if (_bnHeld == mine) BinocLetGoMouse(); });
+        }
+        else
+        {
+            BinocMouseEvent(left ? 0x0004u : 0x0010u, 0, 0, 0u, System.UIntPtr.Zero);
+            if (left) _bnLeftDown = false; else _bnRightDown = false;
+        }
     }
+    catch { }
+}
+
+static void BinocLetGoMouse()
+{
+    if (_bnLeftDown)
+        BinocButton(true, false);
+    if (_bnRightDown)
+        BinocButton(false, false);
+}
+
+// lets go of everything the scan holds down (also when a fight or a death stops it)
+static void BinocStop()
+{
+    BinocLetGoMouse();
+    if (_bnKeyDown)
+    {
+        BinocKey(BuddyCron.sysInputEvent.MacroBinocularsZoomIn, false);
+        _bnKeyDown = false;
+    }
+    _bnState = 0;
+}
+
+// where the mission stands: its step and its counts added up (false = the game doesn't say)
+static bool BinocQuest(out ulong step, out ulong sum)
+{
+    step = 0;
+    sum = 0;
+    try
+    {
+        BuddyCron.Objects.QuestState st;
+        var qs = BuddyCron.Core.Me.Quests.ActiveQuestsList;
+        if (_bnQ == 0 || qs == null || !qs.TryGetValue(_bnQ, out st) || st == null)
+            return false;
+        step = st.StepId;
+        if (st.TaskCount != null)
+            foreach (ulong c in st.TaskCount)
+                sum += c;
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+// when the scan starts: where the mission stands
+static void BinocMark()
+{
+    _bnQHad = BinocQuest(out _bnQStep, out _bnQSum);
+}
+
+// the scan counted: since it started the mission moved on (its step, or a count went up), is done, or is gone
+static bool BinocCounted()
+{
+    if (_bnQ == 0 || !_bnQHad)
+        return false;
+    try
+    {
+        if (!BuddyCron.Scripting.ConditionParser.HasQuest(_bnQ) || BuddyCron.Scripting.ConditionParser.IsQuestComplete(_bnQ))
+            return true;
+    }
+    catch { }
+    ulong step, sum;
+    if (!BinocQuest(out step, out sum))
+        return false;
+    return step != _bnQStep || sum > _bnQSum;
+}
+
+// Escape on the binocular view's own controls, only while the game says the view is open
+static bool BinocCancel()
+{
+    if (BinocOpen() != 1)
+        return false;
+    bool took = BinocKey(BuddyCron.sysInputEvent.Cancel, true);
+    BinocKey(BuddyCron.sysInputEvent.Cancel, false);
     return took;
+}
+
+// after the scan: let go of the zoom, then leave the view (state 5 checks it really closed)
+static void BinocLeaveStart(System.DateTime now)
+{
+    BinocLetGoMouse();
+    bool held = _bnKeyDown;
+    BinocKey(BuddyCron.sysInputEvent.MacroBinocularsZoomIn, false);
+    _bnKeyDown = false;
+    _bnLeave = 0;
+    _bnLeaveAt = now;
+    _bnLeaveHow = held ? ""let go of the zoom key"" : ""waited"";
+    _bnState = 5;
 }
 
 // where to aim from where the bot stands: at the object you scanned (found again by its name near where it was), corrected
@@ -1570,15 +1677,21 @@ static void BinocWant(System.Numerics.Vector3 spot, float recYaw, float recPitch
     }
 }
 
-// before the cast: start this scan, and face the way to aim (BuddyCron's own turn)
+// before the item: start this scan, and face the way to aim (BuddyCron's own turn; the view opens where the camera looks)
 static void BinocStart(System.Numerics.Vector3 spot, float recYaw, float recPitch, bool hasAt, System.Numerics.Vector3 at, string atName)
 {
-    _bnState = 0;
-    _bnPulses = 0;
-    _bnZoomTries = 0;
-    _bnZoomTook = false;
-    _bnTurnMode = 0;
-    _bnPending = 0;
+    BinocStop();
+    _bnMoves = 0;
+    _bnMode = 0;
+    _bnZoomTry = 0;
+    _bnLastDx = 0;
+    _bnLastDy = 0;
+    _bnNoMove = 0;
+    _bnGainX = 0f;
+    _bnGainY = 0f;
+    _bnLayerLooked = false;
+    BinocLayer();
+    BinocMark();
     BinocWant(spot, recYaw, recPitch, hasAt, at, atName);
     float cy, cp;
     bool cam = BinocCamera(out cy, out cp);
@@ -1592,32 +1705,88 @@ static void BinocStart(System.Numerics.Vector3 spot, float recYaw, float recPitc
     catch { }
 }
 
-// one key press toward the wanted angle on one axis, learning from the press before how far a press moves the camera
-static void BinocPress(bool yawAxis, float err)
+// one round of aiming with the mouse: 0 = still aiming, 1 = done (aimed, or it can't)
+static int BinocAimMouse(System.DateTime now, float tol, double most)
 {
-    BuddyCron.sysInputEvent a = yawAxis ? BuddyCron.sysInputEvent.RotateLeft : BuddyCron.sysInputEvent.RotateCameraUp;
-    BuddyCron.sysInputEvent b = yawAxis ? BuddyCron.sysInputEvent.RotateRight : BuddyCron.sysInputEvent.RotateCameraDown;
-    float gain = yawAxis ? _bnYawGain : _bnPitchGain;
-    int layer = BinocAt(yawAxis ? _bnYawLayer : _bnPitchLayer);
-    BuddyCron.sysInputEvent key;
-    int ms;
-    if (gain == 0f)
+    float cy, cp;
+    if (!BinocCamera(out cy, out cp))
     {
-        key = a; // not learned yet: a short press to see which way and how far it goes
-        ms = 60;
+        BinocLog(""the camera can't be read: zooming where it looks"");
+        return 1;
     }
-    else
+    if (_bnLastDx != 0 || _bnLastDy != 0)
     {
-        key = (err > 0f) == (gain > 0f) ? a : b;
-        ms = (int)System.Math.Max(10.0, System.Math.Min(400.0, System.Math.Abs(err / gain)));
+        // what the last move did (the game shows it a frame or two later)
+        if ((now - _bnMoveAt).TotalMilliseconds < 160)
+            return 0;
+        float my = BinocDiff(cy, _bnLastYaw), mp = cp - _bnLastPitch;
+        bool moved = false;
+        if (_bnLastDx != 0 && System.Math.Abs(my) >= 0.05f)
+        {
+            float g = my / _bnLastDx;
+            _bnGainX = _bnGainX != 0f && (g > 0f) == (_bnGainX > 0f) ? 0.5f * (_bnGainX + g) : g;
+            moved = true;
+        }
+        if (_bnLastDy != 0 && System.Math.Abs(mp) >= 0.05f)
+        {
+            float g = mp / _bnLastDy;
+            _bnGainY = _bnGainY != 0f && (g > 0f) == (_bnGainY > 0f) ? 0.5f * (_bnGainY + g) : g;
+            moved = true;
+        }
+        _bnLastDx = 0;
+        _bnLastDy = 0;
+        if (!moved && _bnGainX == 0f && _bnGainY == 0f && ++_bnNoMove >= 2)
+        {
+            _bnNoMove = 0;
+            if (_bnState != 2)
+            {
+                // (while it waits for the scan: no more moves)
+                _bnMode = 2;
+                return 1;
+            }
+            if (_bnMode == 0)
+            {
+                // moving the mouse alone didn't turn the view: with the left button held
+                BinocLog(""moving the mouse didn't turn the view: trying with the left button held"");
+                _bnMode = 1;
+                BinocButton(true, true);
+                return 0;
+            }
+            BinocLetGoMouse();
+            BinocLog(""the mouse didn't turn the view either way: zooming where it looks"");
+            _bnMode = 2;
+            return 1;
+        }
     }
-    bool took = BinocHold(layer, key, ms);
-    _bnPending = yawAxis ? 1 : 2;
-    _bnLastKey = key;
-    _bnLastMs = took ? ms : 0;
+    float ey = BinocDiff(_bnWantYaw, cy), ep = _bnWantPitch - cp;
+    bool done = System.Math.Abs(ey) <= tol && System.Math.Abs(ep) <= tol;
+    if (done || _bnMoves >= 60 || (now - _bnStepAt).TotalSeconds > most)
+    {
+        if (_bnState == 2)
+            BinocLog((done ? ""aimed"" : ""couldn't aim all the way"") + "": the camera looks at "" + BinocF(cy) + "", "" + BinocF(cp) + "" up (off by "" +
+                     BinocF(ey) + "" and "" + BinocF(ep) + "") after "" + _bnMoves + "" mouse moves"" + (_bnMode == 1 ? "" with the left button held"" : string.Empty));
+        return 1;
+    }
+    int dx = 0, dy = 0;
+    if (System.Math.Abs(ey) > tol)
+        dx = _bnGainX == 0f ? (ey > 0f ? 30 : -30) : (int)System.Math.Round(ey / _bnGainX);
+    if (System.Math.Abs(ep) > tol)
+        dy = _bnGainY == 0f ? (ep > 0f ? -30 : 30) : (int)System.Math.Round(ep / _bnGainY);
+    if (dx == 0 && System.Math.Abs(ey) > tol) dx = ey > 0f ? 1 : -1;
+    if (dy == 0 && System.Math.Abs(ep) > tol) dy = ep > 0f ? -1 : 1;
+    dx = System.Math.Max(-400, System.Math.Min(400, dx));
+    dy = System.Math.Max(-400, System.Math.Min(400, dy));
+    _bnLastYaw = cy;
+    _bnLastPitch = cp;
+    _bnLastDx = dx;
+    _bnLastDy = dy;
+    _bnMoveAt = now;
+    _bnMoves++;
+    BinocMouse(dx, dy);
+    return 0;
 }
 
-// after the cast: 0 = still working (the hook waits), 1 = done (zoomed in and waited for the scan, or it couldn't)
+// after the item: 0 = still working (the hook waits), 1 = done (zoomed in and waited for the scan, or it couldn't)
 static int BinocAim()
 {
     var now = System.DateTime.Now;
@@ -1633,128 +1802,157 @@ static int BinocAim()
         if (open == 1 || (open == -1 && waited > 0.8))
         {
             _bnState = 2;
-            _bnAt = now;
-            BinocLog(open == 1 ? ""the view is open"" : ""the game doesn't say if the view is open: aiming anyway"");
-            BinocOrder();
+            _bnStepAt = now;
+            _bnFront = BinocGameInFront();
+            bool layer = BinocLayer() != null;
+            BinocLog((open == 1 ? ""the view is open"" : ""the game doesn't say if the view is open: aiming anyway"") +
+                     (_bnFront ? ""; the game is in front: aiming with the mouse"" : ""; the game isn't the window in front, so the bot won't move the mouse"") +
+                     (layer ? ""; found the binoculars' own controls"" : ""; the binoculars' own controls weren't found""));
+            if (float.IsNaN(_bnWantYaw) || float.IsNaN(_bnWantPitch))
+            {
+                BinocLog(""no aim recorded: zooming where it looks"");
+                _bnState = 3;
+                _bnStepAt = now;
+            }
+            else if (!_bnFront)
+            {
+                _bnState = 3;
+                _bnStepAt = now;
+            }
             return 0;
         }
         if (waited < 4)
             return 0;
-        BinocLog(""the view didn't open after the cast"");
-        _bnState = 0;
+        BinocLog(""the view didn't open after the item"");
+        BinocStop();
         return 1;
+    }
+    if (_bnState == 5)
+    {
+        // left = the game says the view is shut and the zoom is back to normal; else one more way every 1.5 s
+        int vo = BinocOpen(), vz = BinocZoom();
+        if (vo != 1 && vz != 2 && vz != 3 && vz != 4)
+        {
+            BinocLog(""left the view ("" + _bnLeaveHow + ""; view "" + vo + "", zoom "" + vz + "")"");
+            BinocStop();
+            return 1;
+        }
+        if ((now - _bnLeaveAt).TotalSeconds < 1.5)
+            return 0;
+        _bnLeave++;
+        _bnLeaveAt = now;
+        if (_bnLeave == 1)
+        {
+            if (vo == 1)
+            {
+                bool took = BinocCancel();
+                _bnLeaveHow = ""Escape on the binoculars' own controls ("" + (took ? ""taken"" : ""not taken"") + "")"";
+            }
+            else
+            {
+                BinocKey(BuddyCron.sysInputEvent.MacroBinocularsZoomIn, false);
+                bool took = BinocKey(BuddyCron.sysInputEvent.MacroBinocularsZoomOut, true);
+                BinocKey(BuddyCron.sysInputEvent.MacroBinocularsZoomOut, false);
+                _bnLeaveHow = ""the zoom stayed (zoom "" + vz + ""): zoom out key ("" + (took ? ""taken"" : ""not taken"") + "")"";
+            }
+            BinocLog(""still in the view (view "" + vo + "", zoom "" + vz + ""): "" + _bnLeaveHow);
+            return 0;
+        }
+        if (_bnLeave == 2 && vo == 1 && BinocGameInFront())
+        {
+            // the Escape key itself, only while the game says the view is open and the game is the window in front
+            BinocKeybd(0x1B, 0, 0u, System.UIntPtr.Zero);
+            BinocKeybd(0x1B, 0, 0x0002u, System.UIntPtr.Zero);
+            _bnLeaveHow = ""the Escape key"";
+            BinocLog(""still in the view (view "" + vo + "", zoom "" + vz + ""): pressed the Escape key"");
+            return 0;
+        }
+        if (_bnLeave < 3)
+            return 0;
+        BinocLog(""couldn't leave the view (view "" + vo + "", zoom "" + vz + "", tried: "" + _bnLeaveHow + ""): going on"");
+        BinocStop();
+        return 1;
+    }
+    if (BinocOpen() == 0)
+    {
+        BinocLog(_bnState == 4 ? ""the view closed (zoom "" + BinocZoom() + "")"" : ""the view closed before the scan"");
+        BinocLeaveStart(now);
+        return 0;
     }
     if (_bnState == 2)
     {
-        float cy, cp;
-        if (float.IsNaN(_bnWantYaw) || float.IsNaN(_bnWantPitch) || !BinocCamera(out cy, out cp))
-        {
-            BinocLog(float.IsNaN(_bnWantYaw) ? ""no aim recorded: zooming where it looks"" : ""the camera can't be read: zooming where it looks"");
-            _bnState = 3;
+        if (BinocAimMouse(now, 0.6f, 6) == 0)
             return 0;
-        }
-        // what the last press did
-        if (_bnPending == 1 || _bnPending == 3)
-        {
-            float moved = BinocDiff(cy, _bnLastYaw);
-            if (_bnPending == 3)
-            {
-                // BuddyCron's own turn: the view follows it, or keys are needed
-                if (System.Math.Abs(moved) < 0.3f * System.Math.Abs(_bnLastCmd))
-                {
-                    _bnTurnMode = 2;
-                    BinocLog(""turning the character doesn't turn the view: using the turn keys"");
-                }
-                else
-                    _bnTurnMode = 1;
-            }
-            else if (_bnLastMs > 0 && System.Math.Abs(moved) >= 0.2f)
-            {
-                float g = moved / _bnLastMs;
-                _bnYawGain = _bnLastKey == BuddyCron.sysInputEvent.RotateLeft ? g : -g;
-            }
-            else if (_bnYawGain == 0f)
-            {
-                BinocLog(""the "" + BinocLayerName(BinocAt(_bnYawLayer)) + "" layer's turn key didn't turn the view"");
-                _bnYawLayer++;
-            }
-        }
-        else if (_bnPending == 2)
-        {
-            float moved = cp - _bnLastPitch;
-            if (_bnLastMs > 0 && System.Math.Abs(moved) >= 0.2f)
-            {
-                float g = moved / _bnLastMs;
-                _bnPitchGain = _bnLastKey == BuddyCron.sysInputEvent.RotateCameraUp ? g : -g;
-            }
-            else if (_bnPitchGain == 0f)
-            {
-                BinocLog(""the "" + BinocLayerName(BinocAt(_bnPitchLayer)) + "" layer's camera up key didn't tilt the view"");
-                _bnPitchLayer++;
-            }
-        }
-        _bnPending = 0;
-        float ey = BinocDiff(_bnWantYaw, cy), ep = _bnWantPitch - cp;
-        bool yawOk = System.Math.Abs(ey) <= 1.2f || (_bnTurnMode == 2 && _bnYawLayer >= BinocCount());
-        bool pitchOk = System.Math.Abs(ep) <= 1.2f || _bnPitchLayer >= BinocCount();
-        if ((yawOk && pitchOk) || _bnPulses >= 30 || (now - _bnAt).TotalSeconds > 15)
-        {
-            bool aimed = System.Math.Abs(ey) <= 1.2f && System.Math.Abs(ep) <= 1.2f;
-            BinocLog((aimed ? ""aimed"" : ""couldn't aim all the way"") + "": the camera looks at "" + BinocF(cy) + "", "" + BinocF(cp) + "" up (off by "" +
-                     BinocF(ey) + "" and "" + BinocF(ep) + "") after "" + _bnPulses + "" moves"" +
-                     (_bnTurnMode == 1 ? ""; turned by BuddyCron's turn"" : _bnYawGain != 0f ? ""; turned by the "" + BinocLayerName(BinocAt(_bnYawLayer)) + "" layer's keys"" : string.Empty) +
-                     (_bnPitchGain != 0f ? ""; tilted by the "" + BinocLayerName(BinocAt(_bnPitchLayer)) + "" layer's keys"" : string.Empty));
-            _bnState = 3;
-            return 0;
-        }
-        _bnPulses++;
-        _bnLastYaw = cy;
-        _bnLastPitch = cp;
-        if (!yawOk)
-        {
-            if (_bnTurnMode != 2)
-            {
-                // BuddyCron's own turn first (exact, when the view follows the character)
-                _bnLastCmd = ey;
-                _bnPending = 3;
-                try
-                {
-                    var me = BuddyCron.Core.Me;
-                    BuddyCron.Managers.MovementManager.Rotate(BuddyCron.Helpers.HeroMath.MungeHeadingDegrees(me.Heading + ey));
-                }
-                catch { _bnTurnMode = 2; }
-                return 0;
-            }
-            BinocPress(true, ey);
-            return 0;
-        }
-        BinocPress(false, ep);
+        BinocLetGoMouse();
+        _bnState = 3;
+        _bnStepAt = now;
         return 0;
     }
     if (_bnState == 3)
     {
+        // zoom in: the binoculars' own zoom key held down, else the mouse wheel, else the right button held; each checked by
+        // the game's zoom (when the game doesn't say: the key taken, or tried them all)
         int z = BinocZoom();
-        bool zooming = z == 2 || z == 4;
-        // the zoom key on the layers in turn, until the game says it zooms (or a layer takes it, when the game doesn't say)
-        int[] zo = _bnZoomOrder ?? new[] { 1, 2, 0, 3, 4, 5 };
-        if (!zooming && _bnZoomTries < zo.Length && (_bnZoomTries == 0 || ((now - _bnZoomAt).TotalSeconds > 1.5 && (z == 1 || (z == -1 && !_bnZoomTook)))))
+        bool zoomed = z == 2 || z == 4;
+        if (!zoomed && _bnZoomTry > 0 && (now - _bnZoomAt).TotalSeconds < 1.2)
+            return 0;
+        if (!zoomed && z != -1 && _bnZoomTry < 3)
         {
-            int layer = zo[_bnZoomTries];
-            bool took = BinocHold(layer, BuddyCron.sysInputEvent.MacroBinocularsZoomIn, 120);
-            _bnZoomTook = took;
-            _bnZoomTries++;
+            bool front = BinocGameInFront();
+            if (_bnZoomTry == 0)
+            {
+                _bnKeyDown = BinocKey(BuddyCron.sysInputEvent.MacroBinocularsZoomIn, true);
+                BinocLog(""zoom key held on the binoculars' own controls: "" + (_bnKeyDown ? ""taken"" : ""not taken""));
+            }
+            else if (_bnZoomTry == 1)
+            {
+                if (_bnKeyDown) { BinocKey(BuddyCron.sysInputEvent.MacroBinocularsZoomIn, false); _bnKeyDown = false; }
+                if (front) BinocMouseEvent(0x0800u, 0, 0, 120u, System.UIntPtr.Zero);
+                BinocLog(front ? ""the zoom key didn't zoom: mouse wheel up"" : ""the zoom key didn't zoom, and the game isn't in front for the mouse"");
+            }
+            else
+            {
+                if (front) BinocButton(false, true);
+                BinocLog(front ? ""the wheel didn't zoom: right button held"" : ""the wheel wasn't tried: the game isn't in front"");
+            }
+            _bnZoomTry++;
             _bnZoomAt = now;
-            BinocLog(""zoom in on the "" + BinocLayerName(layer) + "" layer: "" + (took ? ""taken"" : ""not taken"") + "" (zoom was "" + z + "")"");
             return 0;
         }
-        // the scan takes a few seconds once zoomed in
-        if ((now - _bnZoomAt).TotalSeconds < 7)
+        if (z == -1 && _bnZoomTry == 0)
+        {
+            _bnKeyDown = BinocKey(BuddyCron.sysInputEvent.MacroBinocularsZoomIn, true);
+            BinocLog(""the game doesn't say the zoom; zoom key held: "" + (_bnKeyDown ? ""taken"" : ""not taken""));
+            _bnZoomTry = 3;
+            _bnZoomAt = now;
             return 0;
-        BinocLog(""waited for the scan (zoom "" + z + "", view "" + BinocOpen() + "")"");
-        _bnState = 0;
-        return 1;
+        }
+        if (!zoomed && _bnRightDown)
+            BinocButton(false, false);
+        BinocLog(zoomed ? ""zoomed in"" : z == -1 ? ""the game doesn't say the zoom: waiting for the scan"" : ""couldn't zoom in (zoom "" + z + ""): waiting for the scan where it looks"");
+        _bnState = 4;
+        _bnStepAt = now;
+        _bnMoves = 0;
+        return 0;
     }
-    _bnState = 0;
+    if (_bnState == 4)
+    {
+        // the scan takes a few seconds once zoomed in; the view stays on it with small mouse moves
+        if (_bnFront && _bnMode == 0 && BinocGameInFront() && !float.IsNaN(_bnWantYaw))
+            BinocAimMouse(now, 0.4f, 15);
+        if (BinocCounted())
+        {
+            BinocLog(""the scan counted after "" + ((now - _bnStepAt).TotalSeconds).ToString(""0.0"", System.Globalization.CultureInfo.InvariantCulture) + "" s: leaving the view"");
+            BinocLeaveStart(now);
+            return 0;
+        }
+        if ((now - _bnStepAt).TotalSeconds < 15)
+            return 0;
+        BinocLog(""waited for the scan (zoom "" + BinocZoom() + "", view "" + BinocOpen() + ""): leaving the view"");
+        BinocLeaveStart(now);
+        return 0;
+    }
+    BinocStop();
     return 1;
 }
 ";
@@ -1773,6 +1971,7 @@ static int BinocAim()
                 _hookNo = 0;
                 _faceAdded = false;
                 _binocAdded = false;
+                _restAdded = false;
             }
             foreach (Step s in steps)
             {
@@ -1855,9 +2054,37 @@ static int BinocAim()
                         outLines.Add("<UseInventoryItem QuestId=\"" + (gq.Success ? gq.Groups[1].Value : Fmt.Hex(s.Quest)) + "\" ItemName=\"" + Attr(l, "ItemName") + "\" />");
                         continue;
                     }
+                    if (l.StartsWith("<ClickRoutine ", StringComparison.Ordinal))
+                    {
+                        // objects to use: the click routine (a BuddyCron Hook) clicks them one at a time while the step is open
+                        string clicker = ClickRoutineHook(l, ++_hookNo);
+                        if (clicker != null)
+                        {
+                            // rest to full (health and companion) before the walk to them, like the hand-made Tatooine one
+                            AddRest();
+                            int walkTo = outLines.Count - 1;
+                            if (walkTo >= 0 && outLines[walkTo].StartsWith("<MoveTo ", StringComparison.Ordinal))
+                            {
+                                outLines.Insert(walkTo, "<Hook Name=\"RestBeforeWalk\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
+                                outLines.Add("<Hook Name=\"RestBeforeWalk\" Operation=\"R\" Location=\"TreeStart\" />");
+                            }
+                            outLines.Add("<Hook Name=\"" + clicker + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
+                            outLines.Add("<While Condition=\"" + Attr(l, "While") + "\"><WaitTimer QuestId=\"1\" WaitTime=\"2\" /></While>");
+                            outLines.Add("<Hook Name=\"" + clicker + "\" Operation=\"R\" Location=\"TreeStart\" />");
+                        }
+                        continue;
+                    }
                     if (l.StartsWith("<ClickObject ", StringComparison.Ordinal))
                     {
                         string n = Attr(l, "Name"), xyz = Attr(l, "XYZ"), stand = Attr(l, "Stand");
+                        if (stand.Length > 0 && Attr(l, "Spot") == "True" && FiniteXyz(xyz) && FiniteXyz(stand))
+                        {
+                            // one of several objects you used, in your order: walk to where you stood, then the hook uses the one at
+                            // its spot (5 m) if it can still be used, else passes it by
+                            outLines.AddRange(WalkUpClick(n, xyz, stand, ++_hookNo, 0.25f));
+                            lastSpot = stand;
+                            continue;
+                        }
                         if (stand.Length > 0 && Attr(l, "Fight") == "True" && FiniteXyz(xyz))
                         {
                             // before a fight: walk to where you stood, then up to the object until it can be clicked
@@ -1887,6 +2114,25 @@ static int BinocAim()
                         outLines.Add("<Hook Name=\"" + lootHook + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
                         outLines.Add(grind);
                         outLines.Add("<Hook Name=\"" + lootHook + "\" Operation=\"R\" Location=\"TreeStart\" />");
+                        continue;
+                    }
+                    if (l.StartsWith("<UseTransportHere ", StringComparison.Ordinal))
+                    {
+                        // a mission transport pressed where the bot stands: with Land, wherever it is (done once it has taken
+                        // you there); with Known, in an area the recording never went to
+                        ulong itemId = 0;
+                        string idText = Attr(l, "ItemId");
+                        if (idText.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                            ulong.TryParse(idText.Substring(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out itemId);
+                        string here = l.Contains(" Land=\"")
+                            ? TransportHook(System.Net.WebUtility.HtmlDecode(Attr(l, "ItemName")), Attr(l, "Land"), ++_hookNo, itemId)
+                            : TransportHook(System.Net.WebUtility.HtmlDecode(Attr(l, "ItemName")), Attr(l, "Known").Split('|'), ++_hookNo, itemId);
+                        if (here != null)
+                        {
+                            outLines.Add("<Hook Name=\"" + here + "\" Operation=\"I\" Index=\"0\" Location=\"TreeStart\" />");
+                            outLines.Add("<WaitTimer QuestId=\"1\" WaitTime=\"1\" />");
+                            outLines.Add("<Hook Name=\"" + here + "\" Operation=\"R\" Location=\"TreeStart\" />");
+                        }
                         continue;
                     }
                     bool once = l.StartsWith("<UseMissionItemOnce ", StringComparison.Ordinal);
@@ -2063,6 +2309,8 @@ static int BinocAim()
                     }
                     string nl = "\r\n";
                     bool anyBin = bins.Contains("true");
+                    Match scanQm = Regex.Match(s.Gate ?? string.Empty, @"HasQuest\((0x[0-9A-F]+)\)");
+                    string scanQ = (scanQm.Success ? scanQm.Groups[1].Value : Fmt.Hex(s.Quest)) + "UL"; // (the scan's mission: leave the view once it counts)
                     if (anyBin && !_binocAdded)
                     {
                         var bc = new StringBuilder();
@@ -2090,7 +2338,7 @@ static int BinocAim()
                     // before a fight) it is done once while the profile waits
                     bool looped = s.Gate != null && s.Gate.Length > 0 && !beforeFight && !onceOnly;
                     int wait = run.Count * 6 + 4 + (anyBin ? 30 : 0); // (a binocular scan: up to ~30 s to aim, zoom and scan)
-                    string again = (looped ? 8 : wait + 5).ToString(CultureInfo.InvariantCulture);
+                    string again = (looped ? (anyBin ? 150 : 8) : wait + 5).ToString(CultureInfo.InvariantCulture);
                     string body =
                         "var names = new[] { " + string.Join(", ", names) + " };" + nl +
                         "var npcs = new[] { " + string.Join(", ", npcs) + " };" + nl +
@@ -2114,9 +2362,11 @@ static int BinocAim()
                         "if ((now - " + v + "_last).TotalSeconds > 60) { " + v + "_i = 0; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_wi = -1; " + v + "_next = now; }" + nl +
                         v + "_last = now;" + nl +
                         "if (" + v + "_i >= names.Length) { if ((now - " + v + "_done).TotalSeconds > " + again + ") { " + v + "_i = 0; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_wi = -1; " + v + "_next = now; } return false; }" + nl +
+                        // in a talk: BuddyCron's talk goes first (an item that opens one: the hook goes on once it is over)
+                        "if (me == null || me.IsInConversation) { if (" + v + "_w) { " + mover + ".MoveStop(); " + v + "_w = false; } return false; }" + nl +
                         "if (me.IsCasting) { if (" + v + "_p) " + v + "_s = true; return true; }" + nl +
                         // a binocular scan: once its cast is over, aim and zoom (a fight or a death first: the cast is done again after)
-                        (anyBin ? "if (" + v + "_p && " + v + "_s && binoc[" + v + "_i]) { if (me.IsDead || me.InCombat) { " + v + "_p = false; " + v + "_s = false; return false; } if (BinocAim() == 0) return true; }" + nl : string.Empty) +
+                        (anyBin ? "if (" + v + "_p && " + v + "_s && binoc[" + v + "_i]) { if (me.IsDead || me.InCombat) { BinocStop(); BinocCancel(); " + v + "_p = false; " + v + "_s = false; return false; } if (BinocAim() == 0) return true; }" + nl : string.Empty) +
                         "if (" + v + "_p && " + v + "_s) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_s = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
                         "if (now < " + v + "_next) return true;" + nl +
                         "if (" + v + "_p && (now - " + v + "_at).TotalSeconds < 1.5) return true;" + nl +
@@ -2126,7 +2376,7 @@ static int BinocAim()
                         // dead, or in a fight this use wasn't part of: BuddyCron's own death handling and combat routine run first
                         // (and the walk-back wait starts over once alive and out of the fight: a long fight or corpse run never
                         // uses it where the bot happens to stand)
-                        "if (me.IsDead || (me.InCombat && !inFight[" + v + "_i])) { if (" + v + "_w) { " + mover + ".MoveStop(); " + v + "_w = false; } " + v + "_p = false; " + v + "_wi = -1; return false; }" + nl +
+                        "if (me.IsDead || (me.InCombat && !inFight[" + v + "_i])) { " + (anyBin ? "BinocStop(); BinocCancel(); " : string.Empty) + "if (" + v + "_w) { " + mover + ".MoveStop(); " + v + "_w = false; } " + v + "_p = false; " + v + "_wi = -1; return false; }" + nl +
                         "if (" + v + "_t >= 4) { " + v + "_i++; " + v + "_t = 0; " + v + "_p = false; " + v + "_next = now.AddSeconds(1.5); if (" + v + "_i >= names.Length) " + v + "_done = now; return true; }" + nl +
                         "if (" + v + "_wi != " + v + "_i) { " + v + "_wi = " + v + "_i; " + v + "_ws = now; " + v + "_tw = System.DateTime.MinValue; }" + nl +
                         // away from where you used it (after a death, or the next place of the row): the profile's own MoveTo walks there
@@ -2149,7 +2399,7 @@ static int BinocAim()
                         mover + ".MoveStop();" + nl +
                         v + "_w = false;" + nl +
                         v + "_ok = false;" + nl +
-                        (anyBin ? "if (binoc[" + v + "_i]) { BinocStart(spots[" + v + "_i], aimYaw[" + v + "_i], aimPitch[" + v + "_i], hasAimAt[" + v + "_i], aimAt[" + v + "_i], aimName[" + v + "_i]); if (BinocOpen() == 1) { " + v + "_p = true; " + v + "_s = true; " + v + "_at = now; " + v + "_t++; return true; } }" + nl : string.Empty) +
+                        (anyBin ? "if (binoc[" + v + "_i]) { _bnQ = " + scanQ + "; BinocStart(spots[" + v + "_i], aimYaw[" + v + "_i], aimPitch[" + v + "_i], hasAimAt[" + v + "_i], aimAt[" + v + "_i], aimName[" + v + "_i]); if (BinocOpen() == 1) { " + v + "_p = true; " + v + "_s = true; " + v + "_at = now; " + v + "_t++; return true; } }" + nl : string.Empty) +
                         "if (isAbility[" + v + "_i])" + nl +
                         "{" + nl +
                         "    if (openWith[" + v + "_i].Length > 0 && !BuddyCron.Managers.AbilityManager.HasAbility(names[" + v + "_i]))" + nl +
@@ -2190,7 +2440,8 @@ static int BinocAim()
                             back.Append(WhenAway(w));
                         // (bounded: about three rounds of the row, ~8 s an item and the hook's 8 s before it starts again,
                         // then the profile goes on and the end says the mission isn't finished)
-                        int most = Math.Min(180, 3 * (names.Count * 8 + (anyBin ? 30 : 8)));
+                        // (a binocular scan: one try, up to ~35 s to walk the last metres, use it, aim, zoom and scan, then the pop-up)
+                        int most = anyBin ? Math.Min(180, names.Count * 8 + 45) : Math.Min(180, 3 * (names.Count * 8 + 8));
                         for (int sofar = 0; sofar < most; sofar += 5)
                             outLines.Add("<If Condition=\"" + s.Gate + "\">" + back.ToString() + "<WaitTimer QuestId=\"1\" WaitTime=\"5\" /></If>");
                         if (anyBin)
@@ -2329,6 +2580,465 @@ static int BinocAim()
         }
 
         /// <summary>
+        /// A mission transport pressed where the bot stands, in an area the recording never went to (another planet, your
+        /// ship: the bot was started there with the mission). BuddyCron's UseItem can't do it, it walks to its XYZ first.
+        /// Presses it out of a fight and not while casting, waits 15 s for the cast and the jump, and is done in one of the
+        /// recording's areas (it has taken you there), when the item is gone, after 3 presses that took you nowhere, or after
+        /// 6 minutes (the step is entered with at most 5 minutes of cooldown left; a cooldown is waited out, not pressed).
+        /// </summary>
+        /// <summary>
+        /// A mission transport pressed where the bot stands, wherever it is (BuddyCron's UseItem kills every enemy near its XYZ
+        /// first: see CoreWrite's Hop). Presses it out of a fight and not while casting, waits 15 s for the cast and the jump,
+        /// and is done once you are at one of the sites in land ("area;r2;x,y,z;...|...", area 0: any; empty: once you are
+        /// 100 m from where it pressed it; another mission's site, its area marked ~, only once it has pressed the item), once you are in another area than where it started, when the item is gone, after 3
+        /// presses that took you nowhere, or after 6 minutes.
+        /// </summary>
+        private static string TransportHook(string item, string land, int no)
+        {
+            return TransportHook(item, land, no, 0);
+        }
+
+        private static string TransportHook(string item, string land, int no, ulong itemId)
+        {
+            if (string.IsNullOrEmpty(item))
+                return null;
+            var la = new List<string>();
+            var lx = new List<string>();
+            var ly = new List<string>();
+            var lz = new List<string>();
+            var lr = new List<string>();
+            var lo = new List<string>();
+            foreach (string site in (land ?? string.Empty).Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] f = site.Split(';');
+                if (f.Length < 3)
+                    continue;
+                string area = f[0].Trim();
+                bool other = area.StartsWith("~", StringComparison.Ordinal);
+                if (other)
+                    area = area.Substring(1);
+                if (area != "0" && !Regex.IsMatch(area, "^0x[0-9A-Fa-f]{1,16}$"))
+                    continue;
+                float r2;
+                if (!float.TryParse(f[1].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out r2) || r2 <= 0f)
+                    continue;
+                for (int k = 2; k < f.Length; k++)
+                {
+                    string[] xyz = f[k].Split(',');
+                    float x, y, z;
+                    if (xyz.Length != 3 ||
+                        !float.TryParse(xyz[0].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out x) ||
+                        !float.TryParse(xyz[1].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out y) ||
+                        !float.TryParse(xyz[2].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out z))
+                        continue;
+                    la.Add(area == "0" ? "0UL" : area + "UL");
+                    lo.Add(other ? "true" : "false");
+                    lx.Add(Fl(x));
+                    ly.Add(Fl(y));
+                    lz.Add(Fl(z));
+                    lr.Add(Fl(r2));
+                }
+            }
+            string hook = "TransportHere" + no, v = "_t" + no;
+            string nl = "\r\n";
+            string sites = la.Count == 0 ? string.Empty :
+                "ulong[] la = { " + string.Join(", ", la) + " };" + nl +
+                "float[] lx = { " + string.Join(", ", lx) + " };" + nl +
+                "float[] ly = { " + string.Join(", ", ly) + " };" + nl +
+                "float[] lz = { " + string.Join(", ", lz) + " };" + nl +
+                "float[] lr = { " + string.Join(", ", lr) + " };" + nl +
+                "bool[] lo = { " + string.Join(", ", lo) + " };" + nl;
+            string there = la.Count == 0
+                // (where it took you was not seen: 100 m from where it pressed it is somewhere else)
+                ? "if (" + v + "_tries > 0 && System.Numerics.Vector3.DistanceSquared(p, " + v + "_from) > 100f) { " + v + "_done = true; return false; }" + nl
+                : "for (int k = 0; k < la.Length; k++)" + nl +
+                  "    if ((!lo[k] || " + v + "_tries > 0) && (la[k] == 0UL || la[k] == area) && (p.X - lx[k]) * (p.X - lx[k]) + (p.Y - ly[k]) * (p.Y - ly[k]) + (p.Z - lz[k]) * (p.Z - lz[k]) < lr[k]) { " + v + "_done = true; return false; }" + nl;
+            string body =
+                "string name = " + CsString(item) + ";" + nl +
+                sites +
+                "var me = BuddyCron.Core.Player;" + nl +
+                "var now = System.DateTime.Now;" + nl +
+                "if ((now - " + v + "_last).TotalSeconds > 30) { " + v + "_start = now; " + v + "_next = System.DateTime.MinValue; " + v + "_tries = 0; " + v + "_done = false; " + v + "_area = 0UL; }" + nl +
+                v + "_last = now;" + nl +
+                "if (me == null || " + v + "_done) return false;" + nl +
+                "ulong area = 0;" + nl +
+                "try { area = me.AreaId; } catch { }" + nl +
+                "if (area == 0) return true;" + nl +
+                // (it has taken you to another area: done, the steps there go on)
+                "if (" + v + "_area == 0UL) " + v + "_area = area;" + nl +
+                "if (area != " + v + "_area) { " + v + "_done = true; return false; }" + nl +
+                "var p = me.Location;" + nl +
+                there +
+                "if ((now - " + v + "_start).TotalSeconds > 360) { " + v + "_done = true; try { Reborn.Utilities.Logging.Write(\"[Transport] Gave up on \" + name + \" here\"); } catch { } return false; }" + nl +
+                "if (me.InCombat || me.IsDead || me.IsInConversation) { " + v + "_start = now; return false; }" + nl +
+                "if (me.IsCasting) return true;" + nl +
+                "if (now < " + v + "_next) return true;" + nl +
+                "if (" + v + "_tries >= 3) { " + v + "_done = true; try { Reborn.Utilities.Logging.Write(\"[Transport] \" + name + \" didn't take you anywhere from here\"); } catch { } return false; }" + nl +
+                PickTransport(v, itemId) +
+                "float cd = 0f;" + nl +
+                "try { var a = it.Ability; if (a != null) cd = a.CooldownRemaining; } catch { }" + nl +
+                "if (cd > 0f) { " + v + "_next = now.AddSeconds(System.Math.Min(cd, 5f)); return true; }" + nl +
+                "BuddyCron.Navigation.Navigator.PlayerMover.MoveStop();" + nl +
+                "it.Use(); " + v + "_tries++; " + v + "_next = now.AddSeconds(15); " + v + "_from = p;" + nl +
+                "try { Reborn.Utilities.Logging.Write(\"[Transport] Using \" + name + \" (\" + it.TemplateId.ToString(\"X\") + \") where you are\"); } catch { }" + nl +
+                "return true;";
+            _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl +
+                            "\t\t\tstatic System.DateTime " + v + "_start, " + v + "_last, " + v + "_next;" + nl +
+                            "\t\t\tstatic int " + v + "_tries;" + nl +
+                            "\t\t\tstatic bool " + v + "_done;" + nl +
+                            "\t\t\tstatic ulong " + v + "_area;" + nl +
+                            "\t\t\tstatic System.Numerics.Vector3 " + v + "_from;" + nl +
+                            "\t\t]]></CodeChunk>");
+            var sbh = new StringBuilder();
+            sbh.Append("\t\t<CodeChunk Name=\"").Append(hook).Append("\" Type=\"Hook\"><![CDATA[").Append(nl);
+            foreach (string bl in body.Split(new[] { nl }, StringSplitOptions.None))
+                sbh.Append("\t\t\t").Append(bl).Append(nl);
+            sbh.Append("\t\t]]></CodeChunk>");
+            _codeChunks.Add(sbh.ToString());
+            return hook;
+        }
+
+        /// <summary>
+        /// The transport hook's pick (C#): with the mission's item id, the item of that id; else (or with none of that id) the
+        /// first item of the name, as before (two missions in one profile whose transports share a name: the bot does
+        /// whichever it lands at first, then the other).
+        /// </summary>
+        private static string PickTransport(string v, ulong itemId)
+        {
+            string nl = "\r\n";
+            return "BuddyCron.Objects.HeroItem it = null;" + nl +
+                   "int same = 0;" + nl +
+                   "BuddyCron.Objects.HeroItem named = null;" + nl +
+                   "foreach (var list in new System.Collections.Generic.IEnumerable<BuddyCron.Objects.HeroItem>[] { BuddyCron.Core.Me.QuestItems, BuddyCron.Core.Me.Backpack })" + nl +
+                   "    foreach (var i in list)" + nl +
+                   "    {" + nl +
+                   "        if (i == null || !i.IsValid) continue;" + nl +
+                   (itemId != 0 ? "        if (it == null && i.TemplateId == " + Fmt.Hex(itemId) + "UL) it = i;" + nl : string.Empty) +
+                   "        if (i.Name == name) { same++; if (named == null) named = i; }" + nl +
+                   "    }" + nl +
+                   "if (it == null && named != null) { it = named; if (same > 1 && " + v + "_tries == 0) { try { Reborn.Utilities.Logging.Write(\"[Transport] You have \" + same + \" items called \" + name + \": using the first one\"); } catch { } } }" + nl +
+                   "if (it == null) { " + v + "_done = true; return false; }" + nl;
+        }
+
+        private static string Fl(float f)
+        {
+            return f.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "f";
+        }
+
+        private static string TransportHook(string item, IList<string> known, int no)
+        {
+            return TransportHook(item, known, no, 0);
+        }
+
+        private static string TransportHook(string item, IList<string> known, int no, ulong itemId)
+        {
+            var ids = new List<string>();
+            foreach (string k in known)
+            {
+                string h = k.Trim();
+                if (Regex.IsMatch(h, "^0x[0-9A-Fa-f]{1,16}$"))
+                    ids.Add(h + "UL");
+            }
+            if (ids.Count == 0 || string.IsNullOrEmpty(item))
+                return null;
+            string hook = "TransportHere" + no, v = "_t" + no;
+            string nl = "\r\n";
+            string body =
+                "string name = " + CsString(item) + ";" + nl +
+                "ulong[] known = { " + string.Join(", ", ids) + " };" + nl +
+                "var me = BuddyCron.Core.Player;" + nl +
+                "var now = System.DateTime.Now;" + nl +
+                "if ((now - " + v + "_last).TotalSeconds > 30) { " + v + "_start = now; " + v + "_next = System.DateTime.MinValue; " + v + "_tries = 0; " + v + "_done = false; }" + nl +
+                v + "_last = now;" + nl +
+                "if (me == null || " + v + "_done) return false;" + nl +
+                "ulong area = 0;" + nl +
+                "try { area = me.AreaId; } catch { }" + nl +
+                "if (area != 0 && System.Array.IndexOf(known, area) >= 0) { " + v + "_done = true; return false; }" + nl +
+                "if ((now - " + v + "_start).TotalSeconds > 360) { " + v + "_done = true; try { Reborn.Utilities.Logging.Write(\"[Transport] Gave up on \" + name + \" here\"); } catch { } return false; }" + nl +
+                "if (area == 0) return true;" + nl +
+                "if (me.InCombat || me.IsDead || me.IsInConversation) { " + v + "_start = now; return false; }" + nl +
+                "if (me.IsCasting) return true;" + nl +
+                "if (now < " + v + "_next) return true;" + nl +
+                "if (" + v + "_tries >= 3) { " + v + "_done = true; try { Reborn.Utilities.Logging.Write(\"[Transport] \" + name + \" didn't take you anywhere from here\"); } catch { } return false; }" + nl +
+                PickTransport(v, itemId) +
+                "float cd = 0f;" + nl +
+                "try { var a = it.Ability; if (a != null) cd = a.CooldownRemaining; } catch { }" + nl +
+                "if (cd > 0f) { " + v + "_next = now.AddSeconds(System.Math.Min(cd, 5f)); return true; }" + nl +
+                "BuddyCron.Navigation.Navigator.PlayerMover.MoveStop();" + nl +
+                "it.Use(); " + v + "_tries++; " + v + "_next = now.AddSeconds(15);" + nl +
+                "try { Reborn.Utilities.Logging.Write(\"[Transport] Using \" + name + \" (\" + it.TemplateId.ToString(\"X\") + \") where you are\"); } catch { }" + nl +
+                "return true;";
+            _codeChunks.Add("\t\t<CodeChunk Name=\"" + hook + "State\" Type=\"Definition\"><![CDATA[" + nl +
+                            "\t\t\tstatic System.DateTime " + v + "_start, " + v + "_last, " + v + "_next;" + nl +
+                            "\t\t\tstatic int " + v + "_tries;" + nl +
+                            "\t\t\tstatic bool " + v + "_done;" + nl +
+                            "\t\t]]></CodeChunk>");
+            var sbh = new StringBuilder();
+            sbh.Append("\t\t<CodeChunk Name=\"").Append(hook).Append("\" Type=\"Hook\"><![CDATA[").Append(nl);
+            foreach (string bl in body.Split(new[] { nl }, StringSplitOptions.None))
+                sbh.Append("\t\t\t").Append(bl).Append(nl);
+            sbh.Append("\t\t]]></CodeChunk>");
+            _codeChunks.Add(sbh.ToString());
+            return hook;
+        }
+
+        /// <summary>
+        /// The click routine of the hand-made Voss and Tatooine profiles, as a BuddyCron Hook (its two code chunks), from a
+        /// ClickRoutine line. Every tick: nothing once the step is done (the game's own check) and nothing while you are dead,
+        /// in a fight or in a talk (BuddyCron fights, revives and talks first); it holds while a cast runs. It takes the
+        /// nearest object of the names that the game still lets you use (within the range of the middle of the ones you used),
+        /// walks to where you stood for the one you used nearest it, then up to it (8 s at most), clicks it, and counts the
+        /// click as done when the game's count goes up (3 clicks at most on one object; one it can't reach in 45 s is left).
+        /// With none to use it waits where you stood nearest, and every minute tries the ones it left again.
+        /// Returns the Hook's name, or null when the line has no objects.
+        /// </summary>
+        private static string ClickRoutineHook(string line, int no)
+        {
+            string[] names = System.Net.WebUtility.HtmlDecode(Attr(line, "Names")).Split('|');
+            var ox = new List<string>(); var oy = new List<string>(); var oz = new List<string>();
+            var sx = new List<string>(); var sy = new List<string>(); var sz = new List<string>();
+            float cx = 0, cy = 0, cz = 0;
+            foreach (string pr in Attr(line, "Pairs").Split('|'))
+            {
+                string[] two = pr.Split(';');
+                Vec3 o, me;
+                if (two.Length != 2 || !TryVec(two[0], out o) || !TryVec(two[1], out me))
+                    continue;
+                ox.Add(F(o.X)); oy.Add(F(o.Y)); oz.Add(F(o.Z));
+                sx.Add(F(me.X)); sy.Add(F(me.Y)); sz.Add(F(me.Z));
+                cx += o.X; cy += o.Y; cz += o.Z;
+            }
+            string[] cnt = Attr(line, "Count").Split(';');
+            string done = System.Net.WebUtility.HtmlDecode(Attr(line, "Done"));
+            float range;
+            if (ox.Count == 0 || names.Length == 0 || names[0].Length == 0 || cnt.Length != 4 || done.Length == 0 ||
+                !float.TryParse(Attr(line, "Range"), NumberStyles.Float, CultureInfo.InvariantCulture, out range))
+                return null;
+            int n = ox.Count;
+            string hook = "ClickRoutine" + no;
+            var nm = new List<string>();
+            foreach (string x in names)
+                nm.Add(CsString(System.Net.WebUtility.HtmlEncode(x)));
+            string code = ClickTemplate
+                .Replace("@@HOOK@@", hook)
+                .Replace("@@NAMES@@", string.Join(", ", nm))
+                .Replace("@@LABEL@@", CsString(System.Net.WebUtility.HtmlEncode(string.Join(" / ", names))))
+                .Replace("@@OX@@", Fs(ox)).Replace("@@OY@@", Fs(oy)).Replace("@@OZ@@", Fs(oz))
+                .Replace("@@SX@@", Fs(sx)).Replace("@@SY@@", Fs(sy)).Replace("@@SZ@@", Fs(sz))
+                .Replace("@@CX@@", F(cx / n)).Replace("@@CY@@", F(cy / n)).Replace("@@CZ@@", F(cz / n))
+                .Replace("@@RANGE@@", F(range))
+                .Replace("@@DONE@@", done)
+                .Replace("@@CQ@@", cnt[0]).Replace("@@CS@@", cnt[1]).Replace("@@CT@@", cnt[2]).Replace("@@CM@@", cnt[3])
+                .Replace("@@RECAP@@", "3")
+                .Replace("_P_", "_k" + no.ToString(CultureInfo.InvariantCulture) + "_");
+            int cut = code.IndexOf("\t\t<CodeChunk Name=\"" + hook + "\" Type=\"Hook\">", StringComparison.Ordinal);
+            if (cut < 0)
+                return null;
+            _codeChunks.Add(code.Substring(0, cut).TrimEnd('\r', '\n'));
+            _codeChunks.Add(code.Substring(cut).TrimEnd('\r', '\n'));
+            return hook;
+        }
+
+        /// <summary>
+        /// Rest to full out of a fight (the hand-made Tatooine one): the combat routine only rests below 77% health, so a walk
+        /// into the next camp at 80% could pull the next group with a fifth of the health gone. One copy a profile: the rest
+        /// code, and the hook the profile puts around the walk to objects (the click routine calls the rest code itself).
+        /// </summary>
+        private static void AddRest()
+        {
+            if (_restAdded)
+                return;
+            _restAdded = true;
+            _codeChunks.Add(RestCode.TrimEnd('\r', '\n'));
+            _codeChunks.Add(RestHook.TrimEnd('\r', '\n'));
+        }
+
+        private const string RestCode = @"		<CodeChunk Name=""RestToFullState"" Type=""Definition""><![CDATA[
+			static System.DateTime _rf_start, _rf_fail, _rf_err;
+			static bool _rf_on;
+			static string _rf_name;
+			static string[] _rf_names = { ""Introspection"", ""Meditation"", ""Recuperate"", ""Recharge and Reload"", ""Channel Hatred"", ""Seethe"" };
+			// Out of combat: rest to full (health and companion) before walking on. The combat routine only rests
+			// below 77% health, so a walk at 80% could pull the next group with a fifth of the health gone.
+			// True = resting now, hold everything else; false = nothing to do (or the companion is dead, which the
+			// combat routine revives).
+			static bool _rf_rest(string where)
+			{
+			    var me = BuddyCron.Core.Player;
+			    var now = System.DateTime.Now;
+			    if (me == null || me.IsDead || me.InCombat || me.IsLooting) { _rf_on = false; return false; }
+			    var comp = me.Companion;
+			    if (comp != null && comp.IsDead) { _rf_on = false; return false; }
+			    if (!_rf_on)
+			    {
+			        bool need = me.HealthPercent < 95f || (comp != null && comp.HealthPercent < 90f);
+			        if (!need || (now - _rf_fail).TotalSeconds < 20) return false;
+			        _rf_on = true; _rf_start = now;
+			        Reborn.Utilities.Logging.Write(""[Rest] Resting to full before "" + where);
+			    }
+			    bool full = me.HealthPercent >= 99f && (comp == null || comp.HealthPercent >= 98f);
+			    if (full || (now - _rf_start).TotalSeconds > 20)
+			    {
+			        if (!full) _rf_fail = now;
+			        _rf_on = false;
+			        if (me.IsCasting) BuddyCron.Managers.AbilityManager.StopCasting();
+			        return false;
+			    }
+			    if (me.IsMoving) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); return true; }
+			    if (me.IsCasting) return true;
+			    if (_rf_name == null)
+			        foreach (var n in _rf_names) { if (BuddyCron.Managers.AbilityManager.CanCast(n, me).Success) { _rf_name = n; break; } }
+			    if (_rf_name != null && BuddyCron.Managers.AbilityManager.Cast(_rf_name, me).Success) return true;
+			    // the rest ability can be on cooldown for a moment right after a fight: keep trying for a few seconds
+			    if ((now - _rf_start).TotalSeconds < 4) return true;
+			    _rf_on = false; _rf_fail = now;
+			    Reborn.Utilities.Logging.Write(""[Rest] Could not start resting, going on"");
+			    return false;
+			}
+		]]></CodeChunk>";
+
+        private const string RestHook = @"		<CodeChunk Name=""RestBeforeWalk"" Type=""Hook""><![CDATA[
+			try { return _rf_rest(""walking on to the objects""); }
+			catch (System.Exception e)
+			{
+			    try { if ((System.DateTime.Now - _rf_err).TotalSeconds > 30) { _rf_err = System.DateTime.Now; Reborn.Utilities.Logging.Write(""[Rest] "" + e.Message); } } catch { }
+			    return false;
+			}
+		]]></CodeChunk>";
+
+        private static string Fs(List<string> v)
+        {
+            return string.Join(", ", v.ConvertAll(x => x + "f"));
+        }
+
+        private static string F(float v)
+        {
+            return v.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+
+        private static readonly string ClickTemplate = @"		<CodeChunk Name=""@@HOOK@@State"" Type=""Definition""><![CDATA[
+			static System.DateTime _P_last, _P_click, _P_lockAt, _P_idle, _P_said, _P_steer, _P_err, _P_rest;
+			static ulong _P_lock;
+			static int _P_lockN, _P_cnt;
+			static bool _P_mv, _P_over, _P_fought;
+			static System.Collections.Generic.HashSet<ulong> _P_spent = new System.Collections.Generic.HashSet<ulong>();
+			static bool _P_walk(System.Numerics.Vector3 to, string name)
+			{
+			    var mp = new BuddyCron.Navigation.MoveToParameters(to, name) { DistanceTolerance = 0.15f, UseMount = false };
+			    _P_mv = true;
+			    return BuddyCron.Navigation.Navigator.MoveTo(mp) == BuddyCron.Navigation.MoveResult.ReachedDestination;
+			}
+		]]></CodeChunk>
+		<CodeChunk Name=""@@HOOK@@"" Type=""Hook""><![CDATA[
+			try
+			{
+			    string[] names = { @@NAMES@@ };
+			    string name = @@LABEL@@;
+			    float[] ox = { @@OX@@ }, oy = { @@OY@@ }, oz = { @@OZ@@ };
+			    float[] sx = { @@SX@@ }, sy = { @@SY@@ }, sz = { @@SZ@@ };
+			    var center = new System.Numerics.Vector3(@@CX@@f, @@CY@@f, @@CZ@@f);
+			    float range = @@RANGE@@f;
+			    var me = BuddyCron.Core.Player;
+			    var now = System.DateTime.Now;
+			    if ((now - _P_last).TotalSeconds > 120) { _P_click = System.DateTime.MinValue; _P_idle = System.DateTime.MinValue; _P_said = System.DateTime.MinValue; _P_steer = System.DateTime.MinValue; _P_rest = System.DateTime.MinValue; _P_lock = 0; _P_lockN = 0; _P_mv = false; _P_over = false; _P_fought = false; _P_spent.Clear(); }
+			    _P_last = now;
+			    if (me == null) return false;
+			    if (@@DONE@@) { if (!_P_over) { if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; } _P_over = true; Reborn.Utilities.Logging.Write(""[Click] "" + name + "": the game says this step is done""); } return false; }
+			    _P_over = false;
+			    if (me.IsDead) { if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; } return false; }
+			    if (me.InCombat) { if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; } _P_fought = true; return false; }
+			    if (me.IsInConversation) { if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; } return false; }
+			    if (_rf_rest(""the next "" + name)) { _P_mv = false; return true; }
+			    // after a fight, let the combat routine revive the companion and rest (it rests below 77% health) before the next one
+			    var comp = me.Companion;
+			    bool low = me.HealthPercent < 77f || (comp != null && (comp.IsDead || comp.HealthPercent < 77f));
+			    if (low && _P_rest == System.DateTime.MinValue) { _P_rest = now; Reborn.Utilities.Logging.Write(""[Click] "" + name + "": resting before the next one""); }
+			    if (_P_rest != System.DateTime.MinValue)
+			    {
+			        if ((!low && !me.IsCasting && (now - _P_rest).TotalSeconds > 3) || (now - _P_rest).TotalSeconds > 45) _P_rest = System.DateTime.MinValue;
+			        else { if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; } return false; }
+			    }
+			    if (me.IsCasting) { if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; } return true; }
+			    if (_P_fought) { _P_fought = false; _P_lockN = 0; _P_lockAt = now; _P_steer = System.DateTime.MinValue; }
+			    if ((now - _P_click).TotalSeconds < 1.5) return true;
+			    int cnt = 0;
+			    for (uint v = 0; v < @@CM@@; v++) { if (BuddyCron.Scripting.ConditionParser.IsTaskValueGreaterThan(@@CQ@@UL, @@CS@@, @@CT@@, v)) cnt++; else break; }
+			    if (_P_lock != 0 && _P_lockN > 0)
+			    {
+			        if (cnt > _P_cnt) { _P_spent.Add(_P_lock); _P_lock = 0; _P_lockN = 0; Reborn.Utilities.Logging.Write(""[Click] "" + name + "": the game counted it ("" + cnt + "" of @@CM@@)""); }
+			        else if ((now - _P_click).TotalSeconds < 3) return true;
+			    }
+			    var p = me.Location;
+			    BuddyCron.Objects.HeroPlaceable cur = null, best = null;
+			    float bestD = float.MaxValue;
+			    foreach (var o in BuddyCron.Managers.HeroObjectManager.GetObjects<BuddyCron.Objects.HeroPlaceable>())
+			    {
+			        if (o == null || !o.IsValid || System.Array.IndexOf(names, o.Name) < 0) continue;
+			        if (_P_lock != 0 && o.NodeId == _P_lock) { cur = o; continue; }
+			        if (!o.IsUsable || _P_spent.Contains(o.NodeId)) continue;
+			        if (System.Numerics.Vector3.DistanceSquared(o.Location, center) > range * range) continue;
+			        float d = System.Numerics.Vector3.DistanceSquared(o.Location, p);
+			        if (d < bestD) { bestD = d; best = o; }
+			    }
+			    if (_P_lock != 0 && (cur == null || !cur.IsUsable || _P_lockN >= @@RECAP@@ || (_P_lockN == 0 && (now - _P_lockAt).TotalSeconds > 45)))
+			    {
+			        if (cur != null && cur.IsUsable) Reborn.Utilities.Logging.Write(""[Click] "" + name + "": left one it could not use"");
+			        _P_spent.Add(_P_lock); _P_lock = 0; cur = null; _P_steer = System.DateTime.MinValue;
+			    }
+			    if (cur == null)
+			    {
+			        if (best == null)
+			        {
+			            // none usable now (used up, or someone else's): wait at the nearest spot you stood at; every minute
+			            // the ones left before may be tried again
+			            if (_P_idle == System.DateTime.MinValue) _P_idle = now;
+			            if ((now - _P_idle).TotalSeconds > 60) { _P_spent.Clear(); _P_idle = now; }
+			            if ((now - _P_said).TotalSeconds > 30) { _P_said = now; Reborn.Utilities.Logging.Write(""[Click] "" + name + "": none can be used right now, waiting here ("" + cnt + "" of @@CM@@ done)""); }
+			            int nk = 0; float nd = float.MaxValue;
+			            for (int k = 0; k < sx.Length; k++) { float d = System.Numerics.Vector3.DistanceSquared(p, new System.Numerics.Vector3(sx[k], sy[k], sz[k])); if (d < nd) { nd = d; nk = k; } }
+			            if (nd > 0.0625f) { if (_P_walk(new System.Numerics.Vector3(sx[nk], sy[nk], sz[nk]), name)) { if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; } } }
+			            else { if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; } }
+			            return true;
+			        }
+			        _P_idle = System.DateTime.MinValue;
+			        cur = best; _P_lock = best.NodeId; _P_lockN = 0; _P_lockAt = now; _P_steer = System.DateTime.MinValue;
+			    }
+			    var ol = cur.Location;
+			    if (!cur.IsWithinInteractRange)
+			    {
+			        // walk to where you stood to use this one (the object itself often stands where nobody can stand),
+			        // then straight at it until the game says it is in reach
+			        int gk = 0; float gd = float.MaxValue;
+			        for (int k = 0; k < ox.Length; k++) { float d = System.Numerics.Vector3.DistanceSquared(ol, new System.Numerics.Vector3(ox[k], oy[k], oz[k])); if (d < gd) { gd = d; gk = k; } }
+			        var goal = new System.Numerics.Vector3(sx[gk], sy[gk], sz[gk]);
+			        bool there = System.Numerics.Vector3.DistanceSquared(p, goal) < 0.0625f;
+			        if (!there && _P_steer == System.DateTime.MinValue) { if (!_P_walk(goal, name)) return true; }
+			        if (_P_steer == System.DateTime.MinValue) _P_steer = now;
+			        if ((now - _P_steer).TotalSeconds > 8)
+			        {
+			            if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; }
+			            Reborn.Utilities.Logging.Write(""[Click] "" + name + "": could not get in reach of one, trying another"");
+			            _P_spent.Add(_P_lock); _P_lock = 0; _P_steer = System.DateTime.MinValue;
+			            return true;
+			        }
+			        BuddyCron.Navigation.Navigator.PlayerMover.MoveTowards(ol); _P_mv = true;
+			        return true;
+			    }
+			    _P_steer = System.DateTime.MinValue;
+			    if (_P_mv) { BuddyCron.Navigation.Navigator.PlayerMover.MoveStop(); _P_mv = false; }
+			    cur.Interact(); _P_click = now; _P_lockN++; _P_cnt = cnt;
+			    Reborn.Utilities.Logging.Write(""[Click] "" + name + "" ("" + cnt + "" of @@CM@@ done so far)"");
+			    return true;
+			}
+			catch (System.Exception e)
+			{
+			    try { if ((System.DateTime.Now - _P_err).TotalSeconds > 30) { _P_err = System.DateTime.Now; Reborn.Utilities.Logging.Write(""[Click] "" + @@LABEL@@ + "": "" + e.Message); } } catch { }
+			    return false;
+			}
+		]]></CodeChunk>
+";
+
+        /// <summary>
         /// The loot of a kill-and-loot step when your bags are full: BuddyCron loots no body when your bags have 1 free slot or
         /// less (its loot targeting), though a mission item goes in the mission bag and needs no room (Tython's Power Cells:
         /// the bot fought the Sentinels and never opened one). Out of a fight, with 1 free slot or less, it opens the nearest
@@ -2356,7 +3066,7 @@ static int BinocAim()
                 "var me = BuddyCron.Core.Player;" + nl +
                 "var now = System.DateTime.Now;" + nl +
                 // (a fight or room in the bags starts each body's 15 s over: a body chosen before a fight is still tried after it)
-                "if (me == null || me.InCombat || me.IsDead || me.FreeBackpackSlots > 1) { " + stop + " " + v + "_open = System.DateTime.MinValue; " + v + "_node = 0; return false; }" + nl +
+                "if (me == null || me.InCombat || me.IsDead || me.IsInConversation || me.FreeBackpackSlots > 1) { " + stop + " " + v + "_open = System.DateTime.MinValue; " + v + "_node = 0; return false; }" + nl +
                 "bool open = false;" + nl +
                 "try { open = BuddyCron.Objects.HeroGuiApiGfx.Instance.IsLootWindowOpen; } catch { }" + nl +
                 "if (open)" + nl +
@@ -2409,6 +3119,12 @@ static int BinocAim()
         /// </summary>
         private static List<string> WalkUpClick(string name, string xyz, string stand, int no)
         {
+            return WalkUpClick(name, xyz, stand, no, 4f);
+        }
+
+        /// <param name="near2">How far from the spot the object may be, squared (4: 20 m; 0.25: 5 m).</param>
+        private static List<string> WalkUpClick(string name, string xyz, string stand, int no, float near2)
+        {
             var lines = new List<string>();
             string[] p = xyz.Split(',');
             string hook = "WalkUpClick" + no, v = "_c" + no;
@@ -2423,7 +3139,10 @@ static int BinocAim()
                 // a new run of the step (the hook was out for 30 s): it may click again
                 "if ((now - " + v + "_last).TotalSeconds > 30) { " + v + "_done = false; " + v + "_click = System.DateTime.MinValue; " + v + "_cast = false; " + v + "_mv = false; " + v + "_n = 0; }" + nl +
                 v + "_last = now;" + nl +
+                "if (me == null) return false;" + nl +
                 "if (" + v + "_done || me.IsDead) { " + stop + " return false; }" + nl +
+                // in a talk (BuddyCron's talk goes first): one that came of the click is what the click did
+                "if (me.IsInConversation) { " + stop + " if (" + v + "_n > 0) " + v + "_done = true; return false; }" + nl +
                 "double since = (now - " + v + "_click).TotalSeconds;" + nl +
                 "if (since < 20 && me.IsCasting && !me.IsLooting) { " + stop + " " + v + "_cast = true;" + (retryCut ? " " + v + "_left = me.CastTimeRemaining;" : string.Empty) + " return true; }" + nl +
                 "if (since < 1.5) return true;" + nl +
@@ -2436,7 +3155,7 @@ static int BinocAim()
                 "if (me.InCombat) { " + stop + " return false; }" + nl +
                 "BuddyCron.Objects.HeroPlaceable best = null;" + nl +
                 "foreach (var o in BuddyCron.Managers.HeroObjectManager.GetObjects<BuddyCron.Objects.HeroPlaceable>())" + nl +
-                "    if (o != null && o.IsValid && o.Name == " + CsString(name) + " && o.IsUsable && System.Numerics.Vector3.DistanceSquared(o.Location, spot) <= 4f && (best == null || System.Numerics.Vector3.DistanceSquared(o.Location, spot) < System.Numerics.Vector3.DistanceSquared(best.Location, spot))) best = o;" + nl +
+                "    if (o != null && o.IsValid && o.Name == " + CsString(name) + " && o.IsUsable && System.Numerics.Vector3.DistanceSquared(o.Location, spot) <= " + near2.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "f && (best == null || System.Numerics.Vector3.DistanceSquared(o.Location, spot) < System.Numerics.Vector3.DistanceSquared(best.Location, spot))) best = o;" + nl +
                 "if (best == null) { " + stop + " return false; }" + nl +
                 "if (!best.IsWithinInteractRange)" + nl +
                 "{" + nl +
@@ -2592,9 +3311,17 @@ static int BinocAim()
         /// </summary>
         internal static string NoLongCooldown(string item)
         {
+            return NoLongCooldown(item, 0);
+        }
+
+        /// <summary>With the item's id: that item's cooldown first (another of the same name can be on its own).</summary>
+        internal static string NoLongCooldown(string item, ulong id)
+        {
             string n = Fmt.PyStr(item);
             string cd = "(i.Ability.CooldownRemaining if i.Ability is not None else 0)";
-            return "max(([" + cd + " for i in Me.QuestItems if i.Name == " + n + "] + [" + cd + " for i in Me.Backpack if i.Name == " + n + "])[:1] + [0]) <= 300";
+            string byId = id == 0 ? string.Empty
+                : "[" + cd + " for i in Me.QuestItems if i.TemplateId == " + Fmt.Hex(id) + "] + [" + cd + " for i in Me.Backpack if i.TemplateId == " + Fmt.Hex(id) + "] + ";
+            return "max((" + byId + "[" + cd + " for i in Me.QuestItems if i.Name == " + n + "] + [" + cd + " for i in Me.Backpack if i.Name == " + n + "])[:1] + [0]) <= 300";
         }
 
         /// <summary>Two rows the recorder wrote at one look (the same moment).</summary>
@@ -2604,7 +3331,7 @@ static int BinocAim()
         }
 
         /// <summary>The step names only Quest Recorder knows (a profile must have none of them).</summary>
-        public static readonly string[] RecorderOnlySteps = { "PickUpIfOffered", "TalkAndReply", "UseMissionItemOnce", "ClickObject", "UseQuestAbility", "EquipItem" };
+        public static readonly string[] RecorderOnlySteps = { "PickUpIfOffered", "TalkAndReply", "UseMissionItemOnce", "ClickObject", "UseQuestAbility", "EquipItem", "ClickRoutine", "UseTransportHere" };
 
         /// <summary>
         /// Every interaction in the recording - object, NPC and terminal clicks, quest windows, mission boards, reply
@@ -2883,8 +3610,11 @@ static int BinocAim()
         public static string Build(IList<RecEvent> events, string profileName, string fileName, string recordingName, out List<string> problems)
         {
             LastCoverage = null; // (never the last profile's line)
+            LastChecks = new List<string>();
+            _stepNotes = null;
             string text = Build(events, profileName, fileName, recordingName, null);
             problems = PlainProblems(text);
+            LastChecks = Checks(text, problems);
             if (problems.Count > 0)
                 text = MarkNotFinished(text, problems);
             return text;
@@ -2938,7 +3668,137 @@ static int BinocAim()
             foreach (string h in named)
                 if (!hooks.Contains(h))
                     problems.Add("a Hook with no code (" + h + ")");
+            // every Hook put in is taken out again later (one left in runs for the rest of the profile)
+            var inAt = new Dictionary<string, int>(StringComparer.Ordinal);
+            int order = 0;
+            var lastOut = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (System.Xml.XmlNode n in doc.SelectNodes("//Hook"))
+            {
+                var el = n as System.Xml.XmlElement;
+                if (el == null)
+                    continue;
+                order++;
+                string h = el.GetAttribute("Name"), op = el.GetAttribute("Operation");
+                if ((op == "I" || op == "A") && !inAt.ContainsKey(h))
+                    inAt[h] = order;
+                else if (op == "R")
+                    lastOut[h] = order;
+            }
+            foreach (KeyValuePair<string, int> kv in inAt)
+            {
+                int o;
+                if (!lastOut.TryGetValue(kv.Key, out o) || o < kv.Value)
+                {
+                    string p = "a Hook put in and never taken out (" + kv.Key + ")";
+                    if (!problems.Contains(p))
+                        problems.Add(p);
+                }
+            }
             return problems;
+        }
+
+        [ThreadStatic] private static List<string> _stepNotes;
+
+        /// <summary>
+        /// The checks of the last profile built, for the top of "what you did": what keeps it from running (it then says it
+        /// is not finished), then what to look at - a fight for a bonus you didn't do, BuddyCron's UseObject walking spot to
+        /// spot with no fight there, a transport known only by a name other heroics' transports have, and each step the
+        /// maker wasn't sure of. Empty when there is nothing.
+        /// </summary>
+        [ThreadStatic] public static List<string> LastChecks;
+
+        public static List<string> Checks(string profile, List<string> problems)
+        {
+            var list = new List<string>();
+            foreach (string p in problems ?? new List<string>())
+                list.Add("NOT FINISHED: " + p);
+            var doc = new System.Xml.XmlDocument();
+            try
+            {
+                doc.LoadXml(profile ?? string.Empty);
+            }
+            catch (System.Xml.XmlException)
+            {
+                return list;
+            }
+            var dropped = UseCore && CoreSteps.Dropped != null ? CoreSteps.Dropped : new HashSet<ulong>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            Action<string> add = t => { if (seen.Add(t)) list.Add(t); };
+            foreach (System.Xml.XmlNode n in doc.SelectNodes("//Questing//*"))
+            {
+                var el = n as System.Xml.XmlElement;
+                if (el == null)
+                    continue;
+                string label = Label(el);
+                if (el.LocalName == "Grind")
+                {
+                    foreach (ulong q in GateQuests(el))
+                        if (dropped.Contains(q))
+                            add("LOOK: " + label + ": a fight for a bonus you didn't do (" + Fmt.Hex(q) + ")");
+                }
+                else if (el.LocalName == "UseObject" && el.SelectSingleNode("Hotspots") != null &&
+                         el.ParentNode != null && el.ParentNode.SelectSingleNode("Grind") == null)
+                {
+                    string what = el.GetAttribute("ObjectName");
+                    if (what.Length == 0)
+                    {
+                        var ps = new List<string>();
+                        foreach (System.Xml.XmlNode pn in el.SelectNodes("Placeables/Placeable"))
+                            ps.Add(pn.InnerText);
+                        what = ps.Count > 0 ? string.Join(", ", ps.ToArray()) : "anything it can use";
+                    }
+                    add("LOOK: " + label + ": BuddyCron's UseObject goes from spot to spot for " + what + " (the count is mostly kills, so it isn't the click routine)");
+                }
+            }
+            foreach (System.Xml.XmlNode n in doc.SelectNodes("//CodeChunk[@Type='Hook']"))
+            {
+                var el = n as System.Xml.XmlElement;
+                string code = el != null ? el.InnerText : string.Empty;
+                if (el == null || !el.GetAttribute("Name").StartsWith("TransportHere", StringComparison.Ordinal) || code.Contains("i.TemplateId == 0x"))
+                    continue;
+                Match m = Regex.Match(code, "string name = \"([^\"]*)\";");
+                if (m.Success && m.Groups[1].Value.IndexOf(": ", StringComparison.Ordinal) < 0)
+                    add("LOOK: the transport \"" + m.Groups[1].Value + "\" is known only by its name, and other heroics' transports have it too: the bot may press another mission's");
+            }
+            if (_stepNotes != null)
+                foreach (string t in _stepNotes)
+                    add("LOOK: " + t);
+            return list;
+        }
+
+        /// <summary>The step comment just before the element's top If (or "a step").</summary>
+        private static string Label(System.Xml.XmlElement el)
+        {
+            System.Xml.XmlNode top = el;
+            while (top.ParentNode != null && top.ParentNode.LocalName != "Questing")
+                top = top.ParentNode;
+            for (System.Xml.XmlNode p = top.PreviousSibling; p != null; p = p.PreviousSibling)
+            {
+                if (p.NodeType == System.Xml.XmlNodeType.Comment)
+                    return p.Value.Trim();
+                if (p.NodeType == System.Xml.XmlNodeType.Element)
+                    break;
+            }
+            return "a step";
+        }
+
+        /// <summary>The missions the element's If gates ask HasQuest of.</summary>
+        private static List<ulong> GateQuests(System.Xml.XmlElement el)
+        {
+            var qs = new List<ulong>();
+            for (System.Xml.XmlNode p = el.ParentNode; p != null && p.LocalName != "Questing"; p = p.ParentNode)
+            {
+                var pe = p as System.Xml.XmlElement;
+                if (pe == null || (pe.LocalName != "If" && pe.LocalName != "While"))
+                    continue;
+                foreach (Match m in Regex.Matches(pe.GetAttribute("Condition"), @"HasQuest\((0x[0-9A-Fa-f]+)\)"))
+                {
+                    ulong q;
+                    if (ulong.TryParse(m.Groups[1].Value.Substring(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out q) && !qs.Contains(q))
+                        qs.Add(q);
+                }
+            }
+            return qs;
         }
 
         /// <summary>Every ( { [ in the code is closed in order (string and char literals skipped).</summary>
@@ -3322,6 +4182,7 @@ static int BinocAim()
             var steps = new List<Step>();
             var markers = new List<KeyValuePair<string, Vec3>>();
             _doorArea = new Dictionary<string, ulong>(StringComparer.Ordinal);
+            _doorClick = new Dictionary<string, string[]>(StringComparer.Ordinal);
             var uses = new List<Use>();
             var fightUses = new List<Use>(); // objects you used or attacked in a fight (one may bring out the mob that ends it)
             string fightMobs = string.Empty; // the mobs that started the last fight, as the recorder listed them
@@ -4009,6 +4870,14 @@ static int BinocAim()
                             ulong doorArea = e.FromArea != 0 ? e.FromArea : e.AreaId;
                             if (e.Kind != EvKind.AreaChange && doorArea != 0)
                                 _doorArea[X(e.FromPos) + "|" + X(e.Pos)] = doorArea;
+                            // the door you clicked to go through (Voss's Trial of the First Chamber Door: a click, a talk,
+                            // then the game puts you inside): clicked again by the walk when the bot is outside later on
+                            if (e.Kind != EvKind.AreaChange && lastClicked != null && lastClicked.Kind == ObjKind.Placeable && lastClicked.Name.Length > 0 &&
+                                !lastClicked.Name.StartsWith("#", StringComparison.Ordinal) && t - lastClickedAt <= 30 && !lastClicked.OffersQuest &&
+                                !lastClicked.TakesTurnIn && !e.FromPos.IsZero &&
+                                ((!lastClickedStand.IsZero && e.FromPos.DistanceTo(lastClickedStand) <= 1.5f) || (lastClicked.HasPos && e.FromPos.DistanceTo(lastClicked.Pos) <= 1.5f)))
+                                _doorClick[X(e.FromPos) + "|" + X(e.Pos)] = new[] { lastClicked.Name, X(lastClicked.HasPos ? lastClicked.Pos : lastClickedStand),
+                                                                                  X(lastClickedStand.IsZero ? e.FromPos : lastClickedStand) };
                         }
                         break;
                     }
@@ -5678,6 +6547,9 @@ static int BinocAim()
                         had.Add(q);
                 }
                 had.RemoveAll(q => steps.Exists(p => p.Kind == "Pickup" && p.Lines.Exists(l => l.StartsWith("<PickUp", StringComparison.Ordinal) && Attr(l, "QuestId") == Fmt.Hex(q))));
+                // a bonus the bot doesn't do is never something to go and pick up
+                if (UseCore && CoreSteps.Dropped != null)
+                    had.RemoveAll(q => CoreSteps.Dropped.Contains(q));
                 if (had.Count > 0)
                 {
                     var names = new List<string>();
@@ -5710,6 +6582,14 @@ static int BinocAim()
                 if (q != 0 && !picked.Contains(q) && !weeklies.Contains(q))
                     picked.Add(q);
             }
+            // a bonus the bot doesn't do is never "not finished"
+            if (UseCore && CoreSteps.Dropped != null)
+                picked.RemoveAll(q => CoreSteps.Dropped.Contains(q));
+            // the steps the maker wasn't sure of, for the checks at the top of "what you did"
+            _stepNotes = new List<string>();
+            foreach (Step s in steps)
+                if (s.Unsure && !string.IsNullOrEmpty(s.Note))
+                    _stepNotes.Add((s.Comment.Length > 0 ? s.Comment : s.Kind) + ": " + s.Note);
             return Render(steps, picked, profileName, fileName, recordingName, dark > light ? "Dark" : (light > dark ? "Light" : null), vendors, completedOrder);
         }
 
@@ -5734,6 +6614,8 @@ static int BinocAim()
             CoreRender.RewardWaiting = RewardWaiting;
             List<CoreRender.Block> blocks = CoreWrite.Blocks(c, core);
             var coreQuests = new HashSet<ulong>();
+            if (CoreSteps.Dropped != null)
+                coreQuests.UnionWith(CoreSteps.Dropped); // an unfinished bonus the core left out: none of the old steps' fights either
             var coreEnds = new HashSet<ulong>();
             var corePickups = new HashSet<string>(StringComparer.Ordinal);
             foreach (CoreRender.Block b in blocks)
@@ -5769,6 +6651,15 @@ static int BinocAim()
                         return q.Length > 0 && corePickups.Contains(q);
                     }
                     case "Complete":
+                        if (CoreSteps.Dropped != null && CoreSteps.Dropped.Contains(s.Quest) && !coreEnds.Contains(s.Quest))
+                        {
+                            // a bonus the bot doesn't do (kills alone counted toward it): its reward only if it is waiting
+                            string bh = Fmt.Hex(s.Quest);
+                            s.Gate = Fmt.XmlAttr(CoreRender.RewardWaitingText(bh));
+                            s.Lines.Clear();
+                            s.Lines.Add("<CompleteQuest QuestId=\"" + bh + "\" />");
+                            return false;
+                        }
                         return coreEnds.Contains(s.Quest); // (a quest end the new core did not see keeps the old reward step)
                     default:
                         ulong sq = QuestOf(s);
@@ -5867,6 +6758,34 @@ static int BinocAim()
         /// with your replies on the talks. Their board pick-ups, one-use items, item rows and abilities go through the plain
         /// pass like the steps above (BuddyCron's own steps, and a Hook only for those three).
         /// </summary>
+        /// <summary>
+        /// "(HasQuest(q) and not IsQuestComplete(q))" for each mission (XML-escaped, as the route and ride gates are written) with a step after step i. With here: only the missions
+        /// done after it before the next transport, each also while the bot isn't at another open mission's site (Voss, 23 Nov:
+        /// every Voss heroic's transport is "Heroic Transport"; the bot landed at Ancient Guardians first, and the walk through
+        /// the Trial of the First door, gated on any Voss heroic being open, took it across the map to that door).
+        /// </summary>
+        private static List<string> OpenAfter(List<Step> steps, int i, bool here)
+        {
+            var open = new List<string>();
+            var at = new Dictionary<ulong, int>();
+            for (int j = i + 1; j < steps.Count; j++)
+            {
+                Step n = steps[j];
+                if (here && (n.Hop || (n.Kind == "Ride" && n.Comment.StartsWith("Mission item:", StringComparison.Ordinal))))
+                    break;
+                ulong q = n.Quest;
+                if (q == 0 || n.Kind == "Skip")
+                    continue;
+                int k;
+                if (!at.TryGetValue(q, out k))
+                {
+                    at[q] = open.Count;
+                    open.Add(Fmt.Format("(HasQuest({0}) and not IsQuestComplete({0})", Fmt.Hex(q)) + (here && n.Away != null ? " and " + A(n.Away) : string.Empty) + ")");
+                }
+            }
+            return open;
+        }
+
         private static void CoreAfter(List<Step> steps, List<CoreRender.Block> blocks, List<Convo> convos, string side)
         {
             var made = new List<Step>();
@@ -5875,7 +6794,8 @@ static int BinocAim()
             {
                 bool pickup = b.Step.Kind == StepKind.Pickup;
                 var s = new Step { Kind = pickup ? "Pickup" : "Qr", Raw = true, Gate = b.No > 0 ? b.Gate : null, Quest = pickup ? 0 : b.Quest, At = b.At,
-                                   Board = b.Board, Group = b.Group, Comment = (b.No > 0 ? b.No.ToString(CultureInfo.InvariantCulture) + ". " : string.Empty) + b.Label };
+                                   Board = b.Board, Group = b.Group, Away = b.Away, Hop = b.Step.Kind == StepKind.Hop,
+                                   Comment = (b.No > 0 ? b.No.ToString(CultureInfo.InvariantCulture) + ". " : string.Empty) + b.Label };
                 foreach (string l in b.Run)
                     s.Lines.Add(l.TrimStart('\t'));
                 foreach (string u in b.Unsure)
@@ -6060,6 +6980,9 @@ static int BinocAim()
         /// <summary>The zone of each door / phase you went through, by its two walk points (X of before + "|" + X of after).</summary>
         [ThreadStatic] private static Dictionary<string, ulong> _doorArea;
 
+        /// <summary>The door object you clicked to go through a door / phase (name, its spot, where you stood), by its two walk points.</summary>
+        [ThreadStatic] private static Dictionary<string, string[]> _doorClick;
+
         /// <summary>Writes walk points as route lines (lift rides become UseTransport).</summary>
         private static void AddRoute(Step route, List<KeyValuePair<string, Vec3>> markers)
         {
@@ -6102,6 +7025,17 @@ static int BinocAim()
                 }
                 else
                     route.Lines.Add("<MoveTo QuestId=\"1\" Name=\"" + A(m.Key) + "\" XYZ=\"" + X(m.Value) + "\" />");
+                // a door you clicked to go through: click it again (if the game lets you use it), then wait while the bot is
+                // still on this side (the click's talk, then the game moves you through; a doorway nobody clicks: 15 s at most)
+                string[] dc;
+                if (m.Key == "Before the door / phase" && mi + 1 < markers.Count && markers[mi + 1].Key == "Came out here" && _doorClick != null &&
+                    _doorClick.TryGetValue(X(m.Value) + "|" + X(markers[mi + 1].Value), out dc))
+                {
+                    KeyValuePair<int, string> d = doors.Find(x => x.Key == mi + 1);
+                    route.Lines.Add("<ClickObject Name=\"" + A(dc[0]) + "\" XYZ=\"" + dc[1] + "\" Stand=\"" + dc[2] + "\" Fight=\"True\" />");
+                    if (d.Value != null)
+                        route.Lines.AddRange(WaitWhile(d.Value, 3));
+                }
                 if (inPart && mi == doors[door].Key)
                 {
                     route.Lines.Add("</If>");
@@ -6575,15 +7509,9 @@ static int BinocAim()
             {
                 if (steps[i].Kind == "Ride")
                 {
-                    // ride while on the near side and any quest with a step after the ride is unfinished
-                    var open = new List<string>();
-                    var qs = new HashSet<ulong>();
-                    for (int j = i + 1; j < steps.Count; j++)
-                    {
-                        ulong q = steps[j].Quest;
-                        if (q != 0 && qs.Add(q))
-                            open.Add(Fmt.Format("(HasQuest({0}) and not IsQuestComplete({0}))", Fmt.Hex(q)));
-                    }
+                    // ride while on the near side and any quest with a step after the ride is unfinished (a lift or a door: only
+                    // the missions done after it before the next transport, each while the bot isn't at another one's site)
+                    List<string> open = steps[i].Comment.StartsWith("Mission item:", StringComparison.Ordinal) ? OpenAfter(steps, i, false) : OpenAfter(steps, i, true);
                     if (open.Count == 0)
                     {
                         // a mission item hop at the very end (Heroic Transport from the Fleet, then you stopped): it only
@@ -6610,14 +7538,7 @@ static int BinocAim()
                 // walked out only once it was already outside), while any quest with a step after it is still open - like a ride
                 if (steps[i].Side != null)
                 {
-                    var open = new List<string>();
-                    var qs = new HashSet<ulong>();
-                    for (int j = i + 1; j < steps.Count; j++)
-                    {
-                        ulong q = steps[j].Quest;
-                        if (q != 0 && steps[j].Kind != "Skip" && qs.Add(q))
-                            open.Add(Fmt.Format("(HasQuest({0}) and not IsQuestComplete({0}))", Fmt.Hex(q)));
-                    }
+                    List<string> open = OpenAfter(steps, i, true);
                     next = open.Count > 0 ? steps[i].Side + " and (" + string.Join(" or ", open) + ")" : null;
                 }
                 steps[i].Gate = next;
@@ -6741,7 +7662,15 @@ static int BinocAim()
             {
                 // last check: any reward window still open (a fight can hold one back; the weekly's comes last)
                 sb.Append("\t\t<!-- Grab any rewards still waiting -->").Append(nl);
-                sb.Append("\t\t<WaitTimer QuestId=\"1\" WaitTime=\"5\" />").Append(nl);
+                // (only when a mission is done and not handed in yet, or its reward window is open: else nothing comes)
+                var waitFor = new List<string>();
+                foreach (ulong q in completedOrder)
+                {
+                    string h = Fmt.Hex(q);
+                    waitFor.Add("(HasQuest(" + h + ") and IsQuestComplete(" + h + "))");
+                    waitFor.Add(RewardWaiting(h));
+                }
+                sb.Append("\t\t<If Condition=\"").Append(string.Join(" or ", waitFor)).Append("\"><WaitTimer QuestId=\"1\" WaitTime=\"5\" /></If>").Append(nl);
                 foreach (ulong q in completedOrder)
                     sb.Append("\t\t<CompleteQuest QuestId=\"").Append(Fmt.Hex(q)).Append("\" />").Append(nl);
             }

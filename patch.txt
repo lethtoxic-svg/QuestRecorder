@@ -1,5 +1,5 @@
-1.4b
+1.6
 main
-- Objects that start a talk when you use them are clicked (Coruscant's Sealed Case, Tython's Ancient Computer, Voss's door and last pyre).
-- Kill-and-loot steps pick up the mission item even when your bags are full (Tython's Power Cells), and the bot walks to where you stood at a mission board (Voss).
-- Binocular scans are aimed the way you aimed them, and transports, talks and bosses are read more exactly. See PATCHNOTES.txt.
+- Objects are clicked one at a time from where you stood, and a click only counts when the game's count goes up (no more running between Spice Crates).
+- Each mission's own transport is pressed by its item id, where the bot stands. Binocular scans leave the view once the scan counts.
+- The bot rests to full before walking up to things to click and between clicks, and waits and walks about where you only had to get somewhere until it counts. See PATCHNOTES.txt.

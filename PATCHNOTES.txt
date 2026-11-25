@@ -1,5 +1,72 @@
 Quest Recorder patch notes - LethToxic
 
+1.6
+- Binocular scans leave the view once the scan counts (the hand-fixed Yavin 4 one): the bot reads the mission's step
+  and counts when it starts the scan, and as soon as they move on it lets go of the zoom and closes the view, checked
+  by the game (Escape on the view's own controls, then the Escape key while the game is in front). After 15 s with no
+  count it leaves the view too, and a fight or a death closes it first.
+- Rest to full before walking to objects to click, and between clicks after a fight (the hand-fixed Tatooine one): out
+  of a fight, under 95% health or the companion under 90%, the bot uses the class rest (up to 20 s). The combat routine
+  only rests below 77%, so a walk into the next camp at 80% pulled the next group with a fifth of the health gone.
+- A step that only needs you to get somewhere waits there, and walks a few steps back the way you came and on to it
+  again, until the game counts it (the hand-fixed Voss one: Locate the Vile Grotto, Locate the Tomb). About a minute at
+  most, then the profile goes on. Stages the game passes through by itself still just wait for the next step.
+- The end of the profile waits for a reward window only when one can come (a mission done and not handed in, or its
+  window open), not every run.
+
+1.5
+- Objects to use are clicked by one routine everywhere, the one from the hand-made Voss and Tatooine profiles: it
+  clicks the nearest object of the name that the game still lets you use, from where you stood for it, one at a time,
+  and counts a click only when the game's own count goes up. It never walks a round of spots (BuddyCron's UseObject
+  with spots ran between Spice Crates for minutes), lets BuddyCron fight, revive and talk first, and leaves an object it
+  can't reach. Spot-to-spot UseObject is left only where a count is mostly kills (1 step in 50 recordings, was 71).
+- A bonus you didn't do is not done at all, even when your kills counted for it: no fight, no pick-up ask, not in the
+  end check (Tatooine's Thunderstruck, Jedi Rescuers, Exterminate the Exchange, Exchange of Violence). Its reward is
+  only taken if the game offers it.
+- An enemy you clicked to target and then killed is never the step's cause (Voss: the Commando Captain took the pyre's
+  step).
+- Mission transports are pressed by the game's item id for that mission, from the game's quest data (306 missions):
+  Korriban's, Tython's and Voss's heroics each give one called "Heroic Transport", and by name the bot took the first
+  one it found. With each mission's own transport known, the "again" rounds for same-named transports are gone.
+- A transport is used while the mission is on any step you did at its site, not only the first: a bot started again
+  mid-mission, or sent off by a death, gets back there.
+- A door you clicked to go through (Voss's Trial of the First Chamber Door) is clicked again when the bot is outside it
+  later in the mission, then it waits until it is through.
+- Every hook gives way to a conversation (BuddyCron answers it first): object clicks, transports, loot, item uses.
+- Checks at the top of "(what you did).txt": what keeps the profile from running, a fight for a bonus you didn't do,
+  spot-to-spot object use, a transport known only by a shared name, and each step the maker wasn't sure of. A Hook put
+  in and never taken out now marks the profile not finished.
+
+1.4c
+- A bonus you finished is done after its mission's steps, not before them: the steps went by when they started, and a
+  bonus count starts with your first kill (Tatooine's gunners were ground before the consoles, the Exchange forces
+  before the Spice Crates, the Jedi Rescuers before the prisoners). When the mission's end would take the bonus away,
+  the mission's last step is split: all but one, the bonus, then the last one.
+- A bonus you never finished is not hunted (Jawa Trade: 11 of 18 Jawas; Black Box: 5 of 12 Sand People, where the bot
+  waited for respawns). Only missions the game names a bonus: hidden helper missions keep their steps.
+- Clickable objects are searched for only as far as the gap to the next one, and never more than 10 m from one you
+  used: with two Spice Crates the same distance away the bot kept switching between them, and on Hutta it took the lift
+  down to a Fabrication Unit on the floor below instead of the one you used.
+- A step that changed well after a loot and away from it (more than 4 s and 20 m) is a walk to where it changed, not a
+  fight at the body: Hostage Situation Cleanup's "Get to a Safe Distance" had the bot standing at Baranj's body.
+- A mission transport works from anywhere: started on a planet or ship the recording never went to, with the mission in
+  your log, the bot presses it where it stands (BuddyCron's own UseItem walks to where you pressed it first, and that is
+  in another area). Out of a fight, a cooldown waited out, 3 tries at most.
+- A walk to where a step ticked goes to where you landed when it ticked on a lift or in a jump (Hutta's "Get to the
+  Basement" ticked 3 m above the floor, and BuddyCron's walk never ended).
+- Mission transports are pressed where the bot stands everywhere, out of a fight, and the step is done once you are at
+  the mission's site (or in another area). BuddyCron's UseItem was given where you pressed it, and it kills every enemy
+  near that spot before it presses: you mostly pressed it where the mission before ended, so with that mission done
+  the bot fought its enemies again (Tatooine: Jedi Rescuers before Supply Lines).
+- Several objects to use: the ones you used are used first, in your order, each from where you stood, and only if it
+  can still be used; BuddyCron's UseObject does what is left. It also takes any object of that name near the bot, and a
+  Spice Crate a step up from the one it headed for pulled it back and forth for minutes.
+- Binoculars: the view opens where the camera looks and only the mouse turns it (Yavin 4: no key moved it). The bot
+  now aims it with small mouse moves, each checked by reading where the camera looks, and only while the game is the
+  window in front. It zooms with the binoculars' own zoom key held down (found even when BuddyCron's list of the
+  game's controls misses it), then the mouse wheel, then the right button. One try, then the pop-up (it tried for
+  2 minutes). Held buttons are let go after a fight, a death or 20 s.
+
 1.4b
 - Binoculars: when you scan with binoculars, the recorder saves where the camera was looking (left and right, and up
   and down) and what you scanned. The profile turns and aims the camera the same way before it scans. Only binocular

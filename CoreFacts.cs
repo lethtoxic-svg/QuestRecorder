@@ -893,6 +893,9 @@ namespace QuestRecorder
                         }
                         if (e.Kind == EvKind.NpcClick && AttackedAfter(i))
                             break; // clicked to attack it: the fight and the kill are the facts
+                        if (e.Kind == EvKind.NpcClick && KilledLater(i) && !TalkedSoon(i))
+                            break; // an enemy you clicked to target it and killed later (Voss, the Commando Captain the pyre
+                                   // called: the click landed as the pyre's cast ended and took the step from the pyre)
                         Fact f;
                         if (open.TryGetValue(e.Target.NodeId, out f) && t - f.End < 30 && f.Kind == FactKind.Talk)
                         {
@@ -1069,6 +1072,29 @@ namespace QuestRecorder
                     return true;
             LogLine d;
             return _deaths.TryGetValue(node, out d) && Sec(d.Time) <= AtOf[i];
+        }
+
+        /// <summary>You killed that NPC later in the recording (same one, by its id): an enemy, not someone to talk to.</summary>
+        private bool KilledLater(int i)
+        {
+            ulong node = Events[i].Target.NodeId;
+            if (node == 0)
+                return false;
+            for (int j = i + 1; j < Events.Count; j++)
+                if (Events[j].Kind == EvKind.Kill && Events[j].Target != null && Events[j].Target.NodeId == node)
+                    return true;
+            LogLine d;
+            return _deaths.TryGetValue(node, out d) && Sec(d.Time) > AtOf[i];
+        }
+
+        /// <summary>A conversation with that NPC started within 5 s of the click (someone you talked to).</summary>
+        private bool TalkedSoon(int i)
+        {
+            ulong node = Events[i].Target.NodeId;
+            for (int j = i + 1; j < Events.Count && AtOf[j] - AtOf[i] < 5; j++)
+                if (Events[j].Kind == EvKind.ConvoStart && Events[j].Target != null && Events[j].Target.NodeId == node)
+                    return true;
+            return false;
         }
 
         /// <summary>You clicked an NPC and a fight with it began within 3 s (a mob, not someone to talk to).</summary>
@@ -1814,6 +1840,41 @@ namespace QuestRecorder
         }
 
         /// <summary>Where you were at a moment (the nearest row).</summary>
+        /// <summary>
+        /// Where you landed, for a spot taken while you were in the air or riding (Hutta, Hostage Situation: "Get to the
+        /// Basement" ticked on the lift 3 m above the basement floor, and a walk there never ends: BuddyCron's MoveTo is done
+        /// only within a hand's width of its spot). The first place within 3 s, 10 m sideways and 1.5 m or more up or down
+        /// from the spot where your height then held still; the spot itself when there is none (you were on the ground).
+        /// </summary>
+        public Vec3 Landed(double t, Vec3 p)
+        {
+            if (p.IsZero)
+                return p;
+            var at = new List<double>();
+            var pos = new List<Vec3>();
+            for (int i = 0; i < Events.Count; i++)
+            {
+                if (AtOf[i] <= t + 0.05 || Events[i].Pos.IsZero)
+                    continue;
+                if (AtOf[i] > t + 6)
+                    break;
+                if (at.Count > 0 && AtOf[i] - at[at.Count - 1] < 0.1)
+                    continue; // (rows of one moment: one place)
+                at.Add(AtOf[i]);
+                pos.Add(Events[i].Pos);
+            }
+            for (int k = 0; k + 1 < pos.Count && at[k] <= t + 3; k++)
+            {
+                Vec3 q = pos[k];
+                float side = (float)Math.Sqrt((q.X - p.X) * (q.X - p.X) + (q.Z - p.Z) * (q.Z - p.Z));
+                if (side > 1f || Math.Abs(q.Y - p.Y) < 0.15f)
+                    continue;
+                if (at[k + 1] - at[k] <= 3 && Math.Abs(pos[k + 1].Y - q.Y) <= 0.03f)
+                    return q;
+            }
+            return p;
+        }
+
         public Vec3 PosAt(double t)
         {
             Vec3 best = default(Vec3);

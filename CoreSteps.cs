@@ -173,6 +173,8 @@ namespace QuestRecorder
                 Quest(ctx, q, byQuest[q], tracksOf[q], steps);
             Hops(c, steps);
             Fmt.StableSort(steps, (x, y) => x.At != y.At ? x.At.CompareTo(y.At) : x.End.CompareTo(y.End));
+            DropUnfinishedBonuses(c, steps);
+            BonusFightsAfter(c, steps);
             // a mission's reward (or hand-in) never before a step of that mission done at the same moment (Black Box: the
             // ambush's last kill and the reward window came together), nor before a same-moment step of a mission that ended
             // with it (the weekly that Trouble in Deed's end completed: its reward comes after the walk out of the shop)
@@ -194,6 +196,188 @@ namespace QuestRecorder
                 }
             }
             return steps;
+        }
+
+        /// <summary>
+        /// A bonus's kills made on the way through another mission's steps (Call Down the Thunder: you killed the gunners
+        /// at each console as you went, and the 12th fell just before the 4th console): those steps first, then the bonus's
+        /// fights for whatever is left, instead of the whole fight before the first console (the steps go by when they
+        /// started, and the first gunner died before the first console). Only steps in the same area, while the bonus was
+        /// still counting, up to the first transport, pick-up, walk, reward or hand-in. A mission's last step is never put
+        /// before the bonus (the game ends a bonus when its mission ends: Black Box took Crash Cleanup away, Section X):
+        /// a last step of several objects is split, all but one before the bonus and the last one after it (War on Spice:
+        /// 7 Spice Crates, the Exchange of Violence fights, the 8th crate). A last step of several kills is split the same way
+        /// (Prison Labor: 4 Escaped Prisoners, the Jedi Rescuers you killed among them, the 5th prisoner).
+        /// </summary>
+        private static void BonusFightsAfter(CoreFacts c, List<CoreStep> steps)
+        {
+            var done = new HashSet<ulong>();
+            for (int i = 0; i < steps.Count; i++)
+            {
+                CoreStep k = steps[i];
+                if (!IsKill(k) || done.Contains(k.Quest) || !IsBonus(c, k.Quest))
+                    continue;
+                done.Add(k.Quest);
+                var bonus = new List<CoreStep> { k };
+                var main = new List<CoreStep>();
+                CoreStep split = null;
+                double end = k.End;
+                int j = i + 1;
+                for (; j < steps.Count && steps[j].At < end; j++)
+                {
+                    CoreStep s = steps[j];
+                    if (s.Quest == k.Quest)
+                    {
+                        if (!IsKill(s))
+                            break;
+                        bonus.Add(s);
+                        end = Math.Max(end, s.End);
+                        continue;
+                    }
+                    if (s.Area != k.Area || s.Kind == StepKind.Hop || s.Kind == StepKind.Pickup || s.Kind == StepKind.Walk ||
+                        s.Kind == StepKind.Reward || s.Kind == StepKind.HandIn)
+                        break;
+                    if (LastOfQuest(steps, j))
+                    {
+                        if ((s.Kind == StepKind.Use || s.Kind == StepKind.Collect || IsKill(s)) && s.Task >= 0 && s.Max >= 2 && s.CountTo >= s.Max)
+                            split = s;
+                        break;
+                    }
+                    main.Add(s);
+                }
+                if (main.Count == 0 && split == null)
+                    continue;
+                var seg = new List<CoreStep>(main);
+                if (split != null)
+                {
+                    CoreStep most = Copy(split);
+                    most.CountTo = split.Max - 1;
+                    seg.Add(most);
+                }
+                seg.AddRange(bonus);
+                if (split != null)
+                    seg.Add(split);
+                steps.RemoveRange(i, (split != null ? j + 1 : j) - i);
+                steps.InsertRange(i, seg);
+                i += seg.Count - 1;
+            }
+        }
+
+        /// <summary>
+        /// A bonus you never finished in the recording is not hunted: the game pays a bonus only when it is finished, and
+        /// kills that counted toward it on the way (Trade Disruption: 11 of 18 Jawas while you looted the Power Cores;
+        /// Crash Cleanup: 5 of 12 Sand People at the Black Box) were not you doing the bonus. Its steps go; the mobs that
+        /// come at the bot still get fought. A bonus counts as finished when the tracker showed it complete or its reward
+        /// came, or every count it showed reached the end. Only missions the game files name a bonus.
+        /// </summary>
+        private static void DropUnfinishedBonuses(CoreFacts c, List<CoreStep> steps)
+        {
+            var drop = new HashSet<ulong>();
+            foreach (CoreStep s in steps)
+                if (!drop.Contains(s.Quest) && NamedBonus(c, s.Quest) && (!Finished(c, s.Quest, steps) || !ActedFor(steps, s.Quest)))
+                    drop.Add(s.Quest);
+            Dropped = drop;
+            if (drop.Count > 0)
+                steps.RemoveAll(s => drop.Contains(s.Quest) && s.Kind != StepKind.Hop && s.Kind != StepKind.Pickup);
+        }
+
+        /// <summary>
+        /// You did something for the bonus that isn't a kill: clicked, talked, used an item or an ability, scanned, did a
+        /// puzzle. Kills that counted toward a bonus while you did its heroic are not you doing the bonus (Liel, 22 Nov:
+        /// "automatically contributing to the bonus doesn't mean I want to do the bonus"): a bonus finished by kills alone
+        /// gets no steps, so the bot never hunts for it; its reward is taken only if it is waiting.
+        /// </summary>
+        private static bool ActedFor(List<CoreStep> steps, ulong q)
+        {
+            foreach (CoreStep s in steps)
+            {
+                if (s.Quest != q)
+                    continue;
+                switch (s.Kind)
+                {
+                    case StepKind.Use:
+                    case StepKind.Talk:
+                    case StepKind.Item:
+                    case StepKind.Ability:
+                    case StepKind.Puzzle:
+                    case StepKind.Holocom:
+                        return true;
+                    case StepKind.Collect:
+                        if (s.Causes.Exists(f => f.Kind == FactKind.UseObject || f.Kind == FactKind.Item || f.Kind == FactKind.Ability || f.Kind == FactKind.Talk))
+                            return true;
+                        break;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>The unfinished bonuses the last Build left out (the steps above keep none of theirs either).</summary>
+        [ThreadStatic] public static HashSet<ulong> Dropped;
+
+        /// <summary>
+        /// Only a mission the game files name a bonus: a hidden mission without that name is a helper of the mission you
+        /// were doing (the Black Hole's glow injector handler holds the Glow steps), never dropped.
+        /// </summary>
+        private static bool NamedBonus(CoreFacts c, ulong q)
+        {
+            return c.Events.Exists(e => e.QuestId == q && e.QuestFqn.IndexOf(".bonus.", StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private static bool Finished(CoreFacts c, ulong q, List<CoreStep> steps)
+        {
+            if (c.Tracks.Exists(t => t.Quest == q && (t.Kind == TrackKind.Completed || t.Kind == TrackKind.Reward)))
+                return true;
+            if (steps.Exists(s => s.Quest == q && s.Kind == StepKind.Reward))
+                return true;
+            bool counted = false;
+            foreach (CoreStep s in steps)
+            {
+                if (s.Quest != q || s.Task < 0 || s.Max == 0)
+                    continue;
+                if (s.CountTo < s.Max)
+                    return false;
+                counted = true;
+            }
+            return counted;
+        }
+
+        private static bool IsKill(CoreStep s)
+        {
+            return s.Kind == StepKind.Kill || s.Kind == StepKind.KillLoot;
+        }
+
+        /// <summary>A bonus mission: the game hid it when it came (given with its mission), or its own name says bonus.</summary>
+        private static bool IsBonus(CoreFacts c, ulong q)
+        {
+            return c.Events.Exists(e => e.QuestId == q && (e.QuestHidden || e.QuestFqn.IndexOf(".bonus.", StringComparison.OrdinalIgnoreCase) >= 0));
+        }
+
+        private static CoreStep Copy(CoreStep s)
+        {
+            var d = new CoreStep
+            {
+                Kind = s.Kind, Quest = s.Quest, QuestName = s.QuestName, Branch = s.Branch, Step = s.Step, Task = s.Task, CountTo = s.CountTo,
+                Max = s.Max, At = s.At, End = s.End, Area = s.Area, Item = s.Item, Cast = s.Cast, LogAbility = s.LogAbility, InFight = s.InFight,
+                DeadOnly = s.DeadOnly, Loot = s.Loot, Landing = s.Landing, LandArea = s.LandArea, Rank = s.Rank, Came = s.Came, Merged = s.Merged
+            };
+            d.Specs.AddRange(s.Specs);
+            d.Accepts.AddRange(s.Accepts);
+            d.Nodes.AddRange(s.Nodes);
+            d.Anchors.AddRange(s.Anchors);
+            d.Spots.AddRange(s.Spots);
+            d.Causes.AddRange(s.Causes);
+            d.Tries.AddRange(s.Tries);
+            d.Unsure.AddRange(s.Unsure);
+            return d;
+        }
+
+        /// <summary>No later step of the same mission but its reward or hand-in.</summary>
+        private static bool LastOfQuest(List<CoreStep> steps, int j)
+        {
+            for (int n = j + 1; n < steps.Count; n++)
+                if (steps[n].Quest == steps[j].Quest && steps[n].Kind != StepKind.Reward && steps[n].Kind != StepKind.HandIn)
+                    return false;
+            return true;
         }
 
         /// <summary>
@@ -896,7 +1080,8 @@ namespace QuestRecorder
                 // object - is not an action of the step; it still is when it is the cause, the only thing that moved it)
                 bool strong = f.Kind == FactKind.UseObject || f.Kind == FactKind.Item || (f.Kind == FactKind.Ability && !f.InFight && f.Cast.Length > 0) ||
                               (f.Kind == FactKind.Talk && ch.Kind != TrackKind.Completed && (f.Convo || f.Did));
-                bool lastLoot = f.Kind == FactKind.Loot && ch.At - f.At <= 10;
+                // (not a loot you had gone on from, when getting there was the step: see WentOnFromLoot)
+                bool lastLoot = f.Kind == FactKind.Loot && ch.At - f.At <= 10 && !(cause == null && WentOnFromLoot(ch, f));
                 if (!(strong || lastLoot || f == cause))
                     continue;
                 // (one more click on an object this mission already used - the device the step before was done on - is not
@@ -947,6 +1132,17 @@ namespace QuestRecorder
                     best = f;
             }
             return best;
+        }
+
+        /// <summary>
+        /// A loot gives its count the moment you take the item, at the body. A step that changed more than 4 s after a loot
+        /// and more than 20 m from where you looted was not that loot: you had gone on, and getting there did it (Hutta,
+        /// Hostage Situation Cleanup: "Get to a Safe Distance" changed 6 s and 29 m after you looted Baranj's body a third
+        /// time; the step was a fight at the body, where the bot would have stood for good).
+        /// </summary>
+        private static bool WentOnFromLoot(Change ch, Fact f)
+        {
+            return f.Kind == FactKind.Loot && ch.At - f.End > 4 && !ch.Pos.IsZero && !f.Me.IsZero && ch.Pos.DistanceTo(f.Me) > 2f;
         }
 
         private static bool UsedNode(HashSet<Fact> used, ulong node)
@@ -1292,6 +1488,15 @@ namespace QuestRecorder
             {
                 why = "it changed where you went after your last action (" + Fmt.F1(ch.At - newest.End) + " s and about " +
                       ((int)(ch.Pos.DistanceTo(newest.Me) * 10)).ToString(CultureInfo.InvariantCulture) + " m on): reaching that spot was the step";
+                rank = 2;
+                return null;
+            }
+            // (a loot counts the moment you take the item, at the body: a step that changed well after it and well away from
+            // it was done by getting there)
+            if (newest != null && WentOnFromLoot(ch, newest))
+            {
+                why = "it changed where you went after your last action (" + Fmt.F1(ch.At - newest.End) + " s and about " +
+                      ((int)(ch.Pos.DistanceTo(newest.Me) * 10)).ToString(CultureInfo.InvariantCulture) + " m on from a loot): reaching that spot was the step";
                 rank = 2;
                 return null;
             }
